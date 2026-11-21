@@ -101,6 +101,30 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
     same = hidden_states is key_hidden_states and hidden_states is value_hidden_states
     common = (layer.q_proj, layer.r_proj, layer.gate_proj)
     modules = common + (layer.k_proj, layer.v_proj) if same else common
+    if (not full and hidden_states.ndim==3 and hidden_states.shape[0]==1 and hidden_states.shape[1]>=512
+            and hidden_states.shape[1]%128==0
+            and hidden_states.dtype==mx.bfloat16
+            and all(type(p) is nn.Linear and "bias" not in p and p.weight.dtype==mx.bfloat16 for p in modules)):
+        # Prefill GEMMs can share the query input across projection rows.
+        combined, cuts=projection(layer,modules,"_prompt_all" if same else "_prompt_query")
+        pieces=mx.split(hidden_states @ combined.T,cuts,axis=-1)
+        query,relative,gate=pieces[:3]
+        key,value=pieces[3:] if same else (layer.k_proj(key_hidden_states),layer.v_proj(value_hidden_states))
+        key,conv_states[0]=layer.k_sconv(key,conv_states[0],conv_mask)
+        value,conv_states[1]=layer.v_sconv(value,conv_states[1],conv_mask)
+        b,l,_=query.shape
+        q=layer.q_l2_clip(query.reshape(b,l,layer.num_heads,-1))
+        k=layer.k_l2_clip(key.reshape(b,l,layer.num_key_value_heads,-1))
+        v=value.reshape(b,l,layer.num_key_value_heads,-1)
+        v=layers.unweighted_rms_norm(v.astype(mx.float32),layer.eps).astype(value.dtype)
+        r=layer.rel_l2_clip(relative.reshape(b,l,layer.num_heads,-1))
+        q,k,v=(h.transpose(0,2,1,3) for h in (q,k,v))
+        kv=cache[0] if cache is not None else None
+        if kv is not None:
+            k,v=kv.update_and_fetch(k,v)
+        features=layer._attention(q,k,v,layer.rel_logits_proj(r),layer.sink_proj(hidden_states),kv)
+        features=features.reshape(b,l,-1).astype(mx.float32)*mx.sigmoid(gate.astype(mx.float32))
+        return layer.o_proj(features.astype(gate.dtype))
     if hidden_states.shape[:2] != (1, 1) or any(type(m) is not nn.Linear or "bias" in m for m in modules):
         reference = _full if full else _sliding
         return reference(layer, hidden_states, key_hidden_states, value_hidden_states,
