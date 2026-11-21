@@ -36,8 +36,6 @@ def install():
     from inkling_ops import attention_mask, compiled_ring, dynamic_conv, message_gate, projections, short_conv, triplet
     from inkling_ops import expert_gate
     expert_gate.install()
-    from inkling_ops import depth
-    depth.install()
     short_conv.install()
     message_gate.install()
     attention_mask.install()
