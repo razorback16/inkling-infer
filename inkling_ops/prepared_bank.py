@@ -64,7 +64,8 @@ def messages(layer, bank, index):
                           output_dtypes=[mx.float32]*2)
         entries[key] = (bank, outputs)
     raw, normalized = entries[key][1]
-    return raw[index], normalized[index]
+    shape = raw.shape[1:]
+    return raw[index:index+1].reshape(shape), normalized[index:index+1].reshape(shape)
 
 
 def run(reference, model, x, caches):
