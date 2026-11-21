@@ -33,21 +33,22 @@ _pack_rows = mx.fast.metal_kernel(
 )
 DOT="""
         uint format=formats[row];
-        uint base=format>>24;
+        ushort base=ushort(format>>24)<<8;
         float dot=0;
         for (uint tile=0;tile<COLS/128;++tile) {
             uint d=tile*128+lane*4, addr=((row/4*(COLS/128)+tile)*4+row%4)*64;
             float4 a=float4(*(device const bfloat4*)(x+d));
-            float4 w;
+            ushort4 bits;
             if (format&(1u<<tile)) {
-                w=float4(*(device const bfloat4*)(payload+addr+lane*2));
+                bits=*(device const ushort4*)(payload+addr+lane*2);
             } else {
                 ushort h=((device const ushort*)(payload+addr+32))[lane];
-                uint4 delta=uint4(h,h>>4,h>>8,h>>12)&15;
-                uint4 bytes=uint4(as_type<uchar4>(payload[addr+lane]));
-                uint4 bits=(bytes<<31)|((base+delta)<<23)|((bytes&254u)<<15);
-                w=as_type<float4>(bits);
+                ushort4 n=ushort4(h,h>>4,h>>8,h>>12)&15;
+                ushort4 code=(n<<8)|ushort4(as_type<uchar4>(payload[addr+lane]));
+                ushort4 rot=code+base;
+                bits=(rot>>1)|(rot<<15);
             }
+            float4 w=float4(as_type<bfloat4>(bits));
             for (uint j=0;j<4;++j) dot=fma(a[j],w[j],dot);
         }
         for (ushort step=16;step;step>>=1) dot+=simd_shuffle_down(dot,step);
