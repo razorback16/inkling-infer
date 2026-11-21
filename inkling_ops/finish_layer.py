@@ -92,7 +92,7 @@ def decode(layer, hidden_states, block_states, *, cache=None, conv_mask=None, me
     elif messages is not None:
         x = layer.mlp_message_gate(x,messages[...,3,:])
     x, selected, routing = router.route(layer, x, hidden_states.dtype, normalized=prenormalized, logits=logits, squares=route_squares)
-    active = expert_gate.gated_activation(moe.experts,x,selected)
+    active = expert_gate.gated_activation(moe.experts,x,selected,widen=fused_down)
     w = post.conv1d.weight
     if fused_down:
         out, next_history = _finish_mix(
