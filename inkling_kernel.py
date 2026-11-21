@@ -33,8 +33,9 @@ def single_token_moe(self, x):
 
 
 def install():
-    from inkling_ops import attention_mask, message_gate, short_conv
+    from inkling_ops import attention_mask, message_gate, projections, short_conv
     short_conv.install()
     message_gate.install()
     attention_mask.install()
+    projections.install()
     layers.SparseMoeBlock.__call__ = single_token_moe
