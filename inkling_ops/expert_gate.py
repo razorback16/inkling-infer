@@ -7,7 +7,7 @@ from mlx_lm.models.inkling2 import layers
 _reference = layers.Experts.__call__
 _kernel = mx.fast.metal_kernel(
     name="inkling_stock_order_gate_up_fp4",
-    input_names=["x", "ids", "packed", "scales", "amax", "gate_lut", "up_lut"],
+    input_names=["x", "ids", "packed", "scales", "amax", "activation"],
     output_names=["out"],
     header="""
         constant float levels[16] = {
@@ -47,7 +47,7 @@ _kernel = mx.fast.metal_kernel(
             float scale = amax[expert] / 2688.f;
             ushort g = as_type<ushort>(bfloat16_t(sums[lane*2]*scale));
             ushort u = as_type<ushort>(bfloat16_t(sums[lane*2+1]*scale));
-            out[slot*1152+first/2+lane] = bfloat16_t(gate_lut[g]*up_lut[u]);
+            out[slot*1152+first/2+lane] = bfloat16_t(activation[uint(g)*2]*activation[uint(u)*2+1]);
         }
     """,
 )
@@ -58,8 +58,9 @@ def activation_tables():
     values = mx.arange(65536, dtype=mx.uint32).astype(mx.uint16).view(mx.bfloat16).astype(mx.float32)
     gates = (mx.tanh(values / 4)*4) * mx.sigmoid(values)
     ups = mx.tanh(values / 25)*25
-    mx.eval(gates, ups)
-    return gates, ups
+    table=mx.stack((gates,ups),axis=1)
+    mx.eval(table)
+    return table
 
 
 def gated_activation(layer, x, indices):
@@ -72,7 +73,7 @@ def gated_activation(layer, x, indices):
         pair = proj(x[..., None, None, :], indices)
         return layer.act_fn(pair[..., 0::2], pair[..., 1::2])
     active = _kernel(
-        inputs=[x, indices, proj.weight, proj.scales, proj.global_scale, *activation_tables()],
+        inputs=[x, indices, proj.weight, proj.scales, proj.global_scale, activation_tables()],
         grid=(144 * 128, 8, 1), threadgroup=(128, 1, 1),
         output_shapes=[(1, 1, 8, 1, 1152)], output_dtypes=[x.dtype],
     )[0]
