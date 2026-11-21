@@ -6,8 +6,20 @@ from mlx_lm.models.inkling2 import layers
 
 from .exact_sources import native
 
+# Both projection paths finish the unbiased FP32 score and its rank key in the same lane.
+_ROUTE_PAIR_HEADER = """
+    template <typename B>
+    inline void store_route_pair(device float* pairs, device const B* bias, uint e, float x) {
+        float p=1.f/(1.f+precise::exp(abs(x)));
+        float score=x<0 ? p : 1.f-p;
+        pairs[2*e]=score;
+        pairs[2*e+1]=score+float(bias[e]);
+    }
+"""
+
 _kernel = mx.fast.metal_kernel(
-    name="inkling_normalized_router", input_names=["x", "norm_w", "route_w", "eps", "squares"],
+    name="inkling_normalized_router", input_names=["x", "norm_w", "route_w", "eps", "squares", "bias"],
+    header=_ROUTE_PAIR_HEADER,
     output_names=["normalized", "logits"],
     source="""
         uint tid=thread_position_in_threadgroup.x, lane=thread_index_in_simdgroup;
@@ -47,7 +59,8 @@ _kernel = mx.fast.metal_kernel(
         if (tid<ROWS) {
             float total=partial[0][tid];
             for (uint i=1;i<8;++i) total+=partial[i][tid];
-            logits[base+tid]=total;
+            if (PAIRED) store_route_pair(logits,bias,base+tid,total);
+            else logits[base+tid]=total;
         }
     """,
 )
@@ -139,6 +152,62 @@ _select = mx.fast.metal_kernel(
 )
 
 
+_rank_pairs = mx.fast.metal_kernel(
+    name="inkling_rank_probability_pairs",input_names=["logits","eps","scale"],
+    output_names=["inds","weights"],source="""
+        uint tid=thread_position_in_threadgroup.x, lane=thread_index_in_simdgroup;
+        uint warp=simdgroup_index_in_threadgroup;
+        threadgroup float selected[8];
+        float scores[4], other[4];
+        bool special=false;
+        for (uint j=0;j<4;++j) {
+            float2 pair=((device const float2*)logits)[lane+32*j];
+            scores[j]=pair.x; other[j]=pair.y;
+            special |= !isfinite(pair.y);
+        }
+        if (simd_any(special)) {
+            if (!warp) {
+                float b[4];
+                for (uint j=0;j<4;++j) b[j]=other[j];
+                for (uint k=0;k<8;++k) {
+                    float best=-INFINITY;
+                    uint which=128;
+                    for (uint j=0;j<4;++j) {
+                        uint e=lane+32*j;
+                        if (b[j]>best || (b[j]==best && e<which)) {best=b[j];which=e;}
+                    }
+                    float peak=simd_max(best);
+                    uint winner=simd_min(best==peak ? which : 128u);
+                    float keep=0;
+                    for (uint j=0;j<4;++j) if (lane+32*j==winner) {
+                        keep=scores[j]; b[j]=-INFINITY;
+                    }
+                    float w=simd_sum(keep);
+                    if (!lane) {inds[k]=winner; selected[k]=w;}
+                }
+            }
+        } else {
+            for (uint i=0;i<4;++i) {
+                uint e=warp+32*i;
+                float query=simd_shuffle(other[i],warp);
+                uint ahead=0;
+                for (uint j=0;j<4;++j)
+                    ahead+=uint(other[j]>query || (other[j]==query && lane+32*j<e));
+                uint rank=simd_sum(ahead);
+                float score=simd_shuffle(scores[i],warp);
+                if (!lane && rank<8) {inds[rank]=e; selected[rank]=score;}
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid<8) {
+            float total=0;
+            for (uint i=0;i<8;++i) total=selected[i]+total;
+            weights[tid]=selected[tid]/(total+eps)*scale;
+        }
+    """,
+)
+
+
 def route(layer, x, dtype, normalized=False, logits=None, squares=None):
     norm, gate = layer.post_attention_layernorm, layer.mlp.gate
     if (type(norm) is not nn.RMSNorm or type(gate) is not layers.TopKRouter
@@ -150,14 +219,17 @@ def route(layer, x, dtype, normalized=False, logits=None, squares=None):
         logits = _dot_only(inputs=[x,native(gate)],grid=(32*256,1,1),threadgroup=(256,1,1),
                            output_shapes=[(1,1,128)],output_dtypes=[mx.float32])[0]
     elif not normalized:
-        x, logits = _kernel(inputs=[x,norm.weight,native(gate),scalar(norm.eps),x if squares is None else squares],
-                            template=[("PRECOMPUTED",squares is not None),("ROWS",2 if squares is not None else 4)],
+        paired = gate.top_k==8
+        x, logits = _kernel(inputs=[x,norm.weight,native(gate),scalar(norm.eps),x if squares is None else squares,gate.e_score_correction_bias],
+                            template=[("PAIRED",paired),("PRECOMPUTED",squares is not None),("ROWS",2 if squares is not None else 4)],
                             grid=((64 if squares is not None else 32)*256,1,1),threadgroup=(256,1,1),
-                            output_shapes=[x.shape,(1,1,128)],output_dtypes=[dtype,mx.float32])
+                            output_shapes=[x.shape,(1,1,128,2) if paired else (1,1,128)],output_dtypes=[dtype,mx.float32])
     if gate.top_k == 8:
-        indices, weights = _select(
-            inputs=[logits,gate.e_score_correction_bias,scalar(layers._ROUTER_SCORE_EPS),
-                    scalar(gate.routed_scaling_factor)], grid=(1024,1,1),threadgroup=(1024,1,1),
+        paired = logits.shape==(1,1,128,2)
+        kernel = _rank_pairs if paired else _select
+        args = [logits] if paired else [logits,gate.e_score_correction_bias]
+        args.extend([scalar(layers._ROUTER_SCORE_EPS),scalar(gate.routed_scaling_factor)])
+        indices, weights = kernel(inputs=args, grid=(1024,1,1),threadgroup=(1024,1,1),
             output_shapes=[(1,1,8)]*2, output_dtypes=[mx.uint32,mx.float32])
     else:
         indices, weights = layers.expert_routing(

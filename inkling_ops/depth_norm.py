@@ -238,7 +238,7 @@ def make_projected(normalize,routes=False,bottleneck=False):
     if normalize:
         inputs.extend(["weights","eps"])
     if routes:
-        inputs.append("gate")
+        inputs.extend(["gate","bias"])
         source=source.replace("query = threadgroup_position_in_grid.x", "query = 0").replace(
             "mixed[col]=bfloat16_t((values[j]*inv)*float(weights[col]));",
             "bfloat16_t value=bfloat16_t((values[j]*inv)*float(weights[col])); "
@@ -289,8 +289,12 @@ def make_projected(normalize,routes=False,bottleneck=False):
                 "norm[col+j],float(gate[(first+r)*2304+col+j])",
                 "(col<2304 ? norm[col+j] : float(bfloat16_t(message[col+j-2304]))),"
                 "float(gate[(first+r)*4608+col+j])")
+        from .router import _ROUTE_PAIR_HEADER
+        if routes:
+            tail=tail.replace("logits[threadgroup_position_in_grid.x*2+tid]=sum;",
+                              "store_route_pair(logits,bias,threadgroup_position_in_grid.x*2+tid,sum);")
         source+=tail
-        return mx.fast.metal_kernel(name="inkling_depth_message_reduce" if bottleneck else "inkling_depth_router_scores",input_names=inputs,
+        return mx.fast.metal_kernel(header=_ROUTE_PAIR_HEADER if routes else "",name="inkling_depth_message_reduce" if bottleneck else "inkling_depth_router_scores",input_names=inputs,
                                     output_names=["mixed","logits"],source=source)
     return mx.fast.metal_kernel(name="inkling_projected_depth_norm" if normalize else "inkling_projected_depth",
                                 input_names=inputs,output_names=["mixed"],source=source)
@@ -312,9 +316,9 @@ def from_projection(layer, blocks, residual, squares, normalize, gate=None, mess
                                   grid=(32*576,1,1),threadgroup=(576,1,1),
                                   output_shapes=[(1,1,1,2304),(1,1,64)],output_dtypes=[mx.float32,mx.bfloat16])
     if gate is not None:
-        return _projected_routes(inputs=[*inputs,gate],template=[("K",blocks.shape[0]),*config],
+        return _projected_routes(inputs=[*inputs,gate,layer.mlp.gate.e_score_correction_bias],template=[("K",blocks.shape[0]),*config],
                                  grid=(64*576,1,1),threadgroup=(576,1,1),
-                                 output_shapes=[(1,1,1,2304),(1,1,128)],output_dtypes=[mx.bfloat16,mx.float32])
+                                 output_shapes=[(1,1,1,2304),(1,1,128,2)],output_dtypes=[mx.bfloat16,mx.float32])
     return _projected[normalize](inputs=inputs,template=[("K",blocks.shape[0]),*config],
                                  grid=(576,1,1),threadgroup=(576,1,1),
                                  output_shapes=[(1,1,1,2304)],
