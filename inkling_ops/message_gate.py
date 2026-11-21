@@ -3,7 +3,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.inkling2 import layers
 
-from .gain import apply
+from .gain import apply, pack
 from .exact_sources import native
 
 from . import paired_norm
@@ -12,7 +12,7 @@ _reference = layers.MessageGate.__call__
 
 
 @mx.compile
-def _project(hidden, message, down, paired, normalized=None):
+def _project(hidden, message, down, paired, tiled, normalized=None):
     if hidden.shape[-1] == 2304 and hidden.dtype == message.dtype == mx.float32:
         joined = paired_norm.join(hidden, message if normalized is None else normalized, down.dtype, normalized is not None)
     else:
@@ -21,7 +21,7 @@ def _project(hidden, message, down, paired, normalized=None):
         )
     reduced = joined.astype(down.dtype) @ down.T
     if reduced.shape[-1] == 64 and hidden.shape[-1] == 2304 and paired.dtype in (mx.bfloat16, mx.float32):
-        return apply(reduced, paired, hidden, message)
+        return apply(reduced, tiled, hidden, message)
     gates = mx.tanh(reduced.astype(mx.float32) @ paired.T)
     forget, gain = mx.split(gates, 2, axis=-1)
     return (1 - forget) * hidden + gain * message
@@ -37,9 +37,10 @@ def project(layer, hidden_states, message, normalized=None):
     gain = layer.message_gate_proj.weight
     cached = getattr(layer, "_paired_weights", None)
     if cached is None or cached[0] is not forget or cached[1] is not gain:
-        cached = (forget, gain, mx.concatenate((native(layer.forget_gate_proj), native(layer.message_gate_proj)), axis=0))
+        paired = mx.concatenate((native(layer.forget_gate_proj), native(layer.message_gate_proj)),axis=0)
+        cached = (forget,gain,paired,pack(paired))
         object.__setattr__(layer, "_paired_weights", cached)
-    return _project(hidden_states, message, layer.down_proj.weight, cached[2], normalized)
+    return _project(hidden_states, message, layer.down_proj.weight, cached[2], cached[3], normalized)
 
 
 def install():

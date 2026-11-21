@@ -8,14 +8,15 @@ _kernel = mx.fast.metal_kernel(
         uint row = thread_position_in_grid.x / 4;
         uint col = (lane % 4) * 4;
         uint bank = thread_position_in_grid.y;
-        uint base = (bank * 4608 + row) * 64;
+        uint group = bank*288 + row/8;
         float f = 0, g = 0;
         for (uint tile = 0; tile < 64; tile += 16) {
+            uint base=(group*4+tile/16)*256 + (row%8)*16 + col;
             for (uint i = 0; i < 4; ++i) {
                 uint k = tile + col + i;
                 float v = float(x[bank * 64 + k]);
-                f = fma(v, float(packed[base + k]), f);
-                g = fma(v, float(packed[base + 2304 * 64 + k]), g);
+                f = fma(v, float(packed[base+i]), f);
+                g = fma(v, float(packed[base+128+i]), g);
             }
         }
         f += simd_shuffle_down(f, 2);
@@ -30,6 +31,13 @@ _kernel = mx.fast.metal_kernel(
         }
     """,
 )
+
+
+def pack(weight):
+    if weight.shape[-2:] != (4608,64):
+        return weight
+    banks = weight.size // (4608*64)
+    return mx.contiguous(weight.reshape(banks,2,288,8,4,16).transpose(0,2,4,1,3,5))
 
 
 def apply(x, packed, state, messages):
