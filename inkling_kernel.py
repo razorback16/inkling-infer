@@ -33,6 +33,7 @@ def single_token_moe(self, x):
 
 
 def install():
-    from inkling_ops import short_conv
+    from inkling_ops import message_gate, short_conv
     short_conv.install()
+    message_gate.install()
     layers.SparseMoeBlock.__call__ = single_token_moe
