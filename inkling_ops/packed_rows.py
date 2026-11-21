@@ -79,10 +79,9 @@ _dot = mx.fast.metal_kernel(
             for (uint r=0;r<4;++r) {
                 ushort h=high[r];
                 ushort4 ex=ushort4(h,h>>4,h>>8,h>>12)&15;
-                ushort4 code=(ex<<8)|ushort4(as_type<uchar4>(low[r]));
-                ushort4 rotated=code+(ushort(base[r])<<8);
-                ushort4 bits=(rotated>>1)|(rotated<<15);
-                float4 w=float4(as_type<bfloat4>(bits));
+                uint4 bytes=uint4(as_type<uchar4>(low[r]));
+                uint4 exponent=uint4(ex)+uint(base[r]);
+                float4 w=as_type<float4>((bytes<<31)|(exponent<<23)|((bytes&254u)<<15));
                 for (uint j=0;j<4;++j) sums[r]=fma(v[j],w[j],sums[r]);
             }
         }

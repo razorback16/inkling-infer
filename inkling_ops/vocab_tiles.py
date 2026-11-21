@@ -50,7 +50,7 @@ _dot = mx.fast.metal_kernel(
     output_names=["out"], source="""
         uint lane=thread_index_in_simdgroup, row=thread_position_in_grid.x/32;
         uint fmt=formats[row], mask=fmt&0x3ffffu;
-        ushort base=ushort(fmt>>24)<<8;
+        uint base=fmt>>24;
         float dot=0;
         for (uint t=0;t<18;++t) {
             uint addr=((row/4*18+t)*4+row%4)*48;
@@ -61,8 +61,9 @@ _dot = mx.fast.metal_kernel(
                 ushort hi=((device const ushort*)overflow)[index*32+lane];
                 n|=(ushort4(hi,hi>>4,hi>>8,hi>>12)&15)<<4;
             }
-            ushort4 rot=((n<<8)|ushort4(as_type<uchar4>(tiles[addr+lane])))+base;
-            float4 w=float4(as_type<bfloat4>((rot>>1)|(rot<<15)));
+            uint4 bytes=uint4(as_type<uchar4>(tiles[addr+lane]));
+            uint4 exponent=(uint4(n)+base)&255u;
+            float4 w=as_type<float4>((bytes<<31)|(exponent<<23)|((bytes&254u)<<15));
             float4 a=float4(((device const bfloat4*)x)[t*32+lane]);
             for (uint j=0;j<4;++j) dot=fma(a[j],w[j],dot);
         }
