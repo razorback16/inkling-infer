@@ -102,14 +102,15 @@ def loop(model, x, cache, conv_mask):
                 packed = saved_pages[2]
             else:
                 packed = tuple(mx.contiguous(t) for t in mx.split(packed, [capacity-256], axis=2))
-        if isinstance(packed,tuple) and packed[0].shape[0]==1 and packed[0].shape[-1]==128:
+        if (isinstance(packed,tuple) and packed[0].shape[0]==1 and packed[0].shape[-1]==128
+                and packed[0].dtype==mx.bfloat16):
             prefix=packed[0]
-            saved_prefix=getattr(k,"_interleaved_global_prefix",None)
+            saved_prefix=getattr(k,"_compressed_global_prefix",None)
             if saved_prefix is None or saved_prefix[0] is not prefix:
-                _,banks,length,channels=prefix.shape
-                adjacent=mx.contiguous(prefix.reshape(1,2,banks//2,length,channels).transpose(0,2,3,1,4))
+                from .grouped_attn import pack_prefix
+                adjacent=pack_prefix(prefix)
                 saved_prefix=(prefix,adjacent)
-                k._interleaved_global_prefix=saved_prefix
+                k._compressed_global_prefix=saved_prefix
             packed=(*packed,saved_prefix[1])
         states.append((packed, tuple(conv.cache)))
     saved = getattr(model, "_decode_loop", None)

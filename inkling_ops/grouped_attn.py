@@ -3,9 +3,49 @@ import mlx.core as mx
 from mlx_lm.kernels.common import scalar
 from mlx_lm.models.cache import BatchRotatingKVCache, RotatingKVCache
 
+_pack_prefix = mx.fast.metal_kernel(
+    name="inkling_pack_immutable_prefix",input_names=["kv"],output_names=["tiles"],
+    source="""
+        uint lane=thread_index_in_simdgroup, row=thread_position_in_grid.x/32;
+        uint bank=row/ROWS, index=(row%ROWS)*100, off=index+bank*48;
+        ushort4 bits=((device const ushort4*)kv)[row*32+lane];
+        ushort4 e=(bits>>7)&255;
+        ushort peak=simd_max(max(max(e.x,e.y),max(e.z,e.w)));
+        ushort base=ushort(max(0,int(peak)-15));
+        ushort4 n=e-base;
+        bool raw=simd_any(any(n>15));
+        if (!lane) tiles[index+96+bank]=uint(base)|(uint(raw)<<8);
+        if (!raw) {
+            tiles[off+lane]=as_type<uint>(uchar4((bits<<1)|(bits>>15)));
+            ((device ushort*)(tiles+off+32))[lane]=n.x|(n.y<<4)|(n.z<<8)|(n.w<<12);
+        }
+    """,
+)
+
+
+def pack_prefix(kv):
+    rows=kv.size//256
+    return _pack_prefix(inputs=[kv],template=[("ROWS",rows)],grid=(rows*64,1,1),
+                        threadgroup=(128,1,1),output_shapes=[(rows,100)],output_dtypes=[mx.uint32])[0]
+
+
 _partial = mx.fast.metal_kernel(
     name="inkling_interleaved_attention",
-    input_names=["q","k","v","tail","fresh","rel","w","slot","end","sinks","scale"],output_names=["partials","stats"],
+    input_names=["q","k","v","tail","fresh","rel","w","slot","end","sinks","scale","tiles"],output_names=["partials","stats"],
+    header="""
+        template<typename D>
+        inline float4 prefix_vector(device const uint* tiles,device const D* fallback,
+                                    uint row,uint bank,uint lane) {
+            uint index=row*100, fmt=tiles[index+96+bank], d=row*128+lane*4;
+            if (fmt&256)
+                return float4(fallback[d],fallback[d+1],fallback[d+2],fallback[d+3]);
+            auto data=tiles+index+bank*48;
+            ushort h=((device const ushort*)(data+32))[lane];
+            ushort4 n=ushort4(h,h>>4,h>>8,h>>12)&15;
+            ushort4 rot=(((n+ushort(fmt))<<8)|ushort4(as_type<uchar4>(data[lane])));
+            return float4(as_type<bfloat4>((rot>>1)|(rot<<15)));
+        }
+    """,
     source="""
         uint lane = thread_index_in_simdgroup, head = threadgroup_position_in_grid.y;
         int newest = slot[0] - (PRE_UPDATE ? 0 : 1);
@@ -71,17 +111,22 @@ _partial = mx.fast.metal_kernel(
                     uint p = (kv*length+pos)*128+d;
                     auto keys = in_tail ? tail : k;
                     auto values = in_tail ? tail+NKV*256*128 : v;
+                    float4 key, value;
                     if (ADJACENT && !in_tail) {
-                        p=(kv*length+pos)*256+d;
-                        keys=k; values=k+128;
+                        uint row=kv*length+pos;
+                        key=prefix_vector(tiles,k,row,0,lane);
+                        value=prefix_vector(tiles,v,row,1,lane);
+                    } else {
+                        key=float4(keys[p],keys[p+1],keys[p+2],keys[p+3]);
+                        value=float4(values[p],values[p+1],values[p+2],values[p+3]);
                     }
                     float score = 0;
-                    for (uint j=0; j<4; ++j) score += query[j]*float(keys[p+j]);
+                    for (uint j=0; j<4; ++j) score += query[j]*key[j];
                     score = simd_sum(score)+pb;
                     float top = max(peak,score);
                     float a = fast::exp(peak-top), b = fast::exp(score-top);
                     total = total*a+b;
-                    for (uint j=0; j<4; ++j) accum[j] = accum[j]*a+b*float(values[p+j]);
+                    for (uint j=0; j<4; ++j) accum[j] = accum[j]*a+b*value[j];
                     peak = top;
                 }
             }
@@ -147,8 +192,8 @@ def attend(layer,q,k,v,rel,sinks,cache,gate):
     fresh = getattr(cache,"fresh",None)
     adjacent=getattr(cache,"interleaved_prefix",None)
     parts,stats = _partial(
-        inputs=[q,k if adjacent is None else adjacent,v if adjacent is None else adjacent,tail,q if fresh is None else fresh,rel,w,slot,end,
-                sinks.astype(q.dtype),scalar(layer.scaling)],
+        inputs=[q,k,v,tail,q if fresh is None else fresh,rel,w,slot,end,
+                sinks.astype(q.dtype),scalar(layer.scaling),q.view(mx.uint32) if adjacent is None else adjacent],
         template=[("T",q.dtype),("S",length),("PRE_UPDATE",before is not None),("PAGED",paged),("ADJACENT",adjacent is not None),("FRESH",fresh is not None),("NKV",k.shape[1]),("GQA",heads//k.shape[1]),("WIDTH",width),("SWIZZLED",swizzled),
                   ("R",extent),("WINDOW",layer.sliding_window)],
         grid=(128*32,heads,1),threadgroup=(128,1,1),
