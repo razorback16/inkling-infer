@@ -64,34 +64,6 @@ _compact=mx.fast.metal_kernel(
     """)
 
 
-_global_pair=mx.fast.metal_kernel(name="inkling_native_global_pair",input_names=["kx","vx","kw","vw"],
-    output_names=["pair"],source="""
-        uint lane=thread_index_in_simdgroup,row=thread_position_in_grid.x/32;
-        bool value=row>=1024;
-        auto w=value ? vw : kw;
-        auto x=value ? vx : kx;
-        uint base=(row%1024)*2304;
-        float sum=0;
-        for (uint d=lane*4;d<2304;d+=128) {
-            float4 input=float4(*(device const bfloat4*)(x+d));
-            float4 weights=float4(*(device const bfloat4*)(w+base+d));
-            for (uint j=0;j<4;++j) sum=fma(input[j],weights[j],sum);
-        }
-        for (ushort step=16;step;step>>=1) sum+=simd_shuffle_down(sum,step);
-        if (!lane) pair[row]=bfloat16_t(sum);
-    """)
-
-
-def global_pair(layer,k,v):
-    if (k.shape!=(1,1,2304) or k.shape!=v.shape or k.dtype!=v.dtype or k.dtype!=mx.bfloat16
-            or any(type(p) is not nn.Linear or "bias" in p or p.weight.shape!=(1024,2304)
-                   or p.weight.dtype!=k.dtype for p in (layer.k_proj,layer.v_proj))):
-        return None
-    pair=_global_pair(inputs=[k,v,layer.k_proj.weight,layer.v_proj.weight],grid=(2048*32,1,1),
-                      threadgroup=(128,1,1),output_shapes=[(1,1,2048)],output_dtypes=[k.dtype])[0]
-    return mx.split(pair,2,axis=-1)
-
-
 def prepare(model):
     arrays=[]
     for index in model.args.loop_core:
