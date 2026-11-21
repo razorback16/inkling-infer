@@ -8,10 +8,11 @@ _mix = mx.fast.metal_kernel(
     input_names=["states", "weights"],
     output_names=["out"],
     source="""
+        #pragma clang fp contract(off)
         uint c = thread_position_in_grid.x;
-        volatile float value = 0;
+        float value = 0;
         for (uint e = 0; e < 8; ++e) {
-            volatile float term = float(states[e * 2304 + c]) * float(weights[e]);
+            float term = float(states[e * 2304 + c]) * float(weights[e]);
             value = value + term;
         }
         out[c] = static_cast<T>(value);
@@ -50,9 +51,10 @@ def _make_down(finish):
         name="inkling_finish_nvfp4_layer" if finish else "inkling_nvfp4_down_mix",
         input_names=inputs, output_names=outputs,
     header="""
-        constant float fp4_values[16] = {
-            0, .5, 1, 1.5, 2, 3, 4, 6, -0., -.5, -1, -1.5, -2, -3, -4, -6
-        };
+        inline float decode_nibble(uint bits) {
+            ushort half_bits = ((bits & 7u) << 9) | ((bits & 8u) << 12);
+            return float(as_type<half>(half_bits)) * 16384.f;
+        }
 
         inline float decode_scale(uchar bits) {
             ushort magnitude = bits & 127;
@@ -62,6 +64,7 @@ def _make_down(finish):
         }
     """,
     source="""
+        #pragma clang fp contract(off)
         // Each SIMD group projects one expert into the same four channels.
         uint slot = simdgroup_index_in_threadgroup;
         uint lane = thread_index_in_simdgroup;
@@ -78,13 +81,14 @@ def _make_down(finish):
                 uint q = packed[row * 144 + word];
                 float chunk = 0;
                 for (uint k = 0; k < 8; k += 4) {
-                    chunk += x[k] * fp4_values[q & 15]
-                           + x[k+1] * fp4_values[(q >> 4) & 15]
-                           + x[k+2] * fp4_values[(q >> 8) & 15]
-                           + x[k+3] * fp4_values[(q >> 12) & 15];
+                    chunk += x[k] * decode_nibble(q & 15)
+                           + x[k+1] * decode_nibble((q >> 4) & 15)
+                           + x[k+2] * decode_nibble((q >> 8) & 15)
+                           + x[k+3] * decode_nibble((q >> 12) & 15);
                     q >>= 16;
                 }
-                accum[r] += decode_scale(scales[row * 72 + word / 2]) * chunk;
+                float term = decode_scale(scales[row * 72 + word / 2]) * chunk;
+                accum[r] += term;
             }
         }
         threadgroup float projected[8][4];
@@ -95,9 +99,9 @@ def _make_down(finish):
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (slot == 0 && lane < 4) {
-            volatile float value = 0;
+            float value = 0;
             for (uint e = 0; e < 8; ++e) {
-                volatile float term = projected[e][lane] * float(routing[e]);
+                float term = projected[e][lane] * float(routing[e]);
                 value = value + term;
             }
             STORE

@@ -4,13 +4,14 @@ from mlx_lm.models.inkling2 import layers
 
 _reference = layers.Experts.__call__
 _kernel = mx.fast.metal_kernel(
-    name="inkling_gate_up_fp4",
+    name="inkling_stock_order_gate_up_fp4",
     input_names=["x", "ids", "packed", "scales", "amax"],
     output_names=["out"],
     header="""
-        constant float levels[16] = {
-            0, .5, 1, 1.5, 2, 3, 4, 6, -0., -.5, -1, -1.5, -2, -3, -4, -6
-        };
+        inline float decode_nibble(uint bits) {
+            ushort half_bits = ((bits & 7u) << 9) | ((bits & 8u) << 12);
+            return float(as_type<half>(half_bits)) * 16384.f;
+        }
         inline float fp8_scale(uchar bits) {
             ushort mag = bits & 127;
             ushort raw = (mag << 7) | (((mag + 1) >> 7) << 14) | ((bits & 128) << 8);
@@ -18,6 +19,7 @@ _kernel = mx.fast.metal_kernel(
         }
     """,
     source="""
+        #pragma clang fp contract(off)
         uint lane = thread_index_in_simdgroup;
         uint slot = threadgroup_position_in_grid.y;
         uint expert = ids[slot];
@@ -30,11 +32,13 @@ _kernel = mx.fast.metal_kernel(
                 uint row = expert * 2304 + first + r;
                 uint bits = packed[row * 288 + word];
                 float partial = 0.f;
-                for (uint i = 0; i < 8; ++i) {
-                    partial += v[i] * levels[bits & 15];
-                    bits >>= 4;
+                for (uint i = 0; i < 8; i += 4) {
+                    partial += v[i] * decode_nibble(bits & 15) + v[i+1] * decode_nibble((bits >> 4) & 15)
+                             + v[i+2] * decode_nibble((bits >> 8) & 15) + v[i+3] * decode_nibble((bits >> 12) & 15);
+                    bits >>= 16;
                 }
-                sums[r] += partial * fp8_scale(scales[row * 144 + word / 2]);
+                float term = partial * fp8_scale(scales[row * 144 + word / 2]);
+                sums[r] += term;
             }
         }
         for (uint i = 0; i < 4; ++i) sums[i] = simd_sum(sums[i]);
@@ -42,7 +46,8 @@ _kernel = mx.fast.metal_kernel(
             float scale = amax[expert] / 2688.f;
             float g = float(bfloat16_t(sums[lane * 2] * scale));
             float u = float(bfloat16_t(sums[lane * 2 + 1] * scale));
-            float sigmoid = 1.f / (1.f + precise::exp(-g));
+            float prob = 1.f / (1.f + precise::exp(abs(g)));
+            float sigmoid = g < 0 ? prob : 1.f - prob;
             out[slot * 1152 + first / 2 + lane] = bfloat16_t(
                 (precise::tanh(g / 4.f) * 4.f) * sigmoid * (precise::tanh(u / 25.f) * 25.f));
         }
