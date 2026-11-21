@@ -45,9 +45,7 @@ _pack = mx.fast.metal_kernel(
     """,
 )
 
-_dot = mx.fast.metal_kernel(
-    name="inkling_vocab_twelve_bit_dot", input_names=["x","tiles","overflow","formats","offsets"],
-    output_names=["out"], source="""
+_dot_source = """
         uint lane=thread_index_in_simdgroup, row=thread_position_in_grid.x/32;
         uint fmt=formats[row], mask=fmt&0x3ffffu;
         ushort base=ushort(fmt>>24)<<8;
@@ -68,8 +66,17 @@ _dot = mx.fast.metal_kernel(
         }
         for (ushort step=16;step;step>>=1) dot+=simd_shuffle_down(dot,step);
         if (!lane) out[row]=bfloat16_t(dot);
-    """,
-)
+    """
+
+_dot_inputs=["x","tiles","overflow","formats","offsets"]
+_dot = mx.fast.metal_kernel(name="inkling_vocab_twelve_bit_dot",input_names=_dot_inputs,
+                            output_names=["out"],source=_dot_source)
+_capped = mx.fast.metal_kernel(name="inkling_vocab_twelve_bit_softcap",input_names=_dot_inputs+["table"],
+                               output_names=["out"],source=_dot_source.replace(
+    "if (!lane) out[row]=bfloat16_t(dot);",
+    "if (!lane) { ushort code=as_type<ushort>(bfloat16_t(dot)); "
+    "out[row]=table[((uint(code)&32767u)<<1)|(code>>15)]; }"))
+
 
 
 def encode(w):
@@ -84,7 +91,11 @@ def encode(w):
     return tiles,overflow,formats,offsets
 
 
-def project(x,weight,encoded):
+def project(x,weight,encoded,table=None):
     rows=weight.shape[0]
-    return _dot(inputs=[x,*encoded], grid=(rows*32,1,1), threadgroup=(256,1,1),
-                output_shapes=[(1,1,rows)], output_dtypes=[x.dtype])[0]
+    inputs=[x,*encoded]
+    if table is not None:
+        inputs.append(table)
+    kernel=_dot if table is None else _capped
+    return kernel(inputs=inputs,grid=(rows*32,1,1),threadgroup=(256,1,1),
+                  output_shapes=[(1,1,rows)],output_dtypes=[x.dtype if table is None else mx.float32])[0]
