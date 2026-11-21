@@ -4,7 +4,7 @@ import mlx.nn as nn
 from mlx_lm.models.inkling2 import layers
 
 from .head_norm import normalize
-from . import rel_mask, filtered_kv
+from . import rel_mask, filtered_kv, packed_rows
 
 _sliding = layers.SlidingAttention.__call__
 _full = layers.FullAttention.__call__
@@ -24,6 +24,31 @@ def projection(layer, modules, key):
     return cached[1:]
 
 
+def prepare_query_weights(model):
+    arrays = []
+    for index, block in enumerate(model.layers):
+        layer = block.self_attn
+        common = (layer.q_proj,layer.r_proj,layer.gate_proj)
+        variants = []
+        if isinstance(layer,layers.SlidingAttention):
+            variants.append(("_all_qkv",common+(layer.k_proj,layer.v_proj)))
+        if isinstance(layer,layers.FullAttention) or index in model.args.loop_core:
+            variants.append(("_common_q",common))
+        for name, modules in variants:
+            if any(type(p) is not nn.Linear or "bias" in p or p.weight.dtype!=mx.bfloat16
+                   or p.weight.shape[1]!=2304 for p in modules):
+                continue
+            weight,_ = projection(layer,modules,name)
+            saved = getattr(layer,name+"_tiles",None)
+            if weight.shape[0]%16 or (saved is not None and saved[0] is weight):
+                continue
+            encoded = packed_rows.encode(weight)
+            object.__setattr__(layer,name+"_tiles",(weight,encoded))
+            arrays.extend(encoded)
+    if arrays:
+        mx.eval(arrays)
+
+
 def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cache, conv_states, conv_mask):
     full = isinstance(layer, layers.FullAttention)
     same = hidden_states is key_hidden_states and hidden_states is value_hidden_states
@@ -33,8 +58,13 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
         reference = _full if full else _sliding
         return reference(layer, hidden_states, key_hidden_states, value_hidden_states,
                           cache=cache, conv_states=conv_states, conv_mask=conv_mask)
-    packed, boundaries = projection(layer, modules, "_all_qkv" if same else "_common_q")
-    parts = mx.split(hidden_states @ packed.T, boundaries, axis=-1)
+    name = "_all_qkv" if same else "_common_q"
+    packed, boundaries = projection(layer,modules,name)
+    tiles = getattr(layer,name+"_tiles",None)
+    projected = (packed_rows.project(hidden_states,packed,tiles[1])
+                 if tiles is not None and tiles[0] is packed and hidden_states.dtype==mx.bfloat16
+                 else hidden_states @ packed.T)
+    parts = mx.split(projected,boundaries,axis=-1)
     query, relative, gate = parts[:3]
     sinks = layer.sink_proj(hidden_states)
     filtered = (None if full or same else
