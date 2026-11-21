@@ -8,12 +8,7 @@ from .packed_rows import _dot_source
 
 _epilogue = """
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        uint segment=threadgroup_position_in_grid.x;
-        uint tid=thread_position_in_threadgroup.x;
-        if (segment>=27 && segment<51) {
-            if (tid<128) gate[(segment-27)*128+tid]=raw[tid];
-            return;
-        }
+        uint segment=bank;
         if (segment>=24 && segment<27) {
             if (sg>=8 || lane>=16) return;
             uint head=(segment-24)*8+sg, base=head*16;
@@ -64,10 +59,21 @@ _epilogue = """
 def _make_kernel(distinct):
     inputs=["x","payload","qs","rs","qt","rt","eps","attention_scale","kh","vh","kw","vw"]
     prefix="#pragma clang fp contract(off)\nthreadgroup bfloat16_t raw[128]; uint sg=simdgroup_index_in_threadgroup;\n"
+    prefix+="uint work=threadgroup_position_in_grid.x; bool gate_group=work>=27 && work<75; uint bank=work<27 ? work : work<75 ? 27+(work-27)/2 : work-24;\n"
     projection=_dot_source.replace("out[group*4+r]=bfloat16_t(dot);","raw[sg*4+r]=bfloat16_t(dot);")
+    first=projection.index("uint2 meta=")
+    projection=projection[:first]+"""if (gate_group) group=27*32+(work-27)*16+sg/2;
+        else group=bank*32+sg;
+        uint first=gate_group ? (sg%2)*2 : 0, end=gate_group ? first+2 : 4;
+        """+projection[first:]
+    projection=projection.replace("uint r=0;r<4;++r","uint r=first;r<end;++r")
+    projection=projection.replace("if (!lane) raw[sg*4+r]=bfloat16_t(dot);","""if (!lane) {
+                if (gate_group) gate[(group-27*32)*4+r]=bfloat16_t(dot);
+                else raw[sg*4+r]=bfloat16_t(dot);
+            }""")+"\nif (gate_group) return;\n"
     if distinct:
         inputs+=["kx","vx"]
-        prefix+="uint bank=threadgroup_position_in_grid.x; auto input=bank<51 ? x : bank<59 ? kx : vx;\n"
+        prefix+="auto input=bank<51 ? x : bank<59 ? kx : vx;\n"
         projection=projection.replace("(x+d)","(input+d)")
     return mx.fast.metal_kernel(
         name="inkling_project_recurrent_heads" if distinct else "inkling_project_complete_heads",input_names=inputs,
@@ -94,7 +100,7 @@ def compute(layer,x,packed,tiles,conv_states,conv_mask,kv,extra=()):
     q,scaled,rel,gate,pair,kh,vh=kernel(
         inputs=[x,*tiles[1],layer.q_l2_clip.scale,layer.rel_l2_clip.scale,scalar(layer.q_l2_clip.threshold),
                 scalar(layer.rel_l2_clip.threshold),scalar(layer.eps),scalar(layer.scaling),*conv_states[:2],kw,vw,*extra],
-        template=[("W",kw.dtype)],grid=(8576*8,1,1),threadgroup=(1024,1,1),
+        template=[("W",kw.dtype)],grid=(91*1024,1,1),threadgroup=(1024,1,1),
         output_shapes=[(1,24,1,128),(1,24,1,128),(1,1,24,16),(1,1,3072),(1,16,1,128),(1,4,1024),(1,4,1024)],
         output_dtypes=[mx.bfloat16,mx.float32,mx.bfloat16,mx.bfloat16,mx.bfloat16,mx.float32,mx.float32])
     conv_states[:2]=kh,vh
