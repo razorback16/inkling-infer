@@ -2,9 +2,12 @@
 import mlx.core as mx
 
 
+# Interleave adjacent rows so each projection streams its preferred stripe width.
+_STRIPE = "constexpr uint stripe = COLS == 3072 ? 16u : (COLS == 2304 ? 2u : 4u);"
+
 _pack_rows = mx.fast.metal_kernel(
     name="inkling_output_row_bytes", input_names=["w"], output_names=["payload","formats"],
-    source="""
+    source=_STRIPE + """
         uint lane=thread_index_in_simdgroup, row=thread_position_in_grid.x/32;
         ushort highest=0;
         for (uint d=lane*4;d<COLS;d+=128) {
@@ -19,7 +22,7 @@ _pack_rows = mx.fast.metal_kernel(
             uint d=tile*128+lane*4;
             ushort4 bits=*(device const ushort4*)((device const ushort*)w+row*COLS+d);
             ushort4 delta=((bits>>7)&255)-base;
-            uint addr=((row/4*(COLS/128)+tile)*4+row%4)*64;
+            uint addr=((row/stripe*(COLS/128)+tile)*stripe+row%stripe)*64;
             if (simd_any(any(delta>15))) {
                 raw_tiles|=1u<<tile;
                 *(device ushort4*)(payload+addr+lane*2)=bits;
@@ -31,12 +34,12 @@ _pack_rows = mx.fast.metal_kernel(
         if (!lane) formats[row]=(uint(base)<<24)|raw_tiles;
     """,
 )
-DOT="""
+DOT=_STRIPE + """
         uint format=formats[row];
         ushort base=ushort(format>>24)<<8;
         float dot=0;
         for (uint tile=0;tile<COLS/128;++tile) {
-            uint d=tile*128+lane*4, addr=((row/4*(COLS/128)+tile)*4+row%4)*64;
+            uint d=tile*128+lane*4, addr=((row/stripe*(COLS/128)+tile)*stripe+row%stripe)*64;
             float4 a=float4(*(device const bfloat4*)(x+d));
             ushort4 bits;
             if (format&(1u<<tile)) {
