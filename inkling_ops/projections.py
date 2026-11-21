@@ -58,9 +58,6 @@ def prepare_query_weights(model):
             variants.append(("_all_qkv",common+(layer.k_proj,layer.v_proj)))
         if isinstance(layer,layers.FullAttention) or index in model.args.loop_core:
             variants.append(("_common_q",common))
-        sink=layer.sink_proj
-        sink_weight=(sink.weight if type(sink) is nn.Linear and "bias" not in sink and
-                     sink.weight.shape==(24,2304) and sink.weight.dtype==mx.bfloat16 else None)
         for name, modules in variants:
             if any(type(p) is not nn.Linear or "bias" in p or p.weight.dtype!=mx.bfloat16
                    or p.weight.shape[1]!=2304 for p in modules):
@@ -77,16 +74,15 @@ def prepare_query_weights(model):
                     data,=tiles[1]
                     subset=(data[:rows//16],)
                     object.__setattr__(layer,name,(weights,w,boundaries))
-                    object.__setattr__(layer,name+"_tiles",(w,subset,tiles[2]))
+                    object.__setattr__(layer,name+"_tiles",(w,subset))
                     arrays.extend(subset)
                     continue
             weight,_ = projection(layer,modules,name)
             saved = getattr(layer,name+"_tiles",None)
-            header_sink=sink_weight if weight.shape[0]>=16*144 else None
-            if weight.shape[0]%16 or (saved is not None and saved[0] is weight and saved[2] is header_sink):
+            if weight.shape[0]%16 or (saved is not None and saved[0] is weight):
                 continue
-            encoded = packed_rows.encode(weight,header_sink)
-            object.__setattr__(layer,name+"_tiles",(weight,encoded,header_sink))
+            encoded = packed_rows.encode(weight)
+            object.__setattr__(layer,name+"_tiles",(weight,encoded))
             arrays.extend(encoded)
     if arrays:
         mx.eval(arrays)
@@ -104,16 +100,12 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
     name = "_all_qkv" if same else "_common_q"
     packed, boundaries = projection(layer,modules,name)
     tiles = getattr(layer,name+"_tiles",None)
-    encoded=tiles is not None and tiles[0] is packed and hidden_states.dtype==mx.bfloat16
-    sink=layer.sink_proj
-    if (encoded and type(sink) is nn.Linear and "bias" not in sink and sink.weight.dtype==mx.bfloat16
-            and tiles[2] is sink.weight and packed.shape[0]>=16*144):
-        projected,sinks=packed_rows.project_sinks(hidden_states,packed,tiles[1],sink.weight)
-    else:
-        projected=packed_rows.project(hidden_states,packed,tiles[1]) if encoded else hidden_states @ packed.T
-        sinks=sink(hidden_states)
+    projected = (packed_rows.project(hidden_states,packed,tiles[1])
+                 if tiles is not None and tiles[0] is packed and hidden_states.dtype==mx.bfloat16
+                 else hidden_states @ packed.T)
     parts = mx.split(projected,boundaries,axis=-1)
     query, relative, gate = parts[:3]
+    sinks = layer.sink_proj(hidden_states)
     filtered = (None if full or same else
                 filtered_kv.apply(layer,key_hidden_states,value_hidden_states,conv_states,conv_mask))
     if filtered is not None:
