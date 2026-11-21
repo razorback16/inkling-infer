@@ -5,7 +5,7 @@ from mlx_lm.models.cache import BatchRotatingKVCache, RotatingKVCache
 
 _partial = mx.fast.metal_kernel(
     name="inkling_interleaved_attention",
-    input_names=["q","k","v","tail","rel","w","slot","end","sinks","sink_x","sink_w","scale"],output_names=["partials","stats"],
+    input_names=["q","k","v","tail","rel","w","slot","end","sinks","scale"],output_names=["partials","stats"],
     source="""
         uint lane = thread_index_in_simdgroup, head = threadgroup_position_in_grid.y;
         uint tile = thread_position_in_grid.x / 32;
@@ -13,27 +13,7 @@ _partial = mx.fast.metal_kernel(
         uint addr = (head*128+tile);
         float4 query;
         for (uint j=0; j<4; ++j) query[j] = scale*float(q[head*128+d+j]);
-        float peak=-FLT_MAX;
-        if (INLINE_SINK && threadgroup_position_in_grid.x==0) {
-            uint warp=simdgroup_index_in_threadgroup;
-            threadgroup float partial_dots[8];
-            for (uint section=warp;section<8;section+=4) {
-                float dot=0;
-                for (uint start=section*128+lane*4;start<2304;start+=1024)
-                    for (uint j=0;j<4;++j)
-                        dot=fma(float(sink_x[start+j]),float(sink_w[head*2304+start+j]),dot);
-                for (ushort n=16;n;n>>=1) dot+=simd_shuffle_down(dot,n);
-                if (!lane) partial_dots[section]=dot;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (!tile) {
-                float sum=partial_dots[0];
-                for (uint i=1;i<8;++i) sum+=partial_dots[i];
-                peak=float(T(sum));
-            }
-        } else if (!tile) {
-            peak=float(sinks[head]);
-        }
+        float peak = tile ? -FLT_MAX : float(sinks[head]);
         float total = tile ? 0.f : 1.f;
         float4 accum = 0;
         if (S==1024 && WINDOW==1024 && end[0]>=1024) {
@@ -133,7 +113,7 @@ _merge = mx.fast.metal_kernel(
 )
 
 
-def attend(layer,q,k,v,rel,sinks,cache,gate,sink_source=None):
+def attend(layer,q,k,v,rel,sinks,cache,gate):
     length, heads = k.shape[2], q.shape[1]
     slot = cache._idx if isinstance(cache,(RotatingKVCache,BatchRotatingKVCache)) else length
     w = layer.rel_logits_proj.proj.astype(rel.dtype)
@@ -151,13 +131,10 @@ def attend(layer,q,k,v,rel,sinks,cache,gate,sink_source=None):
     tail = cache.page_tail if paged else q
     if paged:
         k, v = mx.split(cache.page_prefix, 2, axis=1)
-    inline_sink = sink_source is not None
-    sink_x, sink_w = sink_source if inline_sink else (q,q)
-    initial = q if inline_sink else sinks.astype(q.dtype)
     parts,stats = _partial(
         inputs=[q,k,v,tail,rel,w,mx.array(slot,mx.int32).reshape(1),mx.array(cache.offset,mx.int32).reshape(1),
-                initial,sink_x,sink_w,scalar(layer.scaling)],
-        template=[("T",q.dtype),("INLINE_SINK",inline_sink),("S",length),("PAGED",paged),("NKV",k.shape[1]),("GQA",heads//k.shape[1]),("WIDTH",width),("SWIZZLED",swizzled),
+                sinks.astype(q.dtype),scalar(layer.scaling)],
+        template=[("T",q.dtype),("S",length),("PAGED",paged),("NKV",k.shape[1]),("GQA",heads//k.shape[1]),("WIDTH",width),("SWIZZLED",swizzled),
                   ("R",extent),("WINDOW",layer.sliding_window)],
         grid=(128*32,heads,1),threadgroup=(128,1,1),
         output_shapes=[(heads,128,128),(heads,128,2)],output_dtypes=[q.dtype,mx.float32])
