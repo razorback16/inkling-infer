@@ -122,6 +122,7 @@ def loop(model, x, cache, conv_mask):
     positions = [None if state[0] is None or type(c[0]) is KVCache else params[slot]
                  for state,c,slot in zip(incoming,cache,slots)]
     result, slab, updated = saved[1](x, incoming, params[offset], positions, slab, ring_slot)
+    mx.async_eval(result)
     views = []
     for c, slot, previous, update in zip(cache, slots, states, updated):
         k, conv = c[0], c[1]
