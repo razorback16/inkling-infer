@@ -3,8 +3,6 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.inkling2 import layers
 
-from .gain import apply
-
 _reference = layers.DecoderLayer._mix_messages
 
 
@@ -13,8 +11,6 @@ def _apply(states, messages, down, up):
     norm = layers.unweighted_rms_norm
     joined = mx.concatenate((norm(states), norm(messages)), axis=-1).astype(down.dtype)
     reduced = (joined @ down.swapaxes(-1, -2)).astype(mx.float32)
-    if reduced.shape[-1] == 64 and states.shape[-1] == 2304 and up.dtype == mx.float32:
-        return apply(reduced, up, states, messages)
     gates = mx.tanh(reduced @ up.swapaxes(-1, -2))
     forget, gain = mx.split(gates, 2, axis=-1)
     return (1 - forget) * states + gain * messages

@@ -3,8 +3,6 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.inkling2 import layers
 
-from .gain import apply
-
 _reference = layers.MessageGate.__call__
 
 
@@ -14,8 +12,6 @@ def _project(hidden, message, down, paired):
         (layers.unweighted_rms_norm(hidden), layers.unweighted_rms_norm(message)), axis=-1
     )
     reduced = joined.astype(down.dtype) @ down.T
-    if reduced.shape[-1] == 64 and hidden.shape[-1] == 2304 and paired.dtype == mx.float32:
-        return apply(reduced, paired, hidden, message)
     gates = mx.tanh(reduced.astype(mx.float32) @ paired.T)
     forget, gain = mx.split(gates, 2, axis=-1)
     return (1 - forget) * hidden + gain * message
