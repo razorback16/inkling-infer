@@ -48,21 +48,12 @@ _dot = mx.fast.metal_kernel(
         uint lane=thread_index_in_simdgroup, group=thread_position_in_grid.x/32;
         uchar4 base=*(device const uchar4*)(bases+group*4);
         float sums[4]={};
-        for (uint begin=0;begin<18;begin+=2) {
-            uint4 lows[2];
-            ushort4 highs[2];
-            float4 vectors[2];
-            #pragma clang loop unroll(full)
-            for (uint j=0;j<2;++j) {
-                uint tile=group*18+begin+j;
-                lows[j]=*(device const uint4*)(payload+tile*192+lane*4);
-                highs[j]=*(device const ushort4*)(payload+tile*192+128+lane*2);
-                vectors[j]=float4(*(device const bfloat4*)(x+(begin+j)*128+lane*4));
-            }
-            #pragma clang loop unroll(full)
-            for (uint phase=0;phase<2;++phase) {
-                uint4 low=lows[phase]; ushort4 high=highs[phase]; float4 v=vectors[phase];
-                uint d=(begin+phase)*128+lane*4;
+        for (uint block=0;block<18;++block) {
+            uint tile=group*18+block;
+            uint4 low=*(device const uint4*)(payload+tile*192+lane*4);
+            ushort4 high=*(device const ushort4*)(payload+tile*192+128+lane*2);
+            uint d=block*128+lane*4;
+            float4 v=float4(*(device const bfloat4*)(x+d));
             for (uint r=0;r<4;++r) {
                 ushort h=high[r];
                 ushort4 ex=ushort4(h,h>>4,h>>8,h>>12)&15;
@@ -75,7 +66,6 @@ _dot = mx.fast.metal_kernel(
                 float4 w=float4(as_type<bfloat4>(bits));
                 for (uint j=0;j<4;++j) sums[r]=fma(v[j],w[j],sums[r]);
             }
-        }
         }
         for (uint r=0;r<4;++r) {
             float dot=sums[r];
