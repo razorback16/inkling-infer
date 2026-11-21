@@ -8,10 +8,11 @@ _mix = mx.fast.metal_kernel(
     input_names=["states", "weights"],
     output_names=["out"],
     source="""
+        #pragma clang fp contract(off)
         uint c = thread_position_in_grid.x;
-        volatile float value = 0;
+        float value = 0;
         for (uint e = 0; e < 8; ++e) {
-            volatile float term = float(states[e * 2304 + c]) * float(weights[e]);
+            float term = float(states[e * 2304 + c]) * float(weights[e]);
             value = value + term;
         }
         out[c] = static_cast<T>(value);
@@ -62,6 +63,7 @@ def _make_down(finish):
         }
     """,
     source="""
+        #pragma clang fp contract(off)
         // Each SIMD group projects one expert into the same four channels.
         uint slot = simdgroup_index_in_threadgroup;
         uint lane = thread_index_in_simdgroup;
@@ -84,7 +86,8 @@ def _make_down(finish):
                            + x[k+3] * fp4_values[(q >> 12) & 15];
                     q >>= 16;
                 }
-                accum[r] += decode_scale(scales[row * 72 + word / 2]) * chunk;
+                float term = decode_scale(scales[row * 72 + word / 2]) * chunk;
+                accum[r] += term;
             }
         }
         threadgroup float projected[8][4];
@@ -95,9 +98,9 @@ def _make_down(finish):
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (slot == 0 && lane < 4) {
-            volatile float value = 0;
+            float value = 0;
             for (uint e = 0; e < 8; ++e) {
-                volatile float term = projected[e][lane] * float(routing[e]);
+                float term = projected[e][lane] * float(routing[e]);
                 value = value + term;
             }
             STORE
