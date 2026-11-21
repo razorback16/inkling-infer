@@ -47,13 +47,14 @@ _dot = mx.fast.metal_kernel(
     source="""
         uint lane=thread_index_in_simdgroup, group=thread_position_in_grid.x/32;
         uchar4 base=*(device const uchar4*)(bases+group*4);
-        float sums[4]={};
+        float4 sums=0;
         for (uint block=0;block<18;++block) {
             uint tile=group*18+block;
             uint4 low=*(device const uint4*)(payload+tile*192+lane*4);
             ushort4 high=*(device const ushort4*)(payload+tile*192+128+lane*2);
             uint d=block*128+lane*4;
             float4 v=float4(*(device const bfloat4*)(x+d));
+            float4 decoded[4];
             for (uint r=0;r<4;++r) {
                 ushort h=high[r];
                 ushort4 ex=ushort4(h,h>>4,h>>8,h>>12)&15;
@@ -63,8 +64,11 @@ _dot = mx.fast.metal_kernel(
                 if (any(code==0)) {
                     bits=*(device const ushort4*)((device const ushort*)weight+(group*4+r)*2304+d);
                 }
-                float4 w=float4(as_type<bfloat4>(bits));
-                for (uint j=0;j<4;++j) sums[r]=fma(v[j],w[j],sums[r]);
+                decoded[r]=float4(as_type<bfloat4>(bits));
+            }
+            for (uint j=0;j<4;++j) {
+                float4 w=float4(decoded[0][j],decoded[1][j],decoded[2][j],decoded[3][j]);
+                sums=fma(float4(v[j]),w,sums);
             }
         }
         for (uint r=0;r<4;++r) {
