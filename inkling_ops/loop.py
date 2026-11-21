@@ -33,14 +33,16 @@ def _compile(model):
                 row = len(grouped)
                 packed = slab[row:row+1]
             pages = packed if isinstance(packed, tuple) else None
-            storage = mx.concatenate(pages, axis=2) if pages is not None else packed
+            storage = mx.concatenate(pages[:2], axis=2) if pages is not None else packed
             keys, values = mx.split(storage, 2, axis=1)
             ring = _DeviceRing(keys, values, offset, slot, packed=storage)
             if shared:
                 grouped.append(ring)
                 ring.grouped = True
             if pages is not None:
-                ring.page_prefix, ring.page_tail = pages
+                ring.page_prefix, ring.page_tail = pages[:2]
+                if len(pages)==3:
+                    ring.interleaved_prefix=pages[2]
             conv = ArraysCache(4)
             conv.cache = list(history)
             caches.append(CacheList(ring, conv))
@@ -100,6 +102,15 @@ def loop(model, x, cache, conv_mask):
                 packed = saved_pages[2]
             else:
                 packed = tuple(mx.contiguous(t) for t in mx.split(packed, [capacity-256], axis=2))
+        if isinstance(packed,tuple) and packed[0].shape[0]==1 and packed[0].shape[-1]==128:
+            prefix=packed[0]
+            saved_prefix=getattr(k,"_interleaved_global_prefix",None)
+            if saved_prefix is None or saved_prefix[0] is not prefix:
+                _,banks,length,channels=prefix.shape
+                adjacent=mx.contiguous(prefix.reshape(1,2,banks//2,length,channels).transpose(0,2,3,1,4))
+                saved_prefix=(prefix,adjacent)
+                k._interleaved_global_prefix=saved_prefix
+            packed=(*packed,saved_prefix[1])
         states.append((packed, tuple(conv.cache)))
     saved = getattr(model, "_decode_loop", None)
     if saved is None or not saved[0].matches(model):

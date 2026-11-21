@@ -71,6 +71,10 @@ _partial = mx.fast.metal_kernel(
                     uint p = (kv*length+pos)*128+d;
                     auto keys = in_tail ? tail : k;
                     auto values = in_tail ? tail+NKV*256*128 : v;
+                    if (ADJACENT && !in_tail) {
+                        p=(kv*length+pos)*256+d;
+                        keys=k; values=k+128;
+                    }
                     float score = 0;
                     for (uint j=0; j<4; ++j) score += query[j]*float(keys[p+j]);
                     score = simd_sum(score)+pb;
@@ -141,10 +145,11 @@ def attend(layer,q,k,v,rel,sinks,cache,gate):
     if before is None:
         slot, end = mx.array(slot,mx.int32).reshape(1), mx.array(end,mx.int32).reshape(1)
     fresh = getattr(cache,"fresh",None)
+    adjacent=getattr(cache,"interleaved_prefix",None)
     parts,stats = _partial(
-        inputs=[q,k,v,tail,q if fresh is None else fresh,rel,w,slot,end,
+        inputs=[q,k if adjacent is None else adjacent,v if adjacent is None else adjacent,tail,q if fresh is None else fresh,rel,w,slot,end,
                 sinks.astype(q.dtype),scalar(layer.scaling)],
-        template=[("T",q.dtype),("S",length),("PRE_UPDATE",before is not None),("PAGED",paged),("FRESH",fresh is not None),("NKV",k.shape[1]),("GQA",heads//k.shape[1]),("WIDTH",width),("SWIZZLED",swizzled),
+        template=[("T",q.dtype),("S",length),("PRE_UPDATE",before is not None),("PAGED",paged),("ADJACENT",adjacent is not None),("FRESH",fresh is not None),("NKV",k.shape[1]),("GQA",heads//k.shape[1]),("WIDTH",width),("SWIZZLED",swizzled),
                   ("R",extent),("WINDOW",layer.sliding_window)],
         grid=(128*32,heads,1),threadgroup=(128,1,1),
         output_shapes=[(heads,128,128),(heads,128,2)],output_dtypes=[q.dtype,mx.float32])
