@@ -117,68 +117,6 @@ _merge = mx.fast.metal_kernel(
 )
 
 
-_sliding_fused=mx.fast.metal_kernel(
-    name="inkling_sliding_attention_one_dispatch",
-    input_names=["q","k","v","fresh","rel","w","slot","sinks","scale","gate"],output_names=["out"],
-    source="""
-        uint head=threadgroup_position_in_grid.y,chunk=threadgroup_position_in_grid.x;
-        uint lane=thread_index_in_simdgroup,warp=simdgroup_index_in_threadgroup;
-        uint kv=head/GQA,newest=uint(slot[0]);
-        float4 query=float4(*(device const bfloat4*)(q+head*128+lane*4))*scale;
-        threadgroup bfloat16_t buffer[128][32];
-        threadgroup float peaks[128], totals[128];
-        for (uint tile=warp;tile<128;tile+=32) {
-            float bias=0;
-            if (lane<8) {
-                uint dist=(newest-tile-128*lane)&1023;
-                if (dist<R) {
-                    for (uint j=0;j<WIDTH;++j)
-                        bias=fma(float(rel[head*WIDTH+j]),float(w[SWIZZLED ? ((dist%128)*WIDTH+j)*(R/128)+dist/128 : j*R+dist]),bias);
-                    bias=float(bfloat16_t(bias));
-                }
-            }
-            float score[8];
-            for (uint pos=0;pos<8;++pos) {
-                uint at=tile+pos*128;
-                auto keys=at==newest ? fresh+kv*128 : k+(kv*1024+at)*128;
-                float4 key=float4(*(device const bfloat4*)(keys+lane*4));
-                float dot=0;
-                for (uint j=0;j<4;++j) dot+=query[j]*key[j];
-                score[pos]=simd_sum(dot)+simd_shuffle(bias,pos);
-            }
-            float peak=tile ? -FLT_MAX : float(sinks[head]),total=tile ? 0.f : 1.f,acc=0;
-            for (uint pos=0;pos<8;++pos) {
-                uint at=tile+pos*128;
-                auto values=at==newest ? fresh+(NKV+kv)*128 : v+(kv*1024+at)*128;
-                float value=float(values[chunk*32+lane]);
-                float top=max(peak,score[pos]);
-                float a=fast::exp(peak-top),b=fast::exp(score[pos]-top);
-                total=total*a+b; acc=acc*a+b*value; peak=top;
-            }
-            buffer[tile][lane]=bfloat16_t(acc);
-            if (!lane) {peaks[tile]=peak;totals[tile]=total;}
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        float peak=-FLT_MAX;
-        for (uint i=lane;i<128;i+=32) peak=max(peak,peaks[i]);
-        peak=simd_max(peak);
-        float z=0,acc=0;
-        for (uint i=lane;i<128;i+=32) {
-            float a=fast::exp(peaks[i]-peak);
-            z+=a*totals[i];
-            acc+=a*float(buffer[i][warp]);
-        }
-        z=simd_sum(z);
-        float value=float(bfloat16_t(simd_sum(acc)/z));
-        if (!lane) {
-            uint col=head*128+chunk*32+warp;
-            float g=float(gate[col]),p=1.f/(1.f+precise::exp(abs(g)));
-            out[col]=bfloat16_t(value*(g<0 ? p : 1.f-p));
-        }
-    """,
-)
-
-
 def attend(layer,q,k,v,rel,sinks,cache,gate):
     length, heads = k.shape[2], q.shape[1]
     slot = cache._idx if isinstance(cache,(RotatingKVCache,BatchRotatingKVCache)) else length
@@ -203,13 +141,6 @@ def attend(layer,q,k,v,rel,sinks,cache,gate):
     if before is None:
         slot, end = mx.array(slot,mx.int32).reshape(1), mx.array(end,mx.int32).reshape(1)
     fresh = getattr(cache,"fresh",None)
-    if (length==layer.sliding_window==1024 and fresh is not None and before is not None
-            and q.dtype==gate.dtype==mx.bfloat16):
-        return _sliding_fused(inputs=[q,k,v,fresh,rel,w,slot,sinks.astype(q.dtype),scalar(layer.scaling),gate],
-                              template=[("GQA",heads//k.shape[1]),("NKV",k.shape[1]),("R",extent),
-                                        ("WIDTH",width),("SWIZZLED",swizzled)],
-                              grid=(4*1024,heads,1),threadgroup=(1024,1,1),
-                              output_shapes=[gate.shape],output_dtypes=[gate.dtype])[0]
     parts,stats = _partial(
         inputs=[q,k,v,tail,q if fresh is None else fresh,rel,w,slot,end,
                 sinks.astype(q.dtype),scalar(layer.scaling)],
