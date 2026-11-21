@@ -230,30 +230,30 @@ def make_projected(normalize,routes=False,bottleneck=False):
     if routes or bottleneck:
         tail = """
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            threadgroup float partial[16][2];
-            uint first=threadgroup_position_in_grid.x*4+(sg/8)*2;
+            threadgroup float partial[16][1];
+            uint first=threadgroup_position_in_grid.x*2+sg/8;
             if (tid<512) {
-                float dots[2]={};
+                float dots[1]={};
                 for (uint col=(tid%256)*4;col<2304;col+=1024)
                     for (uint j=0;j<4;++j)
-                        for (uint r=0;r<2;++r)
+                        for (uint r=0;r<1;++r)
                             dots[r]=fma(norm[col+j],float(gate[(first+r)*2304+col+j]),dots[r]);
-                for (uint r=0;r<2;++r) {
+                for (uint r=0;r<1;++r) {
                     float sum=dots[r];
                     for (ushort step=16;step;step>>=1) sum+=simd_shuffle_down(sum,step);
                     if (!lane) partial[sg][r]=sum;
                 }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (tid<4) {
-                uint bank=(tid/2)*8, col=tid%2;
+            if (tid<2) {
+                uint bank=tid*8, col=0;
                 float sum=partial[bank][col];
                 for (uint i=1;i<8;++i) sum+=partial[bank+i][col];
-                logits[threadgroup_position_in_grid.x*4+tid]=sum;
+                logits[threadgroup_position_in_grid.x*2+tid]=sum;
             }
         """
         if bottleneck:
-            tail=tail.replace("*4+tid]=sum;", "*4+tid]=bfloat16_t(sum);")
+            tail=tail.replace("*2+tid]=sum;", "*2+tid]=bfloat16_t(sum);")
             tail=tail.replace("col<2304", "col<4608").replace(
                 "norm[col+j],float(gate[(first+r)*2304+col+j])",
                 "(col<2304 ? norm[col+j] : float(bfloat16_t(message[col+j-2304]))),"
@@ -278,11 +278,11 @@ def from_projection(layer, blocks, residual, squares, normalize, gate=None, mess
         inputs.extend([norm.weight,scalar(norm.eps)])
     if message is not None:
         return _projected_message(inputs=[*inputs,gate,message],template=[("K",blocks.shape[0]),*config],
-                                  grid=(16*576,1,1),threadgroup=(576,1,1),
+                                  grid=(32*576,1,1),threadgroup=(576,1,1),
                                   output_shapes=[(1,1,1,2304),(1,1,64)],output_dtypes=[mx.float32,mx.bfloat16])
     if gate is not None:
         return _projected_routes(inputs=[*inputs,gate],template=[("K",blocks.shape[0]),*config],
-                                 grid=(32*576,1,1),threadgroup=(576,1,1),
+                                 grid=(64*576,1,1),threadgroup=(576,1,1),
                                  output_shapes=[(1,1,1,2304),(1,1,128)],output_dtypes=[mx.bfloat16,mx.float32])
     return _projected[normalize](inputs=inputs,template=[("K",blocks.shape[0]),*config],
                                  grid=(576,1,1),threadgroup=(576,1,1),
