@@ -1,5 +1,7 @@
 """Normalize the residual and evaluate the learned depth queries in one launch."""
 import mlx.core as mx
+import mlx.nn as nn
+from mlx_lm.kernels.common import scalar
 
 _filter = """
             uint d = tid*4+j;
@@ -94,6 +96,53 @@ def evaluate(module, blocks, x):
     return _kernel(inputs=[x,blocks,module.query], template=[("K",blocks.shape[0])],
                    grid=(q*576,1,1),threadgroup=(576,1,1),
                    output_shapes=[(1,1,q,2304),x.shape],output_dtypes=[mx.float32,mx.float32])
+
+
+_normalized_input_source = _source.replace("FILTER", "").replace(
+    "mixed[query*2304+d] = v + norm[d]*coeff[K];",
+    "values[j] = v + norm[d]*coeff[K];")
+_normalized_inputs = mx.fast.metal_kernel(
+    name="inkling_depth_attention_input_norm",
+    input_names=["x", "blocks", "queries", "weights", "eps"],
+    output_names=["mixed", "normalized"],
+    source=_normalized_input_source + """
+        float norm2=0;
+        for (uint j=0; j<4; ++j) norm2+=values[j]*values[j];
+        norm2=simd_sum(norm2);
+        if (!lane) sums[sg]=norm2;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float inv=precise::rsqrt(simd_sum(lane<18 ? sums[lane] : 0.f)/2304.f+eps);
+        for (uint j=0; j<4; ++j) {
+            uint col=query*2304+tid*4+j;
+            mixed[col]=bfloat16_t((values[j]*inv)*float(weights[col]));
+        }
+    """,
+)
+
+
+def attention_inputs(layer, blocks, x):
+    if hasattr(layer, "input_layernorm"):
+        norms = (layer.input_layernorm,)
+    else:
+        norms = (layer.q_input_layernorm, layer.k_input_layernorm, layer.v_input_layernorm)
+    if any(type(norm) is not nn.RMSNorm or norm.eps != norms[0].eps for norm in norms):
+        return None
+    weights = tuple(norm.weight for norm in norms)
+    if len(weights) == 1:
+        joined = weights[0]
+    else:
+        saved = getattr(layer, "_attention_norm_weights", None)
+        if saved is None or any(a is not b for a,b in zip(saved[0],weights)):
+            saved = (weights, mx.concatenate(weights))
+            object.__setattr__(layer, "_attention_norm_weights", saved)
+        joined = saved[1]
+    q = len(norms)
+    states, normalized = _normalized_inputs(
+        inputs=[x,blocks,layer.attention_input.query,joined,scalar(norms[0].eps)],
+        template=[("K",blocks.shape[0])], grid=(q*576,1,1), threadgroup=(576,1,1),
+        output_shapes=[(1,q,2304),x.shape],output_dtypes=[mx.bfloat16,mx.float32])
+    inputs = (states,)*3 if q==1 else tuple(mx.split(states,3,axis=1))
+    return inputs, normalized
 
 
 def post_attention(layer, blocks, attention, history, hidden):

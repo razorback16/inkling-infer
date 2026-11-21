@@ -20,12 +20,18 @@ def decode(layer, hidden_states, block_states, *, cache=None, conv_mask=None, me
             or (not fused_down and getattr(down, "mode", None) != "mxfp8")):
         return _reference(layer, hidden_states, block_states, cache=cache, conv_mask=conv_mask, messages=messages)
     history = list(cache[1].cache)
-    if layer.attention_input is None:
-        normed = layers.unweighted_rms_norm(hidden_states.astype(mx.float32))
-        inputs = None
+    normalized_inputs = (depth_norm.attention_inputs(layer,block_states,hidden_states)
+                         if messages is None and layer.attention_input is not None else None)
+    if normalized_inputs is not None:
+        states, normed = normalized_inputs
+        attention = layer.self_attn(*states, cache=cache, conv_states=history, conv_mask=None)
     else:
-        inputs, normed = depth_norm.evaluate(layer.attention_input, block_states, hidden_states)
-    attention = layer._self_attention(hidden_states,inputs,cache,history,None,messages)
+        if layer.attention_input is None:
+            normed = layers.unweighted_rms_norm(hidden_states.astype(mx.float32))
+            inputs = None
+        else:
+            inputs, normed = depth_norm.evaluate(layer.attention_input, block_states, hidden_states)
+        attention = layer._self_attention(hidden_states,inputs,cache,history,None,messages)
     if layer.is_block_boundary:
         block = normed[None]
         block_states = block if block_states is None else mx.concatenate((block_states, block))
