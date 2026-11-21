@@ -42,7 +42,7 @@ _project = mx.fast.metal_kernel(
 
 
 def apply(layer,k,v,histories,mask):
-    if (mask is not None or k.shape != (1,1,2304) or k.dtype != v.dtype or k.dtype != mx.bfloat16
+    if (mask is not None or k.shape != (1,1,2304) or v.shape != k.shape or k.dtype != v.dtype or k.dtype != mx.bfloat16
             or any(type(p) is not nn.Linear or "bias" in p or p.weight.shape != (1024,2304)
                    or p.weight.dtype != k.dtype for p in (layer.k_proj,layer.v_proj))
             or any(type(c) is not layers.ShortConvolution or c.kernel_size != 4

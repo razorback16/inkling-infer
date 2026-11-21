@@ -8,6 +8,8 @@ _partial = mx.fast.metal_kernel(
     input_names=["q","k","v","tail","rel","w","slot","end","sinks","scale"],output_names=["partials","stats"],
     source="""
         uint lane = thread_index_in_simdgroup, head = threadgroup_position_in_grid.y;
+        int newest = slot[0] - (PRE_UPDATE ? 0 : 1);
+        int valid = end[0] + (PRE_UPDATE ? 1 : 0);
         uint tile = thread_position_in_grid.x / 32;
         uint kv = head / GQA, d = lane*4;
         uint addr = (head*128+tile);
@@ -16,10 +18,10 @@ _partial = mx.fast.metal_kernel(
         float peak = tile ? -FLT_MAX : float(sinks[head]);
         float total = tile ? 0.f : 1.f;
         float4 accum = 0;
-        if (S==1024 && WINDOW==1024 && end[0]>=1024) {
+        if (S==1024 && WINDOW==1024 && valid>=1024) {
             float bias = 0;
             if (lane < 8) {
-                uint dist = uint(slot[0]-1-int(tile+128*lane)) & 1023u;
+                uint dist = uint(newest-int(tile+128*lane)) & 1023u;
                 if (dist<R) {
                     for (uint j=0; j<WIDTH; ++j)
                         bias = fma(float(rel[head*WIDTH+j]),float(w[SWIZZLED ? ((dist%128)*WIDTH+j)*(R/128)+dist/128 : j*R+dist]),bias);
@@ -48,10 +50,10 @@ _partial = mx.fast.metal_kernel(
         } else {
             for (uint chunk=0; chunk<S; chunk+=4096) {
                 int pos = chunk + tile + lane*128;
-                int dist = slot[0]-1-pos;
+                int dist = newest-pos;
                 if (dist < 0) dist += S;
                 float bias = 0;
-                if (pos >= S || dist >= end[0] || (WINDOW && dist >= WINDOW)) bias = -INFINITY;
+                if (pos >= S || dist >= valid || (WINDOW && dist >= WINDOW)) bias = -INFINITY;
                 else if (dist < R) {
                     for (uint j=0; j<WIDTH; ++j)
                         bias = fma(float(rel[head*WIDTH+j]), float(w[SWIZZLED ? ((dist%128)*WIDTH+j)*(R/128)+dist/128 : j*R+dist]), bias);
@@ -116,6 +118,8 @@ _merge = mx.fast.metal_kernel(
 def attend(layer,q,k,v,rel,sinks,cache,gate):
     length, heads = k.shape[2], q.shape[1]
     slot = cache._idx if isinstance(cache,(RotatingKVCache,BatchRotatingKVCache)) else length
+    before = getattr(cache, "write_coordinates", None)
+    slot, end = before if before is not None else (slot, cache.offset)
     w = layer.rel_logits_proj.proj.astype(rel.dtype)
     width, extent = w.shape
     swizzled = extent % 128 == 0
@@ -132,9 +136,9 @@ def attend(layer,q,k,v,rel,sinks,cache,gate):
     if paged:
         k, v = mx.split(cache.page_prefix, 2, axis=1)
     parts,stats = _partial(
-        inputs=[q,k,v,tail,rel,w,mx.array(slot,mx.int32).reshape(1),mx.array(cache.offset,mx.int32).reshape(1),
+        inputs=[q,k,v,tail,rel,w,mx.array(slot,mx.int32).reshape(1),mx.array(end,mx.int32).reshape(1),
                 sinks.astype(q.dtype),scalar(layer.scaling)],
-        template=[("T",q.dtype),("S",length),("PAGED",paged),("NKV",k.shape[1]),("GQA",heads//k.shape[1]),("WIDTH",width),("SWIZZLED",swizzled),
+        template=[("T",q.dtype),("S",length),("PRE_UPDATE",before is not None),("PAGED",paged),("NKV",k.shape[1]),("GQA",heads//k.shape[1]),("WIDTH",width),("SWIZZLED",swizzled),
                   ("R",extent),("WINDOW",layer.sliding_window)],
         grid=(128*32,heads,1),threadgroup=(128,1,1),
         output_shapes=[(heads,128,128),(heads,128,2)],output_dtypes=[q.dtype,mx.float32])

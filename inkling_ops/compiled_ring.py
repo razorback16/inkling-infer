@@ -18,6 +18,7 @@ class _DeviceRing(RotatingKVCache):
         self._idx = slot
 
     def update_and_fetch(self, keys, values):
+        self.write_coordinates = (self._idx, self.offset)
         if self.packed is not None:
             return self.update_packed(mx.concatenate((keys, values), axis=1))
         self.keys = mx.slice_update(self.keys, keys, self._idx, axes=(2,))
@@ -27,6 +28,7 @@ class _DeviceRing(RotatingKVCache):
         return self.keys, self.values
 
     def update_packed(self, new):
+        self.write_coordinates = (self._idx, self.offset)
         if hasattr(self, "page_tail"):
             slot = self._idx - self.page_prefix.shape[2]
             self.page_tail = mx.slice_update(self.page_tail, new, slot, axes=(2,))
