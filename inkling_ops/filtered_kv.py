@@ -9,19 +9,19 @@ _project = mx.fast.metal_kernel(
     output_names=["key","value","next_k","next_v"],
     source="""
         uint lane=thread_index_in_simdgroup, bank=threadgroup_position_in_grid.y;
-        uint first=(thread_position_in_grid.x/32)*1;
+        uint first=(thread_position_in_grid.x/32)*4;
         auto x=bank ? vx : kx; auto w=bank ? vw : kw;
-        float acc[1]={};
+        float4 acc=0;
         for (uint d=lane*4;d<2304;d+=128) {
             float4 a=float4(*(device const bfloat4*)(x+d));
-            for (uint r=0;r<1;++r) {
+            for (uint r=0;r<4;++r) {
                 float4 b=float4(*(device const bfloat4*)(w+(first+r)*2304+d));
                 for (uint j=0;j<4;++j) acc[r]=fma(a[j],b[j],acc[r]);
             }
         }
         auto conv=bank ? vc : kc; auto hist=bank ? vh : kh;
         auto output=bank ? value : key; auto window=bank ? next_v : next_k;
-        for (uint r=0;r<1;++r) {
+        for (uint r=0;r<4;++r) {
             float dot=acc[r];
             for (ushort i=16;i;i>>=1) dot+=simd_shuffle_down(dot,i);
             if (!lane) {
@@ -53,6 +53,6 @@ def apply(layer,k,v,histories,mask):
     if kc.dtype != vc.dtype:
         return None
     return _project(inputs=[k,v,layer.k_proj.weight,layer.v_proj.weight,kc,vc,*histories[:2]],
-                    template=[("W",kc.dtype)],grid=(1024*32,2,1),threadgroup=(128,1,1),
+                    template=[("W",kc.dtype)],grid=(256*32,2,1),threadgroup=(128,1,1),
                     output_shapes=[(1,1,1024)]*2+[(1,4,1024)]*2,
                     output_dtypes=[k.dtype]*2+[mx.float32]*2)
