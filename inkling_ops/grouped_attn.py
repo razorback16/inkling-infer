@@ -137,7 +137,7 @@ _merge = mx.fast.metal_kernel(
                 uint col = head*128+d+j;
                 float g = float(gate[col]);
                 float probability;
-                if (PREPARED) { probability=g; } else if (LOOKUP) {
+                if (LOOKUP) {
                     ushort code=as_type<ushort>(bfloat16_t(gate[col]));
                     probability=table[((uint(code)&32767u)<<1)|(code>>15)];
                 } else {
@@ -151,7 +151,7 @@ _merge = mx.fast.metal_kernel(
 )
 
 
-def attend(layer,q,k,v,rel,sinks,cache,gate,scaled_query=None,factors=None):
+def attend(layer,q,k,v,rel,sinks,cache,gate,scaled_query=None):
     length, heads = k.shape[2], q.shape[1]
     slot = cache._idx if isinstance(cache,(RotatingKVCache,BatchRotatingKVCache)) else length
     before = getattr(cache, "write_coordinates", None)
@@ -184,6 +184,6 @@ def attend(layer,q,k,v,rel,sinks,cache,gate,scaled_query=None,factors=None):
                   ("R",extent),("WINDOW",layer.sliding_window)],
         grid=(128*32,heads,1),threadgroup=(threads,1,1),
         output_shapes=[(heads,128,128),(heads,128,2)],output_dtypes=[q.dtype,mx.float32])
-    return _merge(inputs=[parts,stats,gate if factors is None else factors,gate_probabilities()],template=[("PREPARED",factors is not None),("LOOKUP",gate.dtype==mx.bfloat16),("T",q.dtype)],
+    return _merge(inputs=[parts,stats,gate,gate_probabilities()],template=[("LOOKUP",gate.dtype==mx.bfloat16),("T",q.dtype)],
                   grid=(64*32,heads,1),threadgroup=(256,1,1),
                   output_shapes=[gate.shape],output_dtypes=[q.dtype])[0]

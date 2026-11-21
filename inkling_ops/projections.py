@@ -100,17 +100,9 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
     name = "_all_qkv" if same else "_common_q"
     packed, boundaries = projection(layer,modules,name)
     tiles = getattr(layer,name+"_tiles",None)
-    encoded = tiles is not None and tiles[0] is packed and hidden_states.dtype==mx.bfloat16
-    factors = None
-    kv_cache = cache[0] if cache is not None else None
-    if (encoded and kv_cache is not None and getattr(kv_cache,"packed",None) is not None
-            and layer.head_dim==128 and type(layer.rel_logits_proj) is layers.RelativeLogits
-            and 1024<=kv_cache.keys.shape[2]<=8192):
-        from .grouped_attn import gate_probabilities
-        projected,factors=packed_rows.project_with_gate(
-            hidden_states,packed,tiles[1],boundaries[1],layer.gate_proj.weight.shape[0],gate_probabilities())
-    else:
-        projected = packed_rows.project(hidden_states,packed,tiles[1]) if encoded else hidden_states @ packed.T
+    projected = (packed_rows.project(hidden_states,packed,tiles[1])
+                 if tiles is not None and tiles[0] is packed and hidden_states.dtype==mx.bfloat16
+                 else hidden_states @ packed.T)
     parts = mx.split(projected,boundaries,axis=-1)
     query, relative, gate = parts[:3]
     sinks = layer.sink_proj(hidden_states)
@@ -193,7 +185,7 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
     if (kv is not None and 1024 <= k.shape[2] <= 8192 and q.shape[-1] == 128
             and type(layer.rel_logits_proj) is layers.RelativeLogits and rel.dtype == q.dtype == mx.bfloat16):
         from . import grouped_attn
-        features=grouped_attn.attend(layer,q,k,v,rel,sinks,kv,gate,scaled_query,factors)
+        features=grouped_attn.attend(layer,q,k,v,rel,sinks,kv,gate,scaled_query)
         from . import filtered_output
         out=filtered_output.apply(layer.o_proj,features,getattr(kv,"output_filter",None))
         return layer.o_proj(features) if out is None else out

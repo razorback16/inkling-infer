@@ -94,29 +94,6 @@ _dot = mx.fast.metal_kernel(
     name="inkling_four_row_gemv", input_names=["x","payload"],output_names=["out"],
     source=_dot_source,
 )
-_with_gate = mx.fast.metal_kernel(
-    name="inkling_query_gate_probabilities",input_names=["x","payload","table"],
-    output_names=["out","factors"],source=_dot_source.replace(
-        "if (!lane) out[group*4+r]=bfloat16_t(dot);", """
-        if (!lane) {
-            uint row=group*4+r;
-            bfloat16_t value=bfloat16_t(dot);
-            out[row]=value;
-            if (row>=START && row<START+WIDTH) {
-                ushort code=as_type<ushort>(value);
-                factors[row-START]=table[((uint(code)&32767u)<<1)|(code>>15)];
-            }
-        }"""),
-)
-
-
-def project_with_gate(x,weight,encoded,start,width,table):
-    rows=weight.shape[0]
-    return _with_gate(inputs=[x,*encoded,table],template=[("START",start),("WIDTH",width)],
-                      grid=(rows*8,1,1),threadgroup=(128,1,1),output_shapes=[(1,1,rows),(1,1,width)],
-                      output_dtypes=[mx.bfloat16,mx.float32])
-
-
 _pair = mx.fast.metal_kernel(
     name="inkling_four_row_global_kv",input_names=["kx","vx","payload"],output_names=["out"],
     source=_dot_source.replace("group=thread_position_in_grid.x/32",
