@@ -38,8 +38,7 @@ _kernel = mx.fast.metal_kernel(
                              + v[i+2] * levels[(bits >> 8) & 15] + v[i+3] * levels[(bits >> 12) & 15];
                     bits >>= 16;
                 }
-                auto sc=scales[row*144+word/2];
-                float term=partial*(PREPARED ? float(sc) : fp8_scale(uchar(sc)));
+                float term = partial * fp8_scale(scales[row * 144 + word / 2]);
                 sums[r] += term;
             }
         }
@@ -52,25 +51,6 @@ _kernel = mx.fast.metal_kernel(
         }
     """,
 )
-
-
-def prepare_scales(model):
-    arrays=[]
-    for block in model.layers:
-        proj=block.mlp.experts.gate_up_proj
-        if getattr(proj,"mode",None)!="nvfp4" or proj.scales.dtype!=mx.uint8:
-            continue
-        saved=getattr(proj,"_decode_scales",None)
-        if saved is not None and saved[0] is proj.scales:
-            continue
-        bits=proj.scales.astype(mx.uint16)
-        mag=bits&127
-        half=((mag<<7)|(((mag+1)>>7)<<14)|((bits&128)<<8)).view(mx.float16)
-        decoded=half*256
-        object.__setattr__(proj,"_decode_scales",(proj.scales,decoded))
-        arrays.append(decoded)
-    if arrays:
-        mx.eval(arrays)
 
 
 @lru_cache(maxsize=1)
@@ -91,11 +71,9 @@ def gated_activation(layer, x, indices):
             or layer.act_fn.gate_softcap != 4 or layer.act_fn.up_softcap != 25):
         pair = proj(x[..., None, None, :], indices)
         return layer.act_fn(pair[..., 0::2], pair[..., 1::2])
-    saved=getattr(proj,"_decode_scales",None)
-    ready=saved is not None and saved[0] is proj.scales
     active = _kernel(
-        inputs=[x, indices, proj.weight, saved[1] if ready else proj.scales, proj.global_scale, *activation_tables()],
-        template=[("PREPARED",ready)],grid=(144 * 128, 8, 1), threadgroup=(128, 1, 1),
+        inputs=[x, indices, proj.weight, proj.scales, proj.global_scale, *activation_tables()],
+        grid=(144 * 128, 8, 1), threadgroup=(128, 1, 1),
         output_shapes=[(1, 1, 8, 1, 1152)], output_dtypes=[x.dtype],
     )[0]
     return active
