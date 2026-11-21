@@ -27,16 +27,25 @@ _kernel = mx.fast.metal_kernel(
         uint first = threadgroup_position_in_grid.x * 16 + simdgroup_index_in_threadgroup * 4;
         float sums[4] = {};
         for (uint word = lane; word < 288; word += 32) {
-            float v[8];
-            for (uint i = 0; i < 8; ++i) v[i] = float(x[word * 8 + i]);
+            float4 input[2];
+            half4 small[2];
+            bool safe[2];
+            for (uint part=0;part<2;++part) {
+                input[part]=float4(((device const bfloat4*)(x + word*8))[part]);
+                float4 mag=abs(input[part]);
+                safe[part]=all((mag==0.f)|((mag>=0x1p-13f)&(mag<0x1p13f)));
+                small[part]=half4(input[part]);
+            }
             for (uint r = 0; r < 4; ++r) {
                 uint row = expert * 2304 + first + r;
                 uint bits = packed[row * 288 + word];
                 float partial = 0.f;
-                for (uint i = 0; i < 8; i += 4) {
-                    partial += v[i] * levels[bits & 15] + v[i+1] * levels[(bits >> 4) & 15]
-                             + v[i+2] * levels[(bits >> 8) & 15] + v[i+3] * levels[(bits >> 12) & 15];
-                    bits >>= 16;
+                for (uint part=0;part<2;++part) {
+                    half4 w=half4(levels[bits&15],levels[(bits>>4)&15],
+                                  levels[(bits>>8)&15],levels[(bits>>12)&15]);
+                    float4 product=safe[part] ? float4(small[part]*w) : input[part]*float4(w);
+                    partial+=product.x+product.y+product.z+product.w;
+                    bits>>=16;
                 }
                 float term = partial * fp8_scale(scales[row * 144 + word / 2]);
                 sums[r] += term;
