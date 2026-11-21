@@ -4,7 +4,7 @@ import mlx.nn as nn
 from mlx_lm.models.inkling2 import layers
 
 from .head_norm import normalize
-from . import dynamic_conv, rel_mask
+from . import all_proj, dynamic_conv, rel_mask
 
 _sliding = layers.SlidingAttention.__call__
 _full = layers.FullAttention.__call__
@@ -27,39 +27,34 @@ def projection(layer, modules, key):
 def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cache, conv_states, conv_mask):
     full = isinstance(layer, layers.FullAttention)
     same = hidden_states is key_hidden_states and hidden_states is value_hidden_states
-    common = (layer.q_proj, layer.r_proj, layer.gate_proj, layer.sink_proj)
+    common = (layer.q_proj, layer.r_proj, layer.gate_proj)
     modules = common + (layer.k_proj, layer.v_proj) if same else common
     if hidden_states.shape[:2] != (1, 1) or any(type(m) is not nn.Linear or "bias" in m for m in modules):
         reference = _full if full else _sliding
         return reference(layer, hidden_states, key_hidden_states, value_hidden_states,
                           cache=cache, conv_states=conv_states, conv_mask=conv_mask)
-    packed, boundaries = projection(layer, modules, "_all_qkv" if same else "_common_q")
-    parts = mx.split(hidden_states @ packed.T, boundaries, axis=-1)
-    query, relative, gate, sinks = parts[:4]
-    paired = (full and not same and conv_mask is None
-              and all(type(c) is layers.DynamicShortConvolution and c.kernel_size == 4
-                      and type(c.weight_proj) is nn.Linear and "bias" not in c.weight_proj
-                      for c in (layer.k_sconv, layer.v_sconv))
-              and all(type(p) is nn.Linear and "bias" not in p for p in (layer.k_proj, layer.v_proj))
-              and all(h is not None and h.shape == (1, 3, layer.num_key_value_heads * layer.head_dim)
-                      for h in conv_states[:2]))
-    if same:
-        key, value = parts[4:]
-    elif paired:
-        kp, kb = projection(layer, (layer.k_proj, layer.k_sconv.weight_proj), "_key_filter")
-        vp, vb = projection(layer, (layer.v_proj, layer.v_sconv.weight_proj), "_value_filter")
-        key, kd = mx.split(key_hidden_states @ kp.T, kb, axis=-1)
-        value, vd = mx.split(value_hidden_states @ vp.T, vb, axis=-1)
+    filters = (full and conv_mask is None and all(h is not None for h in conv_states[:2])
+               and all(type(c) is layers.DynamicShortConvolution and c.kernel_size == 4
+                       for c in (layer.k_sconv,layer.v_sconv)))
+    parts = all_proj.project(layer,hidden_states,key_hidden_states,value_hidden_states,filters)
+    if parts is not None:
+        query,relative,gate,key,value,sinks = parts[:6]
     else:
-        key = layer.k_proj(key_hidden_states)
-        value = layer.v_proj(value_hidden_states)
-    if full:
-        if paired:
-            key, conv_states[0] = dynamic_conv.filtered(layer.k_sconv, key, conv_states[0], kd)
-            value, conv_states[1] = dynamic_conv.filtered(layer.v_sconv, value, conv_states[1], vd)
+        packed, boundaries = projection(layer, modules, "_all_qkv" if same else "_common_q")
+        parts = mx.split(hidden_states @ packed.T, boundaries, axis=-1)
+        query, relative, gate = parts[:3]
+        sinks = layer.sink_proj(hidden_states)
+        if same:
+            key, value = parts[3:]
         else:
-            key, conv_states[0] = layer.k_sconv(key, key_hidden_states, conv_states[0], conv_mask)
-            value, conv_states[1] = layer.v_sconv(value, value_hidden_states, conv_states[1], conv_mask)
+            key = layer.k_proj(key_hidden_states)
+            value = layer.v_proj(value_hidden_states)
+    if filters and parts is not None and len(parts)==8:
+        key, conv_states[0] = dynamic_conv.filtered(layer.k_sconv,key,conv_states[0],parts[6])
+        value, conv_states[1] = dynamic_conv.filtered(layer.v_sconv,value,conv_states[1],parts[7])
+    elif full:
+        key, conv_states[0] = layer.k_sconv(key,key_hidden_states,conv_states[0],conv_mask)
+        value, conv_states[1] = layer.v_sconv(value,value_hidden_states,conv_states[1],conv_mask)
     else:
         key, conv_states[0] = layer.k_sconv(key, conv_states[0], conv_mask)
         value, conv_states[1] = layer.v_sconv(value, conv_states[1], conv_mask)
