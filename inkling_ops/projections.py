@@ -108,6 +108,15 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
     name = "_all_qkv" if same else "_common_q"
     packed, boundaries = projection(layer,modules,name)
     tiles = getattr(layer,name+"_tiles",None)
+    if full and cache is not None and conv_mask is None and hasattr(cache[0],"page_prefix"):
+        from . import project_heads
+        common_weight, common_boundaries=projection(layer,common,"_common_q")
+        if common_boundaries==[3072,3456]:
+            prepared=project_heads.compute_paged(layer,hidden_states,key_hidden_states,value_hidden_states,
+                        common_weight,getattr(layer,"_common_q_tiles",None),conv_states,cache[0])
+            if prepared is not None:
+                q,k,v,rel,gate,scaled=prepared
+                return _grouped_output(layer,q,k,v,rel,layer.sink_proj(hidden_states),cache[0],gate,scaled)
     if not full and cache is not None and getattr(cache[0],"grouped",False):
         from . import project_heads
         extra=() if same else (key_hidden_states,value_hidden_states)
