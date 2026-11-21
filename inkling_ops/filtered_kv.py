@@ -1,7 +1,7 @@
 """Project and four-tap filter both distinct sliding key/value inputs in one dispatch."""
 import mlx.core as mx
 import mlx.nn as nn
-from . import single_row_tiles
+from . import single_row_tiles, packed_rows
 from mlx_lm.models.inkling2 import layers
 
 _project = mx.fast.metal_kernel(
@@ -42,9 +42,7 @@ _project = mx.fast.metal_kernel(
 )
 
 
-_compact=mx.fast.metal_kernel(
-    name="inkling_inline_sliding_kv",input_names=["kx","vx","payload","formats","kc","vc","kh","vh"],
-    output_names=["key","value","next_k","next_v"],source="""
+_filtered_dot="""
         uint lane=thread_index_in_simdgroup,row=thread_position_in_grid.x/32;
         uint bank=row/1024,col=row%1024;
         auto x=bank ? vx : kx;
@@ -61,7 +59,38 @@ _compact=mx.fast.metal_kernel(
             total=fma(float(W(v)),float(conv[col*4+3]),total);
             output[col]=bfloat16_t((float(W(total))+v)*0.4472135954999579f);
         }
-    """)
+    """
+
+_inputs=["kx","vx","payload","formats","kc","vc","kh","vh"]
+_outputs=["key","value","next_k","next_v"]
+_compact=mx.fast.metal_kernel(name="inkling_inline_sliding_kv",input_names=_inputs,output_names=_outputs,source=_filtered_dot)
+_joint=mx.fast.metal_kernel(name="inkling_dual_format_attention",input_names=["x","qdata",*_inputs],
+    output_names=["out",*_outputs],source="if (threadgroup_position_in_grid.x<QROWS/16) {\n"
+    + packed_rows.DOT.replace("payload","qdata") + "\n} else {\n"
+    + _filtered_dot.replace("row=thread_position_in_grid.x/32","row=thread_position_in_grid.x/32-QROWS/4")
+    + "\n}")
+
+
+def paired(layer,q,k,v,history,mask,qrows,qtiles):
+    if (mask is not None or history is None or k.shape!=(1,1,2304) or v.shape!=k.shape
+            or q.dtype!=k.dtype or k.dtype!=v.dtype or k.dtype!=mx.bfloat16
+            or any(type(c) is not layers.ShortConvolution or c.kernel_size!=4
+                   for c in (layer.k_sconv,layer.v_sconv))
+            or any(h is None or h.shape!=(1,3,1024) for h in history[:2])):
+        return None
+    saved=getattr(layer,"_filter_tiles",None)
+    if (saved is None or saved[0] is not layer.k_proj.weight or saved[1] is not layer.v_proj.weight
+            or any(type(p) is not nn.Linear or "bias" in p for p in (layer.k_proj,layer.v_proj))):
+        return None
+    kc,vc=layer.k_sconv.conv1d.weight,layer.v_sconv.conv1d.weight
+    if kc.dtype!=vc.dtype:
+        return None
+    return _joint(inputs=[q,*qtiles,k,v,*saved[2],kc,vc,*history[:2]],
+                  template=[("COLS",2304),("QROWS",qrows),("W",kc.dtype)],
+                  grid=((qrows//4+2048)*32,1,1),threadgroup=(128,1,1),
+                  output_shapes=[(1,1,qrows)]+[(1,1,1024)]*2+[(1,4,1024)]*2,
+                  output_dtypes=[q.dtype]*3+[mx.float32]*2)
+
 
 
 def prepare(model):
