@@ -227,12 +227,6 @@ def make_projected(normalize,routes=False,bottleneck=False):
             float inv=precise::rsqrt(simd_sum(lane<18 ? sums[lane] : 0.f)/2304.f+1.e-6f);
             for (uint j=0;j<4;++j) norm[tid*4+j]=float(bfloat16_t(values[j]*inv));
         """
-    # Keep the residual used in the final mixture in registers. The live query
-    # dot visits different columns, so each lane reloads its own eight values.
-    source = source.replace("norm[d] = values[j]*scale;", "values[j] *= scale;")
-    source = source.replace("threadgroup_barrier(mem_flags::mem_threadgroup);\n        uint group", "uint group")
-    source = source.replace("i==K ? norm[d]", "i==K ? float(x[d])*scale")
-    source = source.replace("norm[d]*coeff[K]", "values[j]*coeff[K]")
     if routes or bottleneck:
         tail = """
             threadgroup_barrier(mem_flags::mem_threadgroup);
