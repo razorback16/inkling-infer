@@ -46,7 +46,7 @@ _pack = mx.fast.metal_kernel(
 )
 
 _dot = mx.fast.metal_kernel(
-    name="inkling_vocab_twelve_bit_dot", input_names=["x","tiles","overflow"],
+    name="inkling_vocab_twelve_bit_dot", input_names=["x","tiles"],
     output_names=["out"], source="""
         uint lane=thread_index_in_simdgroup, row=thread_position_in_grid.x/32;
         device const uint* group=tiles+(row/4)*3488;
@@ -62,7 +62,7 @@ _dot = mx.fast.metal_kernel(
             ushort4 n=codes&7;
             if (mask&(1u<<t)) {
                 uint index=descriptor.y+popcount(mask&((1u<<t)-1));
-                ushort hi=((device const ushort*)overflow)[index*32+lane];
+                ushort hi=((device const ushort*)(tiles+MAIN_WORDS))[index*32+lane];
                 n|=(ushort4(hi,hi>>4,hi>>8,hi>>12)&15)<<3;
             }
             ushort4 bits=((codes&8)<<12)|(((n+base)&127)<<8)|ushort4(as_type<uchar4>(group[addr+lane]));
@@ -87,10 +87,11 @@ def encode(w):
                          output_shapes=[(rows,18,48),(n_overflow,16)], output_dtypes=[mx.uint32]*2)
     descriptors=mx.stack((formats,offsets),axis=1).reshape(-1,8)
     headers=mx.pad(descriptors,[(0,0),(0,24)])
-    return mx.concatenate((headers,tiles.reshape(-1,3456)),axis=1),overflow
+    main = mx.concatenate((headers,tiles.reshape(-1,3456)),axis=1)
+    return (mx.concatenate((main.reshape(-1),overflow.reshape(-1))),)
 
 
 def project(x,weight,encoded):
     rows=weight.shape[0]
-    return _dot(inputs=[x,*encoded], grid=(rows*32,1,1), threadgroup=(128,1,1),
+    return _dot(inputs=[x,*encoded], template=[("MAIN_WORDS",rows//4*3488)], grid=(rows*32,1,1), threadgroup=(128,1,1),
                 output_shapes=[(1,1,rows)], output_dtypes=[x.dtype])[0]
