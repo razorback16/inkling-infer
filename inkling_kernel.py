@@ -142,6 +142,9 @@ def single_token_moe(self, x):
 
 
 def install():
+    from inkling_ops.prefill_clip import clip
+    layers.L2Clip.__call__ = clip
+    layers.ScaledL2Clip.__call__ = clip
     from inkling_ops.grouped_attn import gate_probabilities
     gate_probabilities()
     from inkling_ops import packed_vocab
