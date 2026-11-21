@@ -71,9 +71,6 @@ _partial = mx.fast.metal_kernel(
                     uint p = (kv*length+pos)*128+d;
                     auto keys = in_tail ? tail : k;
                     auto values = in_tail ? tail+NKV*256*128 : v;
-                    if (FRESH && PAGED && int(position)==newest) {
-                        keys=fresh; values=fresh+NKV*128; p=kv*128+d;
-                    }
                     float score = 0;
                     for (uint j=0; j<4; ++j) score += query[j]*float(keys[p+j]);
                     score = simd_sum(score)+pb;

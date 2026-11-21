@@ -12,33 +12,14 @@ from . import prepared_bank, block_lookahead
 _reference = TextModel._run_loop
 
 
-def _commit_rows(storage, rings, start, source):
-    if not rings:
-        return storage
-    updates = []
-    for ring in rings:
-        value = getattr(ring, "fresh", None)
-        if value is None:
-            value = mx.take(getattr(ring,source),start,axis=2)
-        updates.append(value)
-    return mx.slice_update(storage,mx.concatenate(updates,axis=0),start,axes=(2,))
-
-
-def _reuse_rows(saved, tensors):
-    if saved is not None and len(saved[1])==len(tensors) and all(
-            a is b for a,b in zip(saved[1],tensors)):
-        return saved[0]
-    return mx.concatenate(tensors,axis=0)
-
-
 def _compile(model):
     groups=block_lookahead.prepare(model)
     owner = weakref.ref(model)
 
     @mx.compile
-    def run(x, states, offset, slots, slab, ring_slot, tails):
+    def run(x, states, offset, slots, slab, ring_slot):
         caches = []
-        grouped, global_rings = [], []
+        grouped = []
         for (packed, history), slot in zip(states, slots):
             shared = packed is None
             if slot is None:
@@ -47,19 +28,12 @@ def _compile(model):
                 row = len(grouped)
                 packed = slab[row:row+1]
             pages = packed if isinstance(packed, tuple) else None
-            shared_tail = pages is not None and len(pages)==1
-            if shared_tail:
-                row = len(global_rings)
-                pages = (pages[0],tails[row:row+1])
             storage = mx.concatenate(pages, axis=2) if pages is not None else packed
             keys, values = mx.split(storage, 2, axis=1)
             ring = _DeviceRing(keys, values, offset, slot, packed=storage)
             if shared:
                 grouped.append(ring)
                 ring.grouped = True
-            if shared_tail:
-                global_rings.append(ring)
-                ring.grouped_tail = True
             if pages is not None:
                 ring.page_prefix, ring.page_tail = pages
             conv = ArraysCache(4)
@@ -67,12 +41,15 @@ def _compile(model):
             caches.append(CacheList(ring, conv))
         result = block_lookahead.run(groups,prepared_bank.run,_reference,owner(),x,caches)
         if grouped:
-            slab = _commit_rows(slab,grouped,grouped[0].write_coordinates[0],"packed")
-        if global_rings:
-            start = offset - global_rings[0].page_prefix.shape[2]
-            tails = _commit_rows(tails,global_rings,start,"page_tail")
-        return result, slab, tails, [
-            (None,tuple(c[1].cache)) if getattr(c[0],"grouped_tail",False) else
+            updates = []
+            for ring in grouped:
+                value = getattr(ring, "fresh", None)
+                if value is None:
+                    value = mx.take(ring.packed,ring.write_coordinates[0],axis=2)
+                updates.append(value)
+            slab = mx.slice_update(slab, mx.concatenate(updates,axis=0),
+                                   grouped[0].write_coordinates[0], axes=(2,))
+        return result, slab, [
             (tuple(c[1].cache),) if getattr(c[0],"grouped",False) else
             (c[0].page_tail, tuple(c[1].cache)) if hasattr(c[0], "page_tail")
             else (c[0].packed, c[0].keys, c[0].values, tuple(c[1].cache)) for c in caches
@@ -132,22 +109,16 @@ def loop(model, x, cache, conv_mask):
     if rows and all(slots[i] == slots[rows[0]] for i in rows):
         tensors = tuple(states[i][0] for i in rows)
         old = getattr(cache[rows[0]][0], "_shared_rings", None)
-        slab = _reuse_rows(old,tensors)
+        reusable = old is not None and len(tensors)==len(old[1]) and all(
+            a is b for a,b in zip(tensors,old[1]))
+        slab = old[0] if reusable else mx.concatenate(tensors,axis=0)
         for i in rows:
             incoming[i] = (None,states[i][1])
-    global_rows = [i for i,(packed,_) in enumerate(states) if isinstance(packed,tuple)
-                   and packed[1].shape==(1,16,256,128) and packed[1].dtype==mx.bfloat16]
-    tails = None
-    if global_rows and all(states[i][0][0].shape==states[global_rows[0]][0][0].shape for i in global_rows):
-        old = getattr(cache[global_rows[0]][0],"_shared_tails",None)
-        tails = _reuse_rows(old,tuple(states[i][0][1] for i in global_rows))
-        for i in global_rows:
-            incoming[i] = ((states[i][0][0],),states[i][1])
     ring_slot = None if slab is None else params[slots[rows[0]]]
     positions = [None if state[0] is None or type(c[0]) is KVCache else params[slot]
                  for state,c,slot in zip(incoming,cache,slots)]
-    result, slab, tails, updated = saved[1](x,incoming,params[offset],positions,slab,ring_slot,tails)
-    views, tail_views = [], []
+    result, slab, updated = saved[1](x, incoming, params[offset], positions, slab, ring_slot)
+    views = []
     for c, slot, previous, update in zip(cache, slots, states, updated):
         k, conv = c[0], c[1]
         if len(update) == 1:
@@ -158,10 +129,6 @@ def loop(model, x, cache, conv_mask):
             keys, values = mx.split(packed,2,axis=1)
         elif len(update) == 2:
             tail, history = update
-            if tail is None:
-                row = len(tail_views)
-                tail = tails[row:row+1]
-                tail_views.append(tail)
             pages = (previous[0][0], tail)
             packed = mx.concatenate(pages, axis=2)
             keys, values = mx.split(packed, 2, axis=1)
@@ -174,8 +141,6 @@ def loop(model, x, cache, conv_mask):
         if type(k) is RotatingKVCache:
             k._idx = slot + 1
         conv.cache = list(history)
-    if tail_views:
-        cache[global_rows[0]][0]._shared_tails = (tails,tuple(tail_views))
     if views:
         cache[rows[0]][0]._shared_rings = (slab, tuple(views))
     return result
