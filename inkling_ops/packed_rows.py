@@ -42,9 +42,7 @@ _pack = mx.fast.metal_kernel(
 
     """,
 )
-_dot = mx.fast.metal_kernel(
-    name="inkling_four_row_gemv", input_names=["x","weight","payload","bases"],output_names=["out"],
-    source="""
+_dot_source = """
         uint lane=thread_index_in_simdgroup, group=thread_position_in_grid.x/32;
         uchar4 base=*(device const uchar4*)(bases+group*4);
         float sums[4]={};
@@ -72,8 +70,54 @@ _dot = mx.fast.metal_kernel(
             for (ushort step=16;step;step>>=1) dot+=simd_shuffle_down(dot,step);
             if (!lane) out[group*4+r]=bfloat16_t(dot);
         }
-    """,
+    """
+_dot = mx.fast.metal_kernel(
+    name="inkling_four_row_gemv", input_names=["x","weight","payload","bases"],output_names=["out"],
+    source=_dot_source,
 )
+
+_sink_source = """
+        uint group=threadgroup_position_in_grid.x;
+        if (group>=MAIN_GROUPS) {
+            uint tid=thread_position_in_threadgroup.x,lane=thread_index_in_simdgroup;
+            uint sg=simdgroup_index_in_threadgroup, first=(group-MAIN_GROUPS)*4;
+            threadgroup float partial[8][4];
+            for (uint part=sg;part<8;part+=4) {
+                float accum[4]={};
+                for (uint d=(part*32+lane)*4;d<2304;d+=1024) {
+                    for (uint j=0;j<4;++j) {
+                        float v=float(x[d+j]);
+                        for (uint r=0;r<4;++r)
+                            accum[r]=fma(v,float(sink_weight[(first+r)*2304+d+j]),accum[r]);
+                    }
+                }
+                for (uint r=0;r<4;++r) {
+                    float dot=accum[r];
+                    for (ushort stride=16;stride;stride>>=1) dot+=simd_shuffle_down(dot,stride);
+                    if (!lane) partial[part][r]=dot;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (tid<4) {
+                float dot=partial[0][tid];
+                for (uint i=1;i<8;++i) dot+=partial[i][tid];
+                sinks[first+tid]=bfloat16_t(dot);
+            }
+            return;
+        }
+"""
+_with_sinks = mx.fast.metal_kernel(
+    name="inkling_four_row_gemv_sinks", input_names=["x","weight","payload","bases","sink_weight"],output_names=["out","sinks"],
+    source="{"+_sink_source+"}"+_dot_source,
+)
+
+
+def project_with_sinks(x,weight,encoded,sink_weight):
+    rows,heads=weight.shape[0],sink_weight.shape[0]
+    return _with_sinks(inputs=[x,weight,*encoded,sink_weight],template=[("MAIN_GROUPS",rows//16)],
+                       grid=((rows//16+heads//4)*128,1,1),threadgroup=(128,1,1),
+                       output_shapes=[(1,1,rows),(1,1,heads)],output_dtypes=[x.dtype,x.dtype])
+
 
 
 def encode(weight):
