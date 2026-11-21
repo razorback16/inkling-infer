@@ -92,9 +92,7 @@ _dot_source = """
     """
 _dot = mx.fast.metal_kernel(
     name="inkling_four_row_gemv", input_names=["x","payload"],output_names=["out"],
-    source=_dot_source.replace("group=thread_position_in_grid.x/32",
-        "warp=thread_position_in_grid.x/32,group=warp/(4/ROWS),start=warp%(4/ROWS)*ROWS").replace(
-        "uint r=0;r<4;++r","uint r=start;r<start+ROWS;++r"),
+    source=_dot_source,
 )
 _pair = mx.fast.metal_kernel(
     name="inkling_four_row_global_kv",input_names=["kx","vx","payload"],output_names=["out"],
@@ -132,8 +130,5 @@ def encode(weight):
 
 def project(x,weight,encoded):
     rows=weight.shape[0]
-    per_simd=2 if rows==6528 else 4
-    threads=512 if rows in (6528,8576) else 128
-    return _dot(inputs=[x,*encoded],template=[("ROWS",per_simd)],
-                grid=(rows//per_simd*32,1,1),threadgroup=(threads,1,1),
+    return _dot(inputs=[x,*encoded],grid=(rows*8,1,1),threadgroup=(128,1,1),
                 output_shapes=[(1,1,rows)],output_dtypes=[x.dtype])[0]
