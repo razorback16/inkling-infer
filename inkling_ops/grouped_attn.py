@@ -22,8 +22,7 @@ _partial = mx.fast.metal_kernel(
             float bias = 0;
             if (lane < 8) {
                 uint dist = uint(newest-int(tile+128*lane)) & 1023u;
-                if (PROJECTED && dist<R) bias=float(w[head*R+dist]);
-                else if (dist<R) {
+                if (dist<R) {
                     for (uint j=0; j<WIDTH; ++j)
                         bias = fma(float(rel[head*WIDTH+j]),float(w[SWIZZLED ? ((dist%128)*WIDTH+j)*(R/128)+dist/128 : j*R+dist]),bias);
                     bias = float(T(bias));
@@ -57,7 +56,6 @@ _partial = mx.fast.metal_kernel(
                 if (dist < 0) dist += S;
                 float bias = 0;
                 if (pos >= S || dist >= valid || (WINDOW && dist >= WINDOW)) bias = -INFINITY;
-                else if (PROJECTED && dist<R) bias=float(w[head*R+dist]);
                 else if (dist < R) {
                     for (uint j=0; j<WIDTH; ++j)
                         bias = fma(float(rel[head*WIDTH+j]), float(w[SWIZZLED ? ((dist%128)*WIDTH+j)*(R/128)+dist/128 : j*R+dist]), bias);
@@ -119,7 +117,7 @@ _merge = mx.fast.metal_kernel(
 )
 
 
-def attend(layer,q,k,v,rel,sinks,cache,gate,bias_table=None):
+def attend(layer,q,k,v,rel,sinks,cache,gate):
     length, heads = k.shape[2], q.shape[1]
     slot = cache._idx if isinstance(cache,(RotatingKVCache,BatchRotatingKVCache)) else length
     before = getattr(cache, "write_coordinates", None)
@@ -127,9 +125,7 @@ def attend(layer,q,k,v,rel,sinks,cache,gate,bias_table=None):
     w = layer.rel_logits_proj.proj.astype(rel.dtype)
     width, extent = w.shape
     swizzled = extent % 128 == 0
-    if bias_table is not None:
-        w=bias_table
-    elif swizzled:
+    if swizzled:
         weight = layer.rel_logits_proj.proj
         saved = getattr(layer, "_relative_tiles", None)
         if saved is None or saved[0] is not weight or saved[1] != rel.dtype:
@@ -149,7 +145,7 @@ def attend(layer,q,k,v,rel,sinks,cache,gate,bias_table=None):
         inputs=[q,k,v,tail,q if fresh is None else fresh,rel,w,slot,end,
                 sinks.astype(q.dtype),scalar(layer.scaling)],
         template=[("T",q.dtype),("S",length),("PRE_UPDATE",before is not None),("PAGED",paged),("FRESH",fresh is not None),("NKV",k.shape[1]),("GQA",heads//k.shape[1]),("WIDTH",width),("SWIZZLED",swizzled),
-                  ("PROJECTED",bias_table is not None),("R",extent),("WINDOW",layer.sliding_window)],
+                  ("R",extent),("WINDOW",layer.sliding_window)],
         grid=(128*32,heads,1),threadgroup=(128,1,1),
         output_shapes=[(heads,128,128),(heads,128,2)],output_dtypes=[q.dtype,mx.float32])
     return _merge(inputs=[parts,stats,gate],template=[("T",q.dtype)],
