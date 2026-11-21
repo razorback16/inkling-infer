@@ -3,7 +3,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.inkling2 import layers
 
-from .gain import apply, lookup
+from .gain import apply
 from .exact_sources import native
 
 from . import paired_norm, prepared_reduce
@@ -12,9 +12,9 @@ _reference = layers.DecoderLayer._mix_messages
 
 
 @mx.compile
-def _apply(states, messages, down, up, normalized=None, tiles=None):
+def _apply(states, messages, down, up, normalized=None):
     if prepared_reduce.applicable(states,normalized,down,up):
-        return apply(prepared_reduce.reduce(states,normalized,down),up,states,messages,tiles)
+        return apply(prepared_reduce.reduce(states,normalized,down),up,states,messages)
     norm = layers.unweighted_rms_norm
     if states.shape[-1] == 2304 and states.dtype == messages.dtype == mx.float32:
         joined = paired_norm.join(states, messages if normalized is None else normalized, down.dtype, normalized is not None)
@@ -22,7 +22,7 @@ def _apply(states, messages, down, up, normalized=None, tiles=None):
         joined = mx.concatenate((norm(states), norm(messages)), axis=-1).astype(down.dtype)
     reduced = joined @ down.swapaxes(-1, -2)
     if reduced.shape[-1] == 64 and states.shape[-1] == 2304 and up.dtype in (mx.bfloat16, mx.float32):
-        return apply(reduced, up, states, messages,tiles)
+        return apply(reduced, up, states, messages)
     gates = mx.tanh(reduced.astype(mx.float32) @ up.swapaxes(-1, -2))
     forget, gain = mx.split(gates, 2, axis=-1)
     return (1 - forget) * states + gain * messages
@@ -51,7 +51,7 @@ def mix_messages(layer, states, messages, packed_states=None):
          else mx.concatenate(states,axis=0))
     msg = messages.reshape(4, 1, -1)[:3]
     prepared = None if normalized is None else normalized.reshape(4,1,-1)[:3]
-    outputs = _apply(x, msg, cache[1], cache[2], prepared,lookup(layer,tuple(w for i,w in enumerate(weights) if i%3)))
+    outputs = _apply(x, msg, cache[1], cache[2], prepared)
     return tuple(mx.split(outputs, 3, axis=0))
 
 
