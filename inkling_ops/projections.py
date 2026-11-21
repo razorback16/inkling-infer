@@ -145,7 +145,8 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
         table=getattr(layer,"_decode_position_table",None)
         if table is not None and table[0]==(layer.log_scaling_alpha,layer.log_scaling_n_floor):
             position=(table[1],kv.offset)
-    prepare_scale = (not full and getattr(kv,"grouped",False) and layer.head_dim==128
+    prepare_scale = (((not full and getattr(kv,"grouped",False))
+                      or (full and unscaled and 1024<=kv.keys.shape[2]<=8192)) and layer.head_dim==128
                      and query.dtype==relative.dtype==mx.bfloat16 and type(layer.rel_logits_proj) is layers.RelativeLogits)
     scaled_query = None
     pair = None

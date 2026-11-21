@@ -71,24 +71,6 @@ _filtered = mx.fast.metal_kernel(
 
 
 
-def _scaled_kernel(filtered):
-    source = _source
-    inputs = _inputs
-    outputs = _outputs
-    if filtered:
-        source = source.replace("            states[d", _filter + "            states[d", 1)
-        inputs = inputs + ["kh","vh","kw","vw"]
-        outputs = outputs + ["k_window","v_window"]
-    source = source.replace("if (query) qo[base+d] = x;",
-                            "if (query) { qo[base+d] = x; scaled[base+d] = attention_scale * float(x); }")
-    return mx.fast.metal_kernel(name="inkling_scaled_filtered_heads" if filtered else "inkling_scaled_heads",
-                                input_names=inputs+["attention_scale"],output_names=outputs+["scaled"],source=source)
-
-
-_scaled = _scaled_kernel(False)
-_scaled_filtered = _scaled_kernel(True)
-
-
 _dynamic_filter = """
             if (key || val) {
                 auto hist=key ? kh : vh;
@@ -111,6 +93,30 @@ _dynamic_filter = """
                 x=float(T((sum+x)/3.f));
             }
 """
+def _scaled_kernel(mode):
+    source = _source
+    inputs = _inputs
+    outputs = _outputs
+    if mode != "plain":
+        history_filter = _dynamic_filter if mode=="dynamic" else _filter
+        source = source.replace("            states[d", history_filter + "            states[d", 1)
+        inputs = inputs + ["kh","vh","kw","vw"]
+        outputs = outputs + ["k_window","v_window"]
+        if mode=="dynamic":
+            inputs = inputs + ["kd","vd"]
+    source = source.replace("if (query) qo[base+d] = x;",
+                            "if (query) { qo[base+d] = x; scaled[base+d] = attention_scale * float(x); }")
+    return mx.fast.metal_kernel(name="inkling_scaled_"+mode+"_heads",
+                                input_names=inputs+["attention_scale"],output_names=outputs+["scaled"],source=source)
+
+
+_scaled = _scaled_kernel("plain")
+_scaled_filtered = _scaled_kernel("filtered")
+
+
+_scaled_dynamic = _scaled_kernel("dynamic")
+
+
 _dynamic = mx.fast.metal_kernel(
     name="inkling_head_norm_dynamic_pair",input_names=_inputs+["kh","vh","kw","vw","kd","vd"],
     output_names=_outputs+["k_window","v_window"],
@@ -150,7 +156,7 @@ def normalize(layer, query, key, value, relative, return_pair=False, filters=Non
             template.append(("W", filters[2].dtype))
             kernel=_filtered
     if prepare_scale:
-        kernel = _scaled_filtered if filters is not None else _scaled
+        kernel = _scaled if filters is None else (_scaled_dynamic if len(filters)==6 else _scaled_filtered)
         inputs.append(scalar(layer.scaling))
         shapes.append(shapes[0])
         types.append(mx.float32)
