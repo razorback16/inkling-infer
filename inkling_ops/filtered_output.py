@@ -41,10 +41,18 @@ _kernel = mx.fast.metal_kernel(
 
 
 _pack_rows = mx.fast.metal_kernel(
-    name="inkling_output_row_bytes", input_names=["w"], output_names=["payload"],
+    name="inkling_output_row_bytes", input_names=["w"], output_names=["payload","bases"],
     source="""
         uint lane=thread_index_in_simdgroup, row=thread_position_in_grid.x/32;
-        constexpr ushort base=108;
+        ushort highest=0;
+        for (uint d=lane*4;d<3072;d+=128) {
+            ushort4 bits=*(device const ushort4*)((device const ushort*)w+row*3072+d);
+            ushort4 e=(bits>>7)&255;
+            highest=max(highest,max(max(e.x,e.y),max(e.z,e.w)));
+        }
+        highest=simd_max(highest);
+        ushort base=ushort(max(0,int(highest)-15));
+        if (!lane) bases[row]=uchar(base);
         for (uint tile=0;tile<24;++tile) {
             uint d=tile*128+lane*4;
             ushort4 bits=*(device const ushort4*)((device const ushort*)w+row*3072+d);
@@ -60,12 +68,12 @@ _pack_rows = mx.fast.metal_kernel(
     """,
 )
 _compact_rows = mx.fast.metal_kernel(
-    name="inkling_stream_output_row",input_names=["x","weight","history","conv","hidden","payload"],
+    name="inkling_stream_output_row",input_names=["x","weight","history","conv","hidden","payload","bases"],
     output_names=["residual","window","squares"],
     source="""
         uint lane=thread_index_in_simdgroup, row=thread_position_in_grid.x/32;
         uint sg=simdgroup_index_in_threadgroup;
-        constexpr ushort base=108<<8;
+        ushort base=ushort(bases[row])<<8;
         float dot=0;
         for (uint tile=0;tile<24;++tile) {
             uint d=tile*128+lane*4, addr=((row/4*24+tile)*4+row%4)*48;
@@ -116,7 +124,7 @@ def prepare(model):
         saved=getattr(proj,"_output_rows",None)
         if saved is None or saved[0] is not w:
             encoded=_pack_rows(inputs=[w],grid=(2304*32,1,1),threadgroup=(128,1,1),
-                               output_shapes=[(2304,24,48)],output_dtypes=[mx.uint32])
+                               output_shapes=[(2304,24,48),(2304,)],output_dtypes=[mx.uint32,mx.uint8])
             object.__setattr__(proj,"_output_rows",(w,encoded))
             arrays.extend(encoded)
     if arrays:
