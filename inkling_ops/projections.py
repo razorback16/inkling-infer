@@ -24,10 +24,22 @@ def projection(layer, modules, key):
     return cached[1:]
 
 
+@mx.compile
+def _position_table(pos,alpha,floor):
+    return 1.0+alpha*mx.log(mx.maximum((pos+1)/floor,1.0))
+
+
 def prepare_query_weights(model):
     arrays = []
+    tables = {}
     for index, block in enumerate(model.layers):
         layer = block.self_attn
+        if isinstance(layer,layers.FullAttention):
+            params=(layer.log_scaling_alpha,layer.log_scaling_n_floor)
+            if params not in tables:
+                tables[params]=_position_table(mx.arange(8192,dtype=mx.float32),*params)
+                arrays.append(tables[params])
+            object.__setattr__(layer,"_decode_position_table",(params,tables[params]))
         common = (layer.q_proj,layer.r_proj,layer.gate_proj)
         variants = []
         if isinstance(layer,layers.SlidingAttention):
@@ -94,6 +106,12 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
     elif not full and filtered is None and not fused_norm:
         key, conv_states[0] = layer.k_sconv(key, conv_states[0], conv_mask)
         value, conv_states[1] = layer.v_sconv(value, conv_states[1], conv_mask)
+    kv = cache[0] if cache is not None else None
+    position=None
+    if dynamic_norm and hasattr(kv,"page_prefix") and kv.keys.shape[2]<=8192:
+        table=getattr(layer,"_decode_position_table",None)
+        if table is not None and table[0]==(layer.log_scaling_alpha,layer.log_scaling_n_floor):
+            position=(table[1],kv.offset)
     pair = None
     if fused_norm or dynamic_norm:
         if dynamic_norm:
@@ -101,7 +119,7 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
                      layer.k_sconv.weight_proj(key_hidden_states),layer.v_sconv.weight_proj(value_hidden_states)]
         else:
             filters=[*conv_states[:2],layer.k_sconv.conv1d.weight,layer.v_sconv.conv1d.weight]
-        query, pair, rel, conv_states[:2] = normalize(layer,query,key,value,relative,filters=filters)
+        query, pair, rel, conv_states[:2] = normalize(layer,query,key,value,relative,filters=filters,position=position)
         key,value = mx.split(pair,2,axis=2)
     elif layer.head_dim == 128 and relative.shape[-1] // layer.num_heads <= 128:
         query, key, value, rel, pair = normalize(layer, query, key, value, relative, return_pair=True)
@@ -111,8 +129,7 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
         value = value.reshape(1, 1, layer.num_key_value_heads, -1)
         value = layers.unweighted_rms_norm(value.astype(mx.float32), layer.eps).astype(value.dtype)
         rel = layer.rel_l2_clip(relative.reshape(1, 1, layer.num_heads, -1))
-    kv = cache[0] if cache is not None else None
-    if full:
+    if full and position is None:
         offset = kv.offset if kv is not None else 0
         pos = layers._positions(offset, 1).astype(mx.float32)
         tau = 1.0 + layer.log_scaling_alpha * mx.log(mx.maximum((pos + 1) / layer.log_scaling_n_floor, 1.0))

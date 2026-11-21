@@ -100,7 +100,17 @@ _dynamic = mx.fast.metal_kernel(
 )
 
 
-def normalize(layer, query, key, value, relative, return_pair=False, filters=None):
+_positioned_source=_source.replace("            states[d",_dynamic_filter+"            states[d",1)
+_positioned_source=_positioned_source.replace("if (query) qo[base+d] = x;",
+    "if (query) qo[base+d] = T(float(x)*table[offset[0]]);").replace(
+    "else ro[base+d] = x;","else ro[base+d] = T(float(x)*table[offset[0]]);")
+_positioned=mx.fast.metal_kernel(
+    name="inkling_positioned_dynamic_heads",input_names=_inputs+["kh","vh","kw","vw","kd","vd","table","offset"],
+    output_names=_outputs+["k_window","v_window"],source=_positioned_source,
+)
+
+
+def normalize(layer, query, key, value, relative, return_pair=False, filters=None, position=None):
     heads, kv, dim = layer.num_heads, layer.num_key_value_heads, layer.head_dim
     rel = relative.shape[-1] // heads
     inputs = [query, key, value, relative, layer.q_l2_clip.scale, layer.rel_l2_clip.scale,
@@ -113,7 +123,10 @@ def normalize(layer, query, key, value, relative, return_pair=False, filters=Non
         inputs.extend(filters)
         shapes.extend([(1,4,kv*dim)] * 2)
         types.extend([mx.float32] * 2)
-        if len(filters)==6:
+        if position is not None:
+            inputs.extend(position)
+            kernel=_positioned
+        elif len(filters)==6:
             kernel=_dynamic
         else:
             template.append(("W", filters[2].dtype))
