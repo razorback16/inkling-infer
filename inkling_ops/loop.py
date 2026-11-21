@@ -7,7 +7,7 @@ from mlx_lm.models.cache import ArraysCache, CacheList, KVCache, RotatingKVCache
 from mlx_lm.models.inkling2.model import TextModel
 
 from .compiled_ring import _DeviceRing
-from . import prepared_bank, block_lookahead, ring_writes
+from . import prepared_bank, block_lookahead
 
 _reference = TextModel._run_loop
 
@@ -49,7 +49,7 @@ def _compile(model):
                 if value is None:
                     value = mx.take(ring.packed,ring.write_coordinates[0],axis=2)
                 updates.append(value)
-            slab = mx.slice_update(slab, ring_writes.gather(updates),
+            slab = mx.slice_update(slab, mx.concatenate(updates,axis=0),
                                    grouped[0].write_coordinates[0], axes=(2,))
         return result, slab, [
             (tuple(c[1].cache),) if getattr(c[0],"grouped",False) else
