@@ -30,8 +30,8 @@ _schedule = mx.fast.metal_kernel(
         uint row=0,count=0;
         if (lo<128) {
             uint first=lo ? ends[lo-1] : 0;
-            row=offsets[lo]+32*(tile-first);
-            count=min(32u,offsets[lo+1]-row);
+            row=offsets[lo]+16*(tile-first);
+            count=min(16u,offsets[lo+1]-row);
         }
         tiles[3*tile]=row; tiles[3*tile+1]=lo; tiles[3*tile+2]=count;
     """,
@@ -42,8 +42,8 @@ def schedule(ids):
     m=ids.size
     offsets,=_offsets(inputs=[ids],template=[("M",m)],grid=(129,1,1),threadgroup=(32,1,1),
                       output_shapes=[(129,)],output_dtypes=[mx.uint32])
-    ends=mx.cumsum((offsets[1:]-offsets[:-1]+31)//32)
-    size=(m+31)//32+128
+    ends=mx.cumsum((offsets[1:]-offsets[:-1]+15)//16)
+    size=(m+15)//16+128
     return _schedule(inputs=[offsets,ends],grid=(size,1,1),threadgroup=(64,1,1),
                      output_shapes=[(size,3)],output_dtypes=[mx.uint32])[0]
 
@@ -69,12 +69,12 @@ def kernel():
             uint count=tiles[3*tile+2];
             if (!count) return;
             uint column=threadgroup_position_in_grid.x*64, tid=thread_position_in_threadgroup.x;
-            mlx::steel::BlockMMA<bfloat16_t,bfloat16_t,32,64,32,2,2,false,true,40,40>
+            mlx::steel::BlockMMA<bfloat16_t,bfloat16_t,16,64,32,1,4,false,true,40,40>
                 mma(simdgroup_index_in_threadgroup,thread_index_in_simdgroup);
             uint input_rows[2];
             uint fn=((thread_index_in_simdgroup/4)&2)*2+(thread_index_in_simdgroup%2)*2;
             for (uint i=0;i<2;++i) {
-                uint at=row+min(uint(mma.sm)+i*16,count-1);
+                uint at=row+min(uint(mma.sm)+i*8,count-1);
                 input_rows[i]=GATHER ? token_rows[at] : at;
             }
             for (uint k=0;k<K;k+=32) {
@@ -84,8 +84,8 @@ def kernel():
                         uint addr=input_rows[i]*K+k+frag*8+fn;
                         mma.Atile.frag_at(i,0)=float2(*(device const bfloat2*)(x+addr));
                     }
-                    for (short j=0;j<4;++j) {
-                        uint nfrag=simdgroup_index_in_threadgroup%2+2*j;
+                    for (short j=0;j<2;++j) {
+                        uint nfrag=simdgroup_index_in_threadgroup%4+4*j;
                         uint at=((tile*32+frag*8+nfrag)*32+thread_index_in_simdgroup);
                         mma.Btile.frag_at(0,j)=float2(((device const bfloat2*)w)[at]);
                     }
@@ -94,30 +94,30 @@ def kernel():
             }
             if (GATED) {
                 for (short i=0;i<2;++i) {
-                    uint r=mma.sm+i*16;
+                    uint r=mma.sm+i*8;
                     if (r>=count) continue;
-                    for (short j=0;j<4;++j) {
+                    for (short j=0;j<2;++j) {
                         float2 frag=mma.Ctile.frag_at(i,j);
                         ushort g=as_type<ushort>(bfloat16_t(frag.x));
                         ushort u=as_type<ushort>(bfloat16_t(frag.y));
                         uint gi=((uint(g)&32767)<<2)|((g>>15)<<1);
                         uint ui=((uint(u)&32767)<<2)|((u>>15)<<1);
-                        uint c=column+mma.sn+j*16;
+                        uint c=column+mma.sn+j*32;
                         out[(row+r)*(N/2)+c/2]=bfloat16_t(activation[gi]*activation[ui+1]);
                     }
                 }
             } else if (ROUTE_LAYOUT) {
                 for (short i=0;i<2;++i) {
-                    uint r=mma.sm+i*16;
+                    uint r=mma.sm+i*8;
                     if (r>=count) continue;
                     uint original=original_slots[row+r], token=original/8, slot=original%8;
                     uint base=((token*(N/64)+column/64)*8+slot)*64;
-                    for (short j=0;j<4;++j)
-                        *(device bfloat2*)(out+base+mma.sn+j*16)=bfloat2(mma.Ctile.frag_at(i,j));
+                    for (short j=0;j<2;++j)
+                        *(device bfloat2*)(out+base+mma.sn+j*32)=bfloat2(mma.Ctile.frag_at(i,j));
                 }
             } else {
                 auto result=out+row*N+column;
-                if (count==32) mma.store_result(result,N);
+                if (count==16) mma.store_result(result,N);
                 else mma.store_result_safe(result,N,short2(64,count));
             }
         """,
