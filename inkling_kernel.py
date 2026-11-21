@@ -1,4 +1,3 @@
-from inkling_ops.fp8_scales import SCALE_HEADER
 """Single-token weighted mixture of eight Inkling expert outputs."""
 import mlx.core as mx
 from mlx_lm.models.inkling2 import layers
@@ -56,7 +55,13 @@ def _make_down(finish):
             0, .5, 1, 1.5, 2, 3, 4, 6, -0., -.5, -1, -1.5, -2, -3, -4, -6
         };
 
-    """ + SCALE_HEADER,
+        inline float decode_scale(uchar bits) {
+            ushort magnitude = bits & 127;
+            ushort raw = (magnitude << 7) | (((magnitude + 1) >> 7) << 14)
+                         | ((bits & 128) << 8);
+            return float(as_type<half>(raw)) * 256.f;
+        }
+    """,
     source="""
         #pragma clang fp contract(off)
         // Each SIMD group projects one expert into the same four channels.

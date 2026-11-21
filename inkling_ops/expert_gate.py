@@ -3,7 +3,6 @@ from functools import lru_cache
 
 import mlx.core as mx
 from mlx_lm.models.inkling2 import layers
-from .fp8_scales import SCALE_HEADER
 
 _reference = layers.Experts.__call__
 _kernel = mx.fast.metal_kernel(
@@ -14,7 +13,12 @@ _kernel = mx.fast.metal_kernel(
         constant float levels[16] = {
             0, .5, 1, 1.5, 2, 3, 4, 6, -0., -.5, -1, -1.5, -2, -3, -4, -6
         };
-    """ + SCALE_HEADER,
+        inline float fp8_scale(uchar bits) {
+            ushort mag = bits & 127;
+            ushort raw = (mag << 7) | (((mag + 1) >> 7) << 14) | ((bits & 128) << 8);
+            return float(as_type<half>(raw)) * 256.f;
+        }
+    """,
     source="""
         #pragma clang fp contract(off)
         uint lane = thread_index_in_simdgroup;
@@ -34,7 +38,7 @@ _kernel = mx.fast.metal_kernel(
                              + v[i+2] * levels[(bits >> 8) & 15] + v[i+3] * levels[(bits >> 12) & 15];
                     bits >>= 16;
                 }
-                float term = partial * decode_scale(scales[row * 144 + word / 2]);
+                float term = partial * fp8_scale(scales[row * 144 + word / 2]);
                 sums[r] += term;
             }
         }
