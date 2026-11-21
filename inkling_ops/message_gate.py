@@ -3,7 +3,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.inkling2 import layers
 
-from .gain import apply
+from .gain import apply, lookup
 from .exact_sources import native
 
 from . import paired_norm, prepared_reduce
@@ -42,7 +42,7 @@ def project(layer, hidden_states, message, normalized=None, reduced=None):
         cached = (forget, gain, mx.concatenate((native(layer.forget_gate_proj), native(layer.message_gate_proj)), axis=0))
         object.__setattr__(layer, "_paired_weights", cached)
     if reduced is not None and cached[2].shape==(4608,64) and cached[2].dtype in (mx.bfloat16,mx.float32):
-        return apply(reduced,cached[2],hidden_states,message)
+        return apply(reduced,cached[2],hidden_states,message,lookup(layer,(forget,gain)))
     return _project(hidden_states, message, layer.down_proj.weight, cached[2], normalized)
 
 
