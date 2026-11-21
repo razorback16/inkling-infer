@@ -21,10 +21,9 @@ _source = """
         f += simd_shuffle_down(f, 1);
         g += simd_shuffle_down(g, 1);
         if ((lane % 4) == 0) {
-            #pragma clang fp contract(off)
             uint c = bank * 2304 + row;
-            float retained = (1.f - precise::tanh(f)) * float(state[SHARED ? row : c]);
-            float added = precise::tanh(g) * float(msg[c]);
+            volatile float retained = (1.f - precise::tanh(f)) * float(state[SHARED ? row : c]);
+            volatile float added = precise::tanh(g) * float(msg[c]);
             out[c] = retained + added;
         }
     """
