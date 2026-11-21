@@ -55,17 +55,32 @@ def _make_kernel(with_sums):
                                 input_names=["x","packed","state","msg"],output_names=outputs,source=source)
 
 
+_quad_source = _source.replace("if ((lane % 4) == 0)", "float value=0; if ((lane % 4) == 0)").replace(
+    "out[c] = retained + added;", "value=retained+added; out[c]=value;")
+_quad_source += """
+        float sum=0;
+        for (ushort j=0;j<4;++j) {
+            float v=simd_shuffle(value,ushort((lane&16)+j*4));
+            sum+=v*v;
+        }
+        if ((lane&15)==0) squares[bank*576+row/4]=sum;
+"""
+_quad_sums = mx.fast.metal_kernel(name="inkling_message_quad_sums",input_names=["x","packed","state","msg"],
+                                  output_names=["out","squares"],source=_quad_source)
+
+
 _kernel = _make_kernel(False)
 _with_sums = _make_kernel(True)
 
 
 def apply(x, packed, state, messages, with_sums=False):
     banks = messages.size // 2304
+    fine = with_sums and banks==3
     shapes = [messages.shape]
     if with_sums:
-        shapes.append((banks,18))
-    kernel = _with_sums if with_sums else _kernel
+        shapes.append((banks,576 if fine else 18))
+    kernel = _quad_sums if fine else _with_sums if with_sums else _kernel
     result = kernel(inputs=[x,packed,state,messages],template=[("SHARED",state.size != messages.size)],
-                    grid=(2304*4,banks,1),threadgroup=(512 if with_sums else 128,1,1),
+                    grid=(2304*4,banks,1),threadgroup=(512 if with_sums and not fine else 128,1,1),
                     output_shapes=shapes,output_dtypes=[mx.float32]*len(shapes))
     return tuple(result) if with_sums else result[0]
