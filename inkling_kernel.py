@@ -112,8 +112,6 @@ def install():
     expert_gate.install()
     from inkling_ops import loop
     loop.install()
-    from inkling_ops import compact_head
-    compact_head.install()
     short_conv.install()
     message_gate.install()
     attention_mask.install()
