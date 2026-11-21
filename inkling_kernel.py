@@ -84,8 +84,7 @@ def _make_down(finish):
                            + x[k+3] * fp4_values[(q >> 12) & 15];
                     q >>= 16;
                 }
-                volatile float term = decode_scale(scales[row * 72 + word / 2]) * chunk;
-                accum[r] += term;
+                accum[r] += decode_scale(scales[row * 72 + word / 2]) * chunk;
             }
         }
         threadgroup float projected[8][4];
