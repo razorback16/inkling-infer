@@ -40,17 +40,29 @@ _source = """
             if (!query) normalized[d] = norm[d];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (tid < 288) {
-            for (uint i = 0; i <= K; ++i) {
-                float dot = 0;
-                for (uint d = tid; d < 2304; d += 288)
-                    dot += (i == K ? norm[d] : blocks[i*2304+d])*queries[query*2304+d];
-                dot = simd_sum(dot);
-                if (lane == 0) scores[i][sg] = dot;
-            }
+        uint group = tid/288;
+        for (uint i=group; i<=K; i+=2) {
+            float dot=0;
+            for (uint d=tid%288; d<2304; d+=288)
+                dot+=(i==K ? norm[d] : blocks[i*2304+d])*queries[query*2304+d];
+            dot=simd_sum(dot);
+            if (!lane) scores[i][sg%9]=dot;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (!tid) {
+        if (K<32 && !sg) {
+            // Each source keeps its serial nine-warp sum; sources proceed independently.
+            float logit=-INFINITY;
+            if (lane<=K) {
+                float dot=0;
+                for (uint j=0; j<9; ++j) dot+=scores[lane][j];
+                logit=dot*(1.f/48.f);
+            }
+            float weight=metal::exp(logit-simd_max(logit));
+            float total=0;
+            for (uint i=0; i<=K; ++i) total+=simd_shuffle(weight,i);
+            if (lane<=K) coeff[lane]=weight/total;
+        }
+        else if (K>=32 && !tid) {
             float peak = -INFINITY, z = 0;
             for (uint i = 0; i <= K; ++i) {
                 float dot = 0;
