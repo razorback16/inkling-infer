@@ -57,10 +57,11 @@ _pack_rows = mx.fast.metal_kernel(
             uint d=tile*128+lane*4;
             ushort4 bits=*(device const ushort4*)((device const ushort*)w+row*3072+d);
             ushort4 delta=((bits>>7)&255)-base;
-            uint addr=((row/4*24+tile)*4+row%4)*64;
+            uint id=(row/4*24+tile)*4+row%4, addr=id*48;
             if (simd_any(any(delta>15))) {
                 raw_tiles|=1u<<tile;
-                *(device ushort4*)(payload+addr+lane*2)=bits;
+                uint word=lane<24 ? addr+lane*2 : 2304*24*48+id*16+(lane-24)*2;
+                *(device ushort4*)(payload+word)=bits;
             } else {
                 payload[addr+lane]=as_type<uint>(uchar4((bits<<1)|(bits>>15)));
                 ((device ushort*)(payload+addr+32))[lane]=delta.x|(delta.y<<4)|(delta.z<<8)|(delta.w<<12);
@@ -79,11 +80,12 @@ _compact_rows = mx.fast.metal_kernel(
         ushort base=ushort(format>>24)<<8;
         float dot=0;
         for (uint tile=0;tile<24;++tile) {
-            uint d=tile*128+lane*4, addr=((row/4*24+tile)*4+row%4)*64;
+            uint d=tile*128+lane*4,id=(row/4*24+tile)*4+row%4,addr=id*48;
             float4 a=float4(*(device const bfloat4*)(x+d));
             ushort4 bits;
             if (format&(1u<<tile)) {
-                bits=*(device const ushort4*)(payload+addr+lane*2);
+                uint word=lane<24 ? addr+lane*2 : 2304*24*48+id*16+(lane-24)*2;
+                bits=*(device const ushort4*)(payload+word);
             } else {
                 ushort h=((device const ushort*)(payload+addr+32))[lane];
                 ushort4 n=ushort4(h,h>>4,h>>8,h>>12)&15;
