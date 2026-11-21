@@ -3,7 +3,7 @@ import mlx.core as mx
 
 _kernel=mx.fast.metal_kernel(
     name="inkling_prepared_message_bottleneck",
-    input_names=["state","message","weight","inverse"],output_names=["out"],
+    input_names=["state","message","weight","state_partials"],output_names=["out"],
     source="""
         uint tid=thread_position_in_threadgroup.x,lane=thread_index_in_simdgroup;
         uint sg=simdgroup_index_in_threadgroup,bank=threadgroup_position_in_grid.y;
@@ -12,7 +12,7 @@ _kernel=mx.fast.metal_kernel(
         threadgroup float norm[18],parts[8][ROWS];
         float inv;
         if (PRECOMPUTED) {
-            inv=inverse[SHARED ? 0 : bank];
+            inv=precise::rsqrt(simd_sum(lane<18 ? state_partials[(SHARED ? 0 : bank)*18+lane] : 0.f)/2304.f+1e-6f);
         } else {
             for (uint g=sg;g<18;g+=8) {
                 float norm2=0;
@@ -54,10 +54,10 @@ def applicable(state, msg, down, up):
             and up.shape[-2:]==(4608,64) and up.dtype in (mx.bfloat16,mx.float32))
 
 
-def reduce(state,msg,down,inverse=None):
+def reduce(state,msg,down,state_partials=None):
     banks=msg.size//2304
-    rows=2 if inverse is not None else 4
-    return _kernel(inputs=[state,msg,down,state if inverse is None else inverse],
-                   template=[("ROWS",rows),("SHARED",state.size!=msg.size),("PRECOMPUTED",inverse is not None)],
+    rows=2 if state_partials is not None else 4
+    return _kernel(inputs=[state,msg,down,state if state_partials is None else state_partials],
+                   template=[("ROWS",rows),("SHARED",state.size!=msg.size),("PRECOMPUTED",state_partials is not None)],
                    grid=(64//rows*256,banks,1),threadgroup=(256,1,1),
                    output_shapes=[msg.shape[:-1]+(64,)],output_dtypes=[mx.bfloat16])[0]

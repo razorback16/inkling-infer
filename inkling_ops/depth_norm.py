@@ -125,16 +125,11 @@ def _message_state_kernel():
         float norm2=0;
         for (uint j=0;j<4;++j) norm2+=values[j]*values[j];
         norm2=simd_sum(norm2);
-        if (!lane) sums[sg]=norm2;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (!sg) {
-            float scale=precise::rsqrt(simd_sum(lane<18 ? sums[lane] : 0.f)/2304.f+1e-6f);
-            if (!lane) inverse[query]=scale;
-        }
+        if (!lane) partials[query*18+sg]=norm2;
     """
-    return mx.fast.metal_kernel(name="inkling_depth_message_inverse",
+    return mx.fast.metal_kernel(name="inkling_depth_message_partials",
                                 input_names=["x","blocks","queries","closed"],
-                                output_names=["mixed","normalized","inverse"],source=source)
+                                output_names=["mixed","normalized","partials"],source=source)
 
 
 _message_state = _message_state_kernel()
@@ -146,13 +141,13 @@ def evaluate(module, blocks, x, prepare_messages=False):
     shapes = [(1,1,q,2304),x.shape]
     kernel = _message_state if prepare_messages else _kernel
     if prepare_messages:
-        shapes.append((q,))
+        shapes.append((q,18))
     result = kernel(inputs=[x,blocks,module.query,closed], template=[("K",blocks.shape[0]), *config],
                     grid=(q*576,1,1),threadgroup=(576,1,1),
                     output_shapes=shapes,output_dtypes=[mx.float32]*len(shapes))
     if prepare_messages:
-        mixed, normalized, inverse = result
-        return (mixed,inverse), normalized
+        mixed, normalized, partials = result
+        return (mixed,partials), normalized
     return result
 
 

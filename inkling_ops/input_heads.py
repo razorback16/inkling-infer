@@ -54,9 +54,9 @@ _from_sums = mx.fast.metal_kernel(
 
 
 def attention(layer, x, inputs, cache, conv_states, conv_mask, messages):
-    inverse = None
+    state_partials = None
     if isinstance(inputs,tuple):
-        inputs, inverse = inputs
+        inputs, state_partials = inputs
     full = isinstance(layer, layers.FullDecoderLayer)
     ref = _full if full else _sliding
     if x.shape != (1,1,2304) or (not full and messages is None):
@@ -75,7 +75,7 @@ def attention(layer, x, inputs, cache, conv_states, conv_mask, messages):
         from . import triplet
         if getattr(layer._mix_messages,"__func__",None) is triplet.mix_messages:
             source = x if inputs is None else inputs
-            result = triplet.mix_messages(layer,states,messages,source.reshape(-1,1,2304),inverse,with_sums=True)
+            result = triplet.mix_messages(layer,states,messages,source.reshape(-1,1,2304),state_partials,with_sums=True)
             if len(result)==2:
                 states, sums = result
             else:
