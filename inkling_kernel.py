@@ -26,7 +26,7 @@ def mix(states, weights, dtype):
                 output_shapes=[(1, 1, 2304)], output_dtypes=[dtype])[0]
 
 
-def _make_down(finish, joint=False):
+def _make_down(finish):
     inputs = ["hidden", "indices", "routing", "packed", "scales", "amax"]
     outputs = ["out"]
     store = "out[channel + lane] = T(value);"
@@ -48,7 +48,7 @@ def _make_down(finish, joint=False):
             out[c] = T(residual[c] + filtered);
         """
     return mx.fast.metal_kernel(
-        name="inkling_joint_down_mix" if joint else "inkling_finish_nvfp4_layer" if finish else "inkling_nvfp4_down_mix",
+        name="inkling_finish_nvfp4_layer" if finish else "inkling_nvfp4_down_mix",
         input_names=inputs, output_names=outputs,
     header="""
         constant float fp4_values[16] = {
@@ -105,14 +105,12 @@ def _make_down(finish, joint=False):
             }
             STORE
         }
-    """.replace("STORE", store).replace("packed[row * 144 + word]",
-        "packed[(expert+1)*2304*288 + row*144+word]" if joint else "packed[row * 144 + word]"),
+    """.replace("STORE", store),
     )
 
 
 _down_mix = _make_down(False)
 _finish_mix = _make_down(True)
-_finish_joint = _make_down(True,True)
 
 
 def can_fuse_down(down, x):
