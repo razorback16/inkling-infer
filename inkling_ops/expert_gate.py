@@ -31,7 +31,7 @@ _kernel = mx.fast.metal_kernel(
             for (uint i = 0; i < 8; ++i) v[i] = float(x[word * 8 + i]);
             for (uint r = 0; r < 4; ++r) {
                 uint row = expert * 2304 + first + r;
-                uint bits = packed[row * 288 + word];
+                uint bits = packed[expert*2304*GAP + row*288+word];
                 float partial = 0.f;
                 for (uint i = 0; i < 8; i += 4) {
                     partial += v[i] * levels[bits & 15] + v[i+1] * levels[(bits >> 4) & 15]
@@ -108,6 +108,31 @@ def activation_tables():
     return table
 
 
+def prepare_expert_pairs(model):
+    arrays=[]
+    for layer in model.layers:
+        experts=layer.mlp.experts
+        gate,down=experts.gate_up_proj,experts.down_proj
+        if (getattr(gate,"mode",None)!="nvfp4" or getattr(down,"mode",None)!="nvfp4"
+                or gate.weight.dtype!=mx.uint32 or down.weight.dtype!=mx.uint32
+                or gate.weight.shape[1:]!=(2304,288) or down.weight.shape!=(gate.weight.shape[0],2304,144)):
+            continue
+        a,b=gate.weight,down.weight
+        old=getattr(experts,"_paired_fp4",None)
+        if old is None or old[0] is not a or old[1] is not b:
+            n=a.shape[0]
+            pair=mx.concatenate((a.reshape(n,-1),b.reshape(n,-1)),axis=1)
+            object.__setattr__(experts,"_paired_fp4",(a,b,pair))
+            arrays.append(pair)
+    if arrays:
+        mx.eval(arrays)
+
+
+def paired_weight(experts):
+    old=getattr(experts,"_paired_fp4",None)
+    return old[2] if old is not None and old[0] is experts.gate_up_proj.weight and old[1] is experts.down_proj.weight else None
+
+
 def gated_activation(layer, x, indices):
     proj = layer.gate_up_proj
     if (x.shape == (1,1,2304) and x.dtype == mx.bfloat16 and indices.shape == (1,1,8)
@@ -126,8 +151,10 @@ def gated_activation(layer, x, indices):
             or layer.act_fn.gate_softcap != 4 or layer.act_fn.up_softcap != 25):
         pair = proj(x[..., None, None, :], indices)
         return layer.act_fn(pair[..., 0::2], pair[..., 1::2])
+    pair=paired_weight(layer)
     active = _kernel(
-        inputs=[x, indices, proj.weight, proj.scales, proj.global_scale, activation_tables()],
+        template=[("GAP",144 if pair is not None else 0)],
+        inputs=[x, indices, proj.weight if pair is None else pair, proj.scales, proj.global_scale, activation_tables()],
         grid=(144 * 128, 8, 1), threadgroup=(128, 1, 1),
         output_shapes=[(1, 1, 8, 1, 1152)], output_dtypes=[x.dtype],
     )[0]

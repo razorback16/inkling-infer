@@ -13,7 +13,8 @@ _reference = TextModel._run_loop
 
 
 def _compile(model):
-    from . import filtered_output, filtered_kv
+    from . import expert_gate, filtered_output, filtered_kv
+    expert_gate.prepare_expert_pairs(model)
     filtered_output.prepare(model)
     filtered_kv.prepare(model)
     from .projections import prepare_query_weights
