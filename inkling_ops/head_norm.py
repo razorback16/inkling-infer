@@ -110,14 +110,12 @@ _positioned=mx.fast.metal_kernel(
 )
 
 
-def normalize(layer, query, key, value, relative, return_pair=False, filters=None, position=None, relative_ready=False):
+def normalize(layer, query, key, value, relative, return_pair=False, filters=None, position=None):
     heads, kv, dim = layer.num_heads, layer.num_key_value_heads, layer.head_dim
     rel = relative.shape[-1] // heads
     inputs = [query, key, value, relative, layer.q_l2_clip.scale, layer.rel_l2_clip.scale,
               scalar(layer.q_l2_clip.threshold), scalar(layer.rel_l2_clip.threshold), scalar(layer.eps)]
     shapes = [(1, 1, heads, dim), (1, 1, 2*kv, dim), (1, 1, heads, rel)]
-    if relative_ready:
-        shapes[2] = (1,)
     types = [query.dtype] * 3
     template = [("T", query.dtype), ("H", heads), ("KV", kv), ("D", dim), ("R", rel)]
     kernel = _kernel
@@ -134,10 +132,8 @@ def normalize(layer, query, key, value, relative, return_pair=False, filters=Non
             template.append(("W", filters[2].dtype))
             kernel=_filtered
     q, pair, r, *windows = kernel(
-        inputs=inputs, template=template, grid=(32*(heads+2*kv+(0 if relative_ready else heads)),1,1), threadgroup=(32,1,1),
+        inputs=inputs, template=template, grid=(32*(2*heads+2*kv),1,1), threadgroup=(32,1,1),
         output_shapes=shapes, output_dtypes=types)
-    if relative_ready:
-        r=relative.reshape(1,1,heads,rel)
     if filters is not None:
         return q, pair, r, windows
     k, v = mx.split(pair,2,axis=2)
