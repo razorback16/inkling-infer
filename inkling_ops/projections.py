@@ -6,7 +6,7 @@ import mlx.nn as nn
 from mlx_lm.models.inkling2 import layers
 
 from .head_norm import normalize
-from . import rel_mask, filtered_kv, packed_rows, single_row_tiles
+from . import rel_mask, filtered_kv, packed_rows
 
 _sliding = layers.SlidingAttention.__call__
 _full = layers.FullAttention.__call__
@@ -47,10 +47,10 @@ def prepare_query_weights(model):
                 and all(type(p) is nn.Linear and "bias" not in p and p.weight.shape==(1024,2304)
                         and p.weight.dtype==mx.bfloat16 for p in (layer.k_proj,layer.v_proj))):
             k,v=layer.k_proj.weight,layer.v_proj.weight
-            saved=getattr(layer,"_single_row_kv",None)
+            saved=getattr(layer,"_four_row_kv",None)
             if saved is None or saved[0] is not k or saved[1] is not v:
-                encoded=single_row_tiles.encode(mx.concatenate((k,v)))
-                object.__setattr__(layer,"_single_row_kv",(k,v,encoded))
+                encoded=packed_rows.encode(mx.concatenate((k,v)))
+                object.__setattr__(layer,"_four_row_kv",(k,v,encoded))
                 arrays.extend(encoded)
         common = (layer.q_proj,layer.r_proj,layer.gate_proj)
         variants = []

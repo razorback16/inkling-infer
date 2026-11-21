@@ -1,6 +1,5 @@
 """Lossless four-row BF16 tiles for 2304-channel decode projections."""
 import mlx.core as mx
-from . import single_row_tiles
 
 _ranges = mx.fast.metal_kernel(
     name="inkling_row_exponent_range",input_names=["weight"],output_names=["bases"],
@@ -95,24 +94,22 @@ _dot = mx.fast.metal_kernel(
     name="inkling_four_row_gemv", input_names=["x","payload"],output_names=["out"],
     source=_dot_source,
 )
-_single_kv = mx.fast.metal_kernel(
-    name="inkling_single_row_global_kv",input_names=["kx","vx","payload","formats"],output_names=["out"],
-    source="""
-        uint lane=thread_index_in_simdgroup,row=thread_position_in_grid.x/32;
-        auto x=row<1024 ? kx : vx;
-    """ + single_row_tiles.DOT + """
-        if (!lane) out[row]=bfloat16_t(dot);
-    """,
+_pair = mx.fast.metal_kernel(
+    name="inkling_four_row_global_kv",input_names=["kx","vx","payload"],output_names=["out"],
+    source=_dot_source.replace("group=thread_position_in_grid.x/32",
+                               "warp=thread_position_in_grid.x/32,group=warp/4,start=warp%4").replace(
+        "uint r=0;r<4;++r","uint r=start;r<start+1;++r").replace(
+        "uint2 meta=", "auto x=group<256 ? kx : vx; uint2 meta="),
 )
 
 
 def project_kv(layer,k,v):
-    saved=getattr(layer,"_single_row_kv",None)
+    saved=getattr(layer,"_four_row_kv",None)
     if (saved is None or saved[0] is not layer.k_proj.weight or saved[1] is not layer.v_proj.weight
             or "bias" in layer.k_proj or "bias" in layer.v_proj
             or k.shape!=(1,1,2304) or v.shape!=k.shape or k.dtype!=mx.bfloat16 or v.dtype!=k.dtype):
         return None
-    pair,=_single_kv(inputs=[k,v,*saved[2]],template=[("COLS",2304)],grid=(2048*32,1,1),threadgroup=(32,1,1),
+    pair,=_pair(inputs=[k,v,*saved[2]],grid=(2048*32,1,1),threadgroup=(128,1,1),
                 output_shapes=[(1,1,2048)],output_dtypes=[k.dtype])
     return mx.split(pair,2,axis=-1)
 
