@@ -31,6 +31,20 @@ _mix_sorted = mx.fast.metal_kernel(
 )
 
 
+_activate = mx.fast.metal_kernel(
+    name="inkling_prompt_gate_activation", input_names=["pairs","table"], output_names=["out"],
+    source="""
+        uint first=thread_position_in_grid.x*4;
+        for (uint j=0;j<4;++j) {
+            ushort2 bits=((device const ushort2*)pairs)[first+j];
+            uint g=((uint(bits.x)&32767)<<2)|((bits.x>>15)<<1);
+            uint u=((uint(bits.y)&32767)<<2)|((bits.y>>15)<<1);
+            out[first+j]=bfloat16_t(table[g]*table[u+1]);
+        }
+    """,
+)
+
+
 def mix(layer, x):
     indices, weights = layer.gate(x)
     ids=indices.reshape(-1)
@@ -42,7 +56,14 @@ def mix(layer, x):
     hidden=x.reshape(-1,1,x.shape[-1])[rows]
     experts = layer.experts
     gated = experts.gate_up_proj(hidden, sorted_ids, sorted_indices=True)
-    active = experts.act_fn(gated[..., 0::2], gated[..., 1::2])
+    if (type(experts.act_fn) is layers.SoftcappedSwiGLU and gated.dtype==mx.bfloat16
+            and gated.shape[-1]%8==0 and experts.act_fn.gate_softcap==4 and experts.act_fn.up_softcap==25):
+        from .expert_gate import activation_tables
+        shape=(*gated.shape[:-1],gated.shape[-1]//2)
+        active=_activate(inputs=[gated,activation_tables()],grid=(gated.size//8,1,1),
+                         threadgroup=(128,1,1),output_shapes=[shape],output_dtypes=[gated.dtype])[0]
+    else:
+        active = experts.act_fn(gated[..., 0::2], gated[..., 1::2])
     results = experts.down_proj(active, sorted_ids, sorted_indices=True)
     return _mix_sorted(
         inputs=[results, inverse, weights], grid=(576, x.shape[1], 1),
