@@ -74,7 +74,7 @@ def mix(layer, x):
                              threadgroup=(128,1,1),output_shapes=[shape],output_dtypes=[gated.dtype])[0]
         else:
             active=experts.act_fn(gated[...,0::2],gated[...,1::2])
-    results=(prefill_qmm.project(experts.down_proj,active,tiles,original_slots=order) if custom
+    results=(prefill_qmm.project(experts.down_proj,active,tiles,original_slots=order,packed_x=tabled) if custom
              else experts.down_proj(active,sorted_ids,sorted_indices=True))
     return _mix_sorted(
         inputs=[results, inverse, weights], template=[("ROUTE_LAYOUT",custom)], grid=(576, x.shape[1], 1),

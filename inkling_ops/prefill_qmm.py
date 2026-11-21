@@ -65,8 +65,8 @@ def kernel():
     return mx.fast.metal_kernel(
         name="inkling_prompt_lookup_gemm",input_names=["x","w","scales","table","tiles","activation","token_rows","original_slots"],
         output_names=["out"],header=include(mma),source="""
-            uint tile=threadgroup_position_in_grid.y, row=tiles[3*tile], expert=tiles[3*tile+1];
-            uint count=tiles[3*tile+2];
+            uint tile_index=threadgroup_position_in_grid.y, row=tiles[3*tile_index], expert=tiles[3*tile_index+1];
+            uint count=tiles[3*tile_index+2];
             if (!count) return;
             uint column=threadgroup_position_in_grid.x*64, tid=thread_position_in_threadgroup.x;
             mlx::steel::BlockMMA<bfloat16_t,bfloat16_t,32,64,32,2,2,false,true,40,40>
@@ -82,6 +82,10 @@ def kernel():
                 for (short frag=0;frag<4;++frag) {
                     for (short i=0;i<2;++i) {
                         uint addr=input_rows[i]*K+k+frag*8+fn;
+                        if (PACKED_X) {
+                            uint rf=simdgroup_index_in_threadgroup/2+2*i;
+                            addr=(((tile_index*4+rf)*(K/8)+k/8+frag)*32+thread_index_in_simdgroup)*2;
+                        }
                         mma.Atile.frag_at(i,0)=float2(*(device const bfloat2*)(x+addr));
                     }
                     for (short j=0;j<4;++j) {
@@ -95,7 +99,6 @@ def kernel():
             if (GATED) {
                 for (short i=0;i<2;++i) {
                     uint r=mma.sm+i*16;
-                    if (r>=count) continue;
                     for (short j=0;j<4;++j) {
                         float2 frag=mma.Ctile.frag_at(i,j);
                         ushort g=as_type<ushort>(bfloat16_t(frag.x));
@@ -103,7 +106,10 @@ def kernel():
                         uint gi=((uint(g)&32767)<<2)|((g>>15)<<1);
                         uint ui=((uint(u)&32767)<<2)|((u>>15)<<1);
                         uint c=column+mma.sn+j*16;
-                        out[(row+r)*(N/2)+c/2]=bfloat16_t(activation[gi]*activation[ui+1]);
+                        uint feature=c/2;
+                        uint owner=((r&4)*4)+((feature&4)*2)+((r&3)*2)+((feature/2)&1);
+                        uint addr=(((tile_index*4+r/8)*(N/16)+feature/8)*32+owner)*2+feature%2;
+                        out[addr]=bfloat16_t(activation[gi]*activation[ui+1]);
                     }
                 }
             } else if (ROUTE_LAYOUT) {
@@ -179,7 +185,7 @@ def expanded_tiles(proj,table):
     return saved[3]
 
 
-def project(proj, x, tiles, activation=None, token_rows=None, original_slots=None):
+def project(proj, x, tiles, activation=None, token_rows=None, original_slots=None, packed_x=False):
     scale=proj.global_scale
     saved=getattr(proj,"_prompt_coefficients",None)
     if saved is None or saved[0] is not scale:
@@ -195,8 +201,12 @@ def project(proj, x, tiles, activation=None, token_rows=None, original_slots=Non
     n=proj.output_dims
     width=n//2 if activation is not None else n
     m=x.shape[0] if token_rows is None else token_rows.size
+    if activation is not None:
+        m=tiles.shape[0]*32
+    elif packed_x:
+        m=original_slots.size
     return kernel()(inputs=[x,expanded_tiles(proj,saved[1]),proj.scales,saved[1],tiles,x if activation is None else activation,
                             tiles if token_rows is None else token_rows,tiles if original_slots is None else original_slots],
-                    template=[("K",proj.input_dims),("N",n),("GATED",activation is not None),("GATHER",token_rows is not None),("ROUTE_LAYOUT",original_slots is not None)],
+                    template=[("K",proj.input_dims),("N",n),("GATED",activation is not None),("PACKED_X",packed_x),("GATHER",token_rows is not None),("ROUTE_LAYOUT",original_slots is not None)],
                     grid=(n//64*128,tiles.shape[0],1),threadgroup=(128,1,1),
                     output_shapes=[(m,1,width)],output_dtypes=[x.dtype])[0]
