@@ -52,21 +52,19 @@ _pack_rows = mx.fast.metal_kernel(
         }
         highest=simd_max(highest);
         ushort base=ushort(max(0,int(highest)-15));
-        uint raw_tiles=0;
+        if (!lane) bases[row]=uchar(base);
         for (uint tile=0;tile<24;++tile) {
             uint d=tile*128+lane*4;
             ushort4 bits=*(device const ushort4*)((device const ushort*)w+row*3072+d);
             ushort4 delta=((bits>>7)&255)-base;
             bool4 escape=delta>15;
-            raw_tiles |= uint(simd_any(any(escape))) << tile;
-            uchar4 bytes=uchar4((bits<<1)|(bits>>15));
-            ushort4 n=delta&15;
+            uchar4 bytes=select(uchar4((bits<<1)|(bits>>15)),uchar4(0),escape);
+            ushort4 n=select(delta,ushort4(0),escape);
             // Four neighboring rows consume this 768-byte tile together.
             uint addr=((row/4*24+tile)*4+row%4)*48;
             payload[addr+lane]=as_type<uint>(bytes);
             ((device ushort*)(payload+addr+32))[lane]=n.x|(n.y<<4)|(n.z<<8)|(n.w<<12);
         }
-        if (!lane) bases[row]=(raw_tiles<<8)|base;
     """,
 )
 _compact_rows = mx.fast.metal_kernel(
@@ -75,23 +73,18 @@ _compact_rows = mx.fast.metal_kernel(
     source="""
         uint lane=thread_index_in_simdgroup, row=thread_position_in_grid.x/32;
         uint sg=simdgroup_index_in_threadgroup;
-        uint meta=bases[row];
-        ushort base=ushort(meta&255)<<8;
-        uint raw_tiles=meta>>8;
+        ushort base=ushort(bases[row])<<8;
         float dot=0;
         for (uint tile=0;tile<24;++tile) {
             uint d=tile*128+lane*4, addr=((row/4*24+tile)*4+row%4)*48;
             float4 a=float4(*(device const bfloat4*)(x+d));
-            ushort4 bits;
-            if (raw_tiles & (1u<<tile)) {
+            ushort h=((device const ushort*)(payload+addr+32))[lane];
+            ushort4 n=ushort4(h,h>>4,h>>8,h>>12)&15;
+            ushort4 code=(n<<8)|ushort4(as_type<uchar4>(payload[addr+lane]));
+            ushort4 rot=code+base;
+            ushort4 bits=(rot>>1)|(rot<<15);
+            if (any(code==0))
                 bits=*(device const ushort4*)((device const ushort*)weight+row*3072+d);
-            } else {
-                ushort h=((device const ushort*)(payload+addr+32))[lane];
-                ushort4 n=ushort4(h,h>>4,h>>8,h>>12)&15;
-                ushort4 code=(n<<8)|ushort4(as_type<uchar4>(payload[addr+lane]));
-                ushort4 rot=code+base;
-                bits=(rot>>1)|(rot<<15);
-            }
             float4 w=float4(as_type<bfloat4>(bits));
             for (uint j=0;j<4;++j) dot=fma(a[j],w[j],dot);
         }
@@ -131,7 +124,7 @@ def prepare(model):
         saved=getattr(proj,"_output_rows",None)
         if saved is None or saved[0] is not w:
             encoded=_pack_rows(inputs=[w],grid=(2304*32,1,1),threadgroup=(128,1,1),
-                               output_shapes=[(2304,24,48),(2304,)],output_dtypes=[mx.uint32,mx.uint32])
+                               output_shapes=[(2304,24,48),(2304,)],output_dtypes=[mx.uint32,mx.uint8])
             object.__setattr__(proj,"_output_rows",(w,encoded))
             arrays.extend(encoded)
     if arrays:
