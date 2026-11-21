@@ -23,7 +23,11 @@ _source = """
             float square = x*x;
             sum += square;
         }
-        if (rel && R <= 64) {
+        if (rel && R <= 32) {
+            float local_square=sum;
+            sum=0;
+            for (ushort j=0;j<R;++j) sum+=simd_shuffle(local_square,j);
+        } else if (rel && R <= 64) {
             sum = 0;
             for (uint j = 0; j < R; ++j) {
                 float y = float(r[base+j]) * float(rs[base+j]);
