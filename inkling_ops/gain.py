@@ -3,27 +3,24 @@ import mlx.core as mx
 
 _source = """
         uint lane = thread_index_in_simdgroup;
-        uint row = thread_position_in_grid.x / 2;
-        uint col = (lane % 2) * 4;
+        uint row = thread_position_in_grid.x / 4;
+        uint col = (lane % 4) * 4;
         uint bank = thread_position_in_grid.y;
         uint base = (bank * 4608 + row) * 64;
-        float f = 0, g = 0, f2 = 0, g2 = 0;
+        float f = 0, g = 0;
         for (uint tile = 0; tile < 64; tile += 16) {
             for (uint i = 0; i < 4; ++i) {
                 uint k = tile + col + i;
                 float v = float(x[bank * 64 + k]);
                 f = fma(v, float(packed[base + k]), f);
                 g = fma(v, float(packed[base + 2304 * 64 + k]), g);
-                float v2 = float(x[bank * 64 + k + 8]);
-                f2 = fma(v2, float(packed[base + k + 8]), f2);
-                g2 = fma(v2, float(packed[base + 2304 * 64 + k + 8]), g2);
             }
         }
-        f += f2;
-        g += g2;
+        f += simd_shuffle_down(f, 2);
+        g += simd_shuffle_down(g, 2);
         f += simd_shuffle_down(f, 1);
         g += simd_shuffle_down(g, 1);
-        if ((lane % 2) == 0) {
+        if ((lane % 4) == 0) {
             uint c = bank * 2304 + row;
             volatile float retained = (1.f - precise::tanh(f)) * float(state[SHARED ? row : c]);
             volatile float added = precise::tanh(g) * float(msg[c]);
@@ -65,6 +62,6 @@ def apply(x, packed, state, messages, with_sums=False):
         shapes.append((banks,18))
     kernel = _with_sums if with_sums else _kernel
     result = kernel(inputs=[x,packed,state,messages],template=[("SHARED",state.size != messages.size)],
-                    grid=(2304*2,banks,1),threadgroup=(256 if with_sums else 128,1,1),
+                    grid=(2304*4,banks,1),threadgroup=(512 if with_sums else 128,1,1),
                     output_shapes=shapes,output_dtypes=[mx.float32]*len(shapes))
     return tuple(result) if with_sums else result[0]
