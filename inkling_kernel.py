@@ -80,11 +80,10 @@ def _make_down(finish):
                 uint q = packed[row * 144 + word];
                 float chunk = 0;
                 for (uint k = 0; k < 8; k += 4) {
-                    float group = x[k] * fp4_values[q & 15];
-                    group = fma(x[k+1], fp4_values[(q >> 4) & 15], group);
-                    group = fma(x[k+2], fp4_values[(q >> 8) & 15], group);
-                    group = fma(x[k+3], fp4_values[(q >> 12) & 15], group);
-                    chunk += group;
+                    chunk += x[k] * fp4_values[q & 15]
+                           + x[k+1] * fp4_values[(q >> 4) & 15]
+                           + x[k+2] * fp4_values[(q >> 8) & 15]
+                           + x[k+3] * fp4_values[(q >> 12) & 15];
                     q >>= 16;
                 }
                 float term = decode_scale(scales[row * 72 + word / 2]) * chunk;
