@@ -55,10 +55,10 @@ _filter = """
                 float total = 0;
                 for (uint t = 0; t < 3; ++t) {
                     float old = history[t*KV*D+i];
-                    if (!COMPACT || t) next[(t-uint(COMPACT))*KV*D+i] = old;
+                    next[t*KV*D+i] = old;
                     total = fma(float(W(old)), float(conv[i*4+t]), total);
                 }
-                next[(3-uint(COMPACT))*KV*D+i] = x;
+                next[3*KV*D+i] = x;
                 total = fma(float(W(x)), float(conv[i*4+3]), total);
                 x = float(T((float(W(total))+x)*0.4472135954999579f));
             }
@@ -83,13 +83,13 @@ _dynamic_filter = """
                     if (lag) {
                         uint at=(3-lag)*KV*D+i;
                         v=hist[at];
-                        if (!COMPACT || lag<3) window[at-uint(COMPACT)*KV*D]=v;
+                        window[at]=v;
                     }
                     float weight=float(fixed[lag*KV*D+i])+float(coefs[local_head*4+lag]);
                     volatile float product=v*weight;
                     sum+=product;
                 }
-                window[(3-uint(COMPACT))*KV*D+i]=x;
+                window[3*KV*D+i]=x;
                 x=float(T((sum+x)/3.f));
             }
 """
@@ -110,7 +110,7 @@ _positioned=mx.fast.metal_kernel(
 )
 
 
-def normalize(layer, query, key, value, relative, return_pair=False, filters=None, position=None, compact_history=False):
+def normalize(layer, query, key, value, relative, return_pair=False, filters=None, position=None):
     heads, kv, dim = layer.num_heads, layer.num_key_value_heads, layer.head_dim
     rel = relative.shape[-1] // heads
     inputs = [query, key, value, relative, layer.q_l2_clip.scale, layer.rel_l2_clip.scale,
@@ -120,9 +120,8 @@ def normalize(layer, query, key, value, relative, return_pair=False, filters=Non
     template = [("T", query.dtype), ("H", heads), ("KV", kv), ("D", dim), ("R", rel)]
     kernel = _kernel
     if filters is not None:
-        template.append(("COMPACT",compact_history))
         inputs.extend(filters)
-        shapes.extend([(1,3 if compact_history else 4,kv*dim)] * 2)
+        shapes.extend([(1,4,kv*dim)] * 2)
         types.extend([mx.float32] * 2)
         if position is not None:
             inputs.extend(position)

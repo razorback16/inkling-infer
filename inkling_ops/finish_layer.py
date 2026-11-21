@@ -23,7 +23,6 @@ def decode(layer, hidden_states, block_states, *, cache=None, conv_mask=None, me
             or post.kernel_size != 4 or moe.sharding_group is not None or moe.gate.top_k != 8
             or (not fused_down and getattr(down, "mode", None) != "mxfp8")):
         return _reference(layer, hidden_states, block_states, cache=cache, conv_mask=conv_mask, messages=messages)
-    cache[0].compact_history=True
     history = list(cache[1].cache)
     if (type(layer.post_attention_convolution) is layers.ShortConvolution
             and layer.post_attention_convolution.kernel_size==4
@@ -95,5 +94,5 @@ def decode(layer, hidden_states, block_states, *, cache=None, conv_mask=None, me
     else:
         states = down(active, selected).squeeze(-2)
         out, next_history = postmix.finish(states, routing, history[3], w, residual)
-    cache[1].cache = [h if h.shape[1]==3 else layers._conv_state(h,None,3) for h in history[:3]] + [next_history]
+    cache[1].cache = [layers._conv_state(h,None,3) for h in history[:3]] + [next_history]
     return out, block_states

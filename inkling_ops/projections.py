@@ -97,9 +97,8 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
     parts = mx.split(projected,boundaries,axis=-1)
     query, relative, gate = parts[:3]
     sinks = layer.sink_proj(hidden_states)
-    compact_history=cache is not None and getattr(cache[0],"compact_history",False)
     filtered = (None if full or same else
-                filtered_kv.apply(layer,key_hidden_states,value_hidden_states,conv_states,conv_mask,compact_history))
+                filtered_kv.apply(layer,key_hidden_states,value_hidden_states,conv_states,conv_mask))
     if filtered is not None:
         key,value,conv_states[0],conv_states[1] = filtered
     elif same:
@@ -140,7 +139,7 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
                      layer.k_sconv.weight_proj(key_hidden_states),layer.v_sconv.weight_proj(value_hidden_states)]
         else:
             filters=[*conv_states[:2],layer.k_sconv.conv1d.weight,layer.v_sconv.conv1d.weight]
-        query, pair, rel, conv_states[:2] = normalize(layer,query,key,value,relative,filters=filters,position=position,compact_history=compact_history)
+        query, pair, rel, conv_states[:2] = normalize(layer,query,key,value,relative,filters=filters,position=position)
         key,value = mx.split(pair,2,axis=2)
     elif layer.head_dim == 128 and relative.shape[-1] // layer.num_heads <= 128:
         query, key, value, rel, pair = normalize(layer, query, key, value, relative, return_pair=True)
