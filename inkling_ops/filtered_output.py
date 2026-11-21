@@ -1,7 +1,7 @@
 """Apply attention output projection, temporal filter, and residual in one pass."""
 import mlx.core as mx
 import mlx.nn as nn
-from . import single_row_tiles
+from . import vocab_tiles
 
 _kernel = mx.fast.metal_kernel(
     name="inkling_project_attention_residual",
@@ -42,12 +42,12 @@ _kernel = mx.fast.metal_kernel(
 
 
 _compact_rows = mx.fast.metal_kernel(
-    name="inkling_stream_output_row",input_names=["x","history","conv","hidden","payload","formats"],
+    name="inkling_stream_output_row",input_names=["x","history","conv","hidden","tiles","overflow","formats","offsets"],
     output_names=["residual","window","squares"],
     source="""
         uint lane=thread_index_in_simdgroup, row=thread_position_in_grid.x/32;
         uint sg=simdgroup_index_in_threadgroup;
-    """ + single_row_tiles.DOT + """
+    """ + vocab_tiles.DOT + """
         threadgroup float values[4];
         if (!lane) {
             float v=float(bfloat16_t(dot)),filtered=0;
@@ -82,7 +82,7 @@ def prepare(model):
             continue
         saved=getattr(proj,"_output_rows",None)
         if saved is None or saved[0] is not w:
-            encoded=single_row_tiles.encode(w)
+            encoded=vocab_tiles.encode(w)
             object.__setattr__(proj,"_output_rows",(w,encoded))
             arrays.extend(encoded)
     if arrays:
