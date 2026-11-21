@@ -55,12 +55,12 @@ _mx_down = mx.fast.metal_kernel(
         }
         threadgroup float value[8];
         dot=simd_sum(dot);
-        if (!lane) value[slot]=float(T(dot))*route[slot];
+        if (!lane) value[slot]=float(T(dot));
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (!slot && !lane) {
             uint c=first;
             float mixed=0;
-            for (uint e=0;e<8;++e) mixed+=value[e];
+            for (uint e=0;e<8;++e) mixed+=value[e]*route[e];
     """ + _filter + "}",
 )
 
