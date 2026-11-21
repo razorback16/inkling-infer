@@ -42,7 +42,9 @@ _pack = mx.fast.metal_kernel(
 
     """,
 )
-_dot_source = """
+_dot = mx.fast.metal_kernel(
+    name="inkling_four_row_gemv", input_names=["x","weight","payload","bases"],output_names=["out"],
+    source="""
         uint lane=thread_index_in_simdgroup, group=thread_position_in_grid.x/32;
         uchar4 base=*(device const uchar4*)(bases+group*4);
         float sums[4]={};
@@ -70,24 +72,8 @@ _dot_source = """
             for (ushort step=16;step;step>>=1) dot+=simd_shuffle_down(dot,step);
             if (!lane) out[group*4+r]=bfloat16_t(dot);
         }
-    """
-_dot = mx.fast.metal_kernel(
-    name="inkling_four_row_gemv", input_names=["x","weight","payload","bases"],output_names=["out"],
-    source=_dot_source,
+    """,
 )
-_vocab = mx.fast.metal_kernel(
-    name="inkling_capped_vocabulary_rows", input_names=["x","weight","payload","bases","softcap"],output_names=["out"],
-    source=_dot_source.replace("if (!lane) out[group*4+r]=bfloat16_t(dot);",
-        "if (!lane && group*4+r<COUNT) out[group*4+r]=softcap[as_type<ushort>(bfloat16_t(dot))];"),
-)
-
-
-def vocabulary(x,weight,encoded,softcap,count):
-    groups=(count+15)//16
-    return _vocab(inputs=[x,weight,*encoded,softcap],template=[("COUNT",count)],
-                  grid=(groups*128,1,1),threadgroup=(128,1,1),
-                  output_shapes=[(1,1,count)],output_dtypes=[mx.float32])[0]
-
 
 
 def encode(weight):
