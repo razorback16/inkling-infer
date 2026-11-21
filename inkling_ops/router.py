@@ -187,14 +187,14 @@ _rank_pairs = mx.fast.metal_kernel(
                 }
             }
         } else {
-            for (uint i=0;i<4;++i) {
-                uint e=warp+32*i;
-                float query=simd_shuffle(other[i],warp);
+            for (uint e=warp;e<128;e+=GROUPS) {
+                uint col=e/32, src=e%32;
+                float query=simd_shuffle(other[col],ushort(src));
                 uint ahead=0;
                 for (uint j=0;j<4;++j)
                     ahead+=uint(other[j]>query || (other[j]==query && lane+32*j<e));
                 uint rank=simd_sum(ahead);
-                float score=simd_shuffle(scores[i],warp);
+                float score=simd_shuffle(scores[col],ushort(src));
                 if (!lane && rank<8) {inds[rank]=e; selected[rank]=score;}
             }
         }
@@ -229,7 +229,9 @@ def route(layer, x, dtype, normalized=False, logits=None, squares=None):
         kernel = _rank_pairs if paired else _select
         args = [logits] if paired else [logits,gate.e_score_correction_bias]
         args.extend([scalar(layers._ROUTER_SCORE_EPS),scalar(gate.routed_scaling_factor)])
-        indices, weights = kernel(inputs=args, grid=(1024,1,1),threadgroup=(1024,1,1),
+        threads=256 if paired else 1024
+        options={"template":[("GROUPS",8)]} if paired else {}
+        indices, weights = kernel(inputs=args, grid=(threads,1,1),threadgroup=(threads,1,1), **options,
             output_shapes=[(1,1,8)]*2, output_dtypes=[mx.uint32,mx.float32])
     else:
         indices, weights = layers.expert_routing(
