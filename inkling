@@ -1,0 +1,15 @@
+#!/bin/sh
+set -eu
+
+usage() {
+    echo 'Usage: inkling {codex|claude} [client arguments...]'
+}
+
+case "${1-}" in
+    codex|claude) client=$1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage >&2; exit 2 ;;
+esac
+shift
+directory=$(dirname "$(realpath "$0")")
+exec "$directory/$client-inkling" "$@"
