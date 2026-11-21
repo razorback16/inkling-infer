@@ -24,7 +24,7 @@ _kernel = mx.fast.metal_kernel(
         g += simd_shuffle_down(g, 1);
         if ((lane % 4) == 0) {
             uint c = bank * 2304 + row;
-            volatile float retained = (1.f - precise::tanh(f)) * float(state[c]);
+            volatile float retained = (1.f - precise::tanh(f)) * float(state[SHARED ? row : c]);
             volatile float added = precise::tanh(g) * float(msg[c]);
             out[c] = retained + added;
         }
@@ -33,7 +33,7 @@ _kernel = mx.fast.metal_kernel(
 
 
 def apply(x, packed, state, messages):
-    banks = state.size // 2304
-    return _kernel(inputs=[x, packed, state, messages],
+    banks = messages.size // 2304
+    return _kernel(inputs=[x, packed, state, messages], template=[("SHARED",state.size != messages.size)],
                    grid=(2304 * 4, banks, 1), threadgroup=(128, 1, 1),
-                   output_shapes=[state.shape], output_dtypes=[mx.float32])[0]
+                   output_shapes=[messages.shape], output_dtypes=[mx.float32])[0]

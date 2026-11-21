@@ -50,7 +50,12 @@ def attention(layer, x, inputs, cache, conv_states, conv_mask, messages):
     else:
         states = (inputs[...,0,:],) * 3
     if messages is not None:
-        states = layer._mix_messages(states, messages)
+        from . import triplet
+        if getattr(layer._mix_messages,"__func__",None) is triplet.mix_messages:
+            source = x if inputs is None else inputs
+            states = triplet.mix_messages(layer,states,messages,source.reshape(-1,1,2304))
+        else:
+            states = layer._mix_messages(states,messages)
     weights = [n.weight for n in norms]
     from mlx_lm.kernels.common import scalar
     q,k,v = _kernel(inputs=[*states,*weights,scalar(norms[0].eps)],

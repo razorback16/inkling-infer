@@ -26,7 +26,7 @@ def _apply(states, messages, down, up, normalized=None):
     return (1 - forget) * states + gain * messages
 
 
-def mix_messages(layer, states, messages):
+def mix_messages(layer, states, messages, packed_states=None):
     normalized = None
     if isinstance(messages,tuple):
         messages, normalized = messages
@@ -44,7 +44,9 @@ def mix_messages(layer, states, messages):
         up = mx.stack([mx.concatenate((native(g.forget_gate_proj), native(g.message_gate_proj))) for g in gates])
         cache = (weights, down, up)
         object.__setattr__(layer, "_message_triplet", cache)
-    x = mx.concatenate(states, axis=0)
+    x = (packed_states if packed_states is not None and packed_states.dtype==mx.float32
+         and messages.dtype==mx.float32 and packed_states.shape[-1]==2304
+         else mx.concatenate(states,axis=0))
     msg = messages.reshape(4, 1, -1)[:3]
     prepared = None if normalized is None else normalized.reshape(4,1,-1)[:3]
     outputs = _apply(x, msg, cache[1], cache[2], prepared)
