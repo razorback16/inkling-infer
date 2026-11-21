@@ -6,13 +6,15 @@ from mlx_lm.models.inkling2 import layers
 from .gain import apply
 from .exact_sources import native
 
-from . import paired_norm
+from . import paired_norm, prepared_reduce
 
 _reference = layers.MessageGate.__call__
 
 
 @mx.compile
 def _project(hidden, message, down, paired, normalized=None):
+    if prepared_reduce.applicable(hidden,normalized,down,paired):
+        return apply(prepared_reduce.reduce(hidden,normalized,down),paired,hidden,message)
     if hidden.shape[-1] == 2304 and hidden.dtype == message.dtype == mx.float32:
         joined = paired_norm.join(hidden, message if normalized is None else normalized, down.dtype, normalized is not None)
     else:

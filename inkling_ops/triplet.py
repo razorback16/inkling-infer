@@ -6,13 +6,15 @@ from mlx_lm.models.inkling2 import layers
 from .gain import apply
 from .exact_sources import native
 
-from . import paired_norm
+from . import paired_norm, prepared_reduce
 
 _reference = layers.DecoderLayer._mix_messages
 
 
 @mx.compile
 def _apply(states, messages, down, up, normalized=None):
+    if prepared_reduce.applicable(states,normalized,down,up):
+        return apply(prepared_reduce.reduce(states,normalized,down),up,states,messages)
     norm = layers.unweighted_rms_norm
     if states.shape[-1] == 2304 and states.dtype == messages.dtype == mx.float32:
         joined = paired_norm.join(states, messages if normalized is None else normalized, down.dtype, normalized is not None)
