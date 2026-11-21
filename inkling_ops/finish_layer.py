@@ -2,7 +2,7 @@
 import mlx.core as mx
 from mlx_lm.models.inkling2 import layers
 
-from . import expert_gate
+from . import depth_norm, expert_gate
 
 _reference = layers.DecoderLayer.__call__
 
@@ -18,8 +18,11 @@ def decode(layer, hidden_states, block_states, *, cache=None, conv_mask=None, me
             or not can_fuse_down(moe.experts.down_proj, hidden_states)):
         return _reference(layer, hidden_states, block_states, cache=cache, conv_mask=conv_mask, messages=messages)
     history = list(cache[1].cache)
-    normed = layers.unweighted_rms_norm(hidden_states.astype(mx.float32))
-    inputs = layer.attention_input(block_states,normed) if layer.attention_input is not None else None
+    if layer.attention_input is None:
+        normed = layers.unweighted_rms_norm(hidden_states.astype(mx.float32))
+        inputs = None
+    else:
+        inputs, normed = depth_norm.evaluate(layer.attention_input, block_states, hidden_states)
     attention = layer._self_attention(hidden_states,inputs,cache,history,None,messages)
     filtered, history[2] = layer.post_attention_convolution(attention,history[2],None)
     residual = filtered.astype(mx.float32)
@@ -28,7 +31,8 @@ def decode(layer, hidden_states, block_states, *, cache=None, conv_mask=None, me
         block_states = block if block_states is None else mx.concatenate((block_states, block))
     else:
         residual = hidden_states.astype(mx.float32) + residual
-    x = layer.mlp_input(block_states,layers.unweighted_rms_norm(residual))[...,0,:]
+    mixed, _ = depth_norm.evaluate(layer.mlp_input, block_states, residual)
+    x = mixed[...,0,:]
     if messages is not None:
         x = layer.mlp_message_gate(x,messages[...,3,:])
     x = layer.post_attention_layernorm(x).astype(hidden_states.dtype)
