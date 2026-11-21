@@ -13,8 +13,6 @@ _reference = TextModel._run_loop
 
 
 def _compile(model):
-    from inkling_kernel import prepare_down_weights
-    prepare_down_weights(model)
     from . import filtered_output
     filtered_output.prepare(model)
     from .projections import prepare_query_weights
