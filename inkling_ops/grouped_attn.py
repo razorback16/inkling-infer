@@ -71,15 +71,13 @@ _partial = mx.fast.metal_kernel(
                     uint p = (kv*length+pos)*128+d;
                     auto keys = in_tail ? tail : k;
                     auto values = in_tail ? tail+NKV*256*128 : v;
-                    float4 key=float4(*(device const bfloat4*)(keys+p));
-                    float4 value=float4(*(device const bfloat4*)(values+p));
                     float score = 0;
-                    for (uint j=0; j<4; ++j) score += query[j]*key[j];
+                    for (uint j=0; j<4; ++j) score += query[j]*float(keys[p+j]);
                     score = simd_sum(score)+pb;
                     float top = max(peak,score);
                     float a = fast::exp(peak-top), b = fast::exp(score-top);
                     total = total*a+b;
-                    for (uint j=0; j<4; ++j) accum[j] = accum[j]*a+b*value[j];
+                    for (uint j=0; j<4; ++j) accum[j] = accum[j]*a+b*float(values[p+j]);
                     peak = top;
                 }
             }
