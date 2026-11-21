@@ -86,69 +86,6 @@ _partial = mx.fast.metal_kernel(
         if (!lane) { stats[addr*2] = peak; stats[addr*2+1] = total; }
     """,
 )
-_triple = mx.fast.metal_kernel(
-    name="inkling_three_query_attention",input_names=["q","k","v","tail","fresh","rel","w","slot","end","sinks","scale"],
-    output_names=["partials","stats"],
-    source="""
-        uint lane=thread_index_in_simdgroup,kv=threadgroup_position_in_grid.y;
-        uint tile=thread_position_in_grid.x/32,d=lane*4;
-        int newest=slot[0]-(PRE_UPDATE ? 0 : 1),valid=end[0]+(PRE_UPDATE ? 1 : 0);
-        float4 query[3],acc[3];
-        float peak[3],total[3];
-        for (uint h=0;h<3;++h) {
-            uint head=kv*3+h;
-            query[h]=float4(*(device const bfloat4*)(q+head*128+d))*scale;
-            peak[h]=tile ? -FLT_MAX : float(sinks[head]);
-            total[h]=tile ? 0.f : 1.f;
-            acc[h]=0;
-        }
-        for (uint chunk=0;chunk<S;chunk+=4096) {
-            int pos=chunk+tile+lane*128;
-            int dist=newest-pos;
-            if (dist<0) dist+=S;
-            float bias[3];
-            for (uint h=0;h<3;++h) {
-                uint head=kv*3+h;
-                float b=0;
-                if (pos>=S || dist>=valid) b=-INFINITY;
-                else if (dist<R) {
-                    for (uint j=0;j<WIDTH;++j)
-                        b=fma(float(rel[head*WIDTH+j]),float(w[SWIZZLED ? ((dist%128)*WIDTH+j)*(R/128)+dist/128 : j*R+dist]),b);
-                    b=float(T(b));
-                }
-                bias[h]=b;
-            }
-            for (uint i=0;i<32 && chunk+tile+i*128<S;++i) {
-                uint position=chunk+tile+i*128;
-                bool in_tail=PAGED && position>=S-256;
-                uint at=in_tail ? position-(S-256) : position;
-                uint length=in_tail ? 256 : (PAGED ? S-256 : S);
-                uint p=(kv*length+at)*128+d;
-                auto keys=in_tail ? tail : k;
-                auto values=in_tail ? tail+NKV*256*128 : v;
-                float4 key=float4(*(device const bfloat4*)(keys+p));
-                float4 val=float4(*(device const bfloat4*)(values+p));
-                for (uint h=0;h<3;++h) {
-                    float pb=simd_shuffle(bias[h],i);
-                    if (pb==-INFINITY) continue;
-                    float score=0;
-                    for (uint j=0;j<4;++j) score+=query[h][j]*key[j];
-                    score=simd_sum(score)+pb;
-                    float top=max(peak[h],score);
-                    float a=fast::exp(peak[h]-top),b=fast::exp(score-top);
-                    total[h]=total[h]*a+b;
-                    for (uint j=0;j<4;++j) acc[h][j]=acc[h][j]*a+b*val[j];
-                    peak[h]=top;
-                }
-            }
-        }
-        for (uint h=0;h<3;++h) {
-            uint addr=(kv*3+h)*128+tile;
-            *(device bfloat4*)(partials+addr*128+d)=bfloat4(acc[h]);
-            if (!lane) {stats[2*addr]=peak[h];stats[2*addr+1]=total[h];}
-        }
-    """,
-)
 _merge = mx.fast.metal_kernel(
     name="inkling_attention_gate", input_names=["partial","stats","gate"], output_names=["out"],
     source="""
@@ -204,14 +141,12 @@ def attend(layer,q,k,v,rel,sinks,cache,gate):
     if before is None:
         slot, end = mx.array(slot,mx.int32).reshape(1), mx.array(end,mx.int32).reshape(1)
     fresh = getattr(cache,"fresh",None)
-    shared=not layer.sliding_window and heads==3*k.shape[1] and fresh is None
-    kernel=_triple if shared else _partial
-    parts,stats = kernel(
+    parts,stats = _partial(
         inputs=[q,k,v,tail,q if fresh is None else fresh,rel,w,slot,end,
                 sinks.astype(q.dtype),scalar(layer.scaling)],
         template=[("T",q.dtype),("S",length),("PRE_UPDATE",before is not None),("PAGED",paged),("FRESH",fresh is not None),("NKV",k.shape[1]),("GQA",heads//k.shape[1]),("WIDTH",width),("SWIZZLED",swizzled),
                   ("R",extent),("WINDOW",layer.sliding_window)],
-        grid=(128*32,k.shape[1] if shared else heads,1),threadgroup=(128,1,1),
+        grid=(128*32,heads,1),threadgroup=(128,1,1),
         output_shapes=[(heads,128,128),(heads,128,2)],output_dtypes=[q.dtype,mx.float32])
     return _merge(inputs=[parts,stats,gate],template=[("T",q.dtype)],
                   grid=(32*32,heads,1),threadgroup=(128,1,1),
