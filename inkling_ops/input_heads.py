@@ -39,10 +39,10 @@ def attention(layer, x, inputs, cache, conv_states, conv_mask, messages):
     full = isinstance(layer, layers.FullDecoderLayer)
     ref = _full if full else _sliding
     if x.shape != (1,1,2304) or (not full and messages is None):
-        return ref(layer, x, inputs, cache, conv_states, conv_mask, messages)
+        return ref(layer, x, inputs, cache, conv_states, conv_mask, messages[0] if isinstance(messages,tuple) else messages)
     norms = (layer.q_input_layernorm, layer.k_input_layernorm, layer.v_input_layernorm) if full else (layer.input_layernorm,) * 3
     if not all(type(n) is nn.RMSNorm and n.eps == norms[0].eps for n in norms):
-        return ref(layer, x, inputs, cache, conv_states, conv_mask, messages)
+        return ref(layer, x, inputs, cache, conv_states, conv_mask, messages[0] if isinstance(messages,tuple) else messages)
     if inputs is None:
         states = (x,) * 3
     elif full:

@@ -12,9 +12,9 @@ _reference = layers.MessageGate.__call__
 
 
 @mx.compile
-def _project(hidden, message, down, paired):
+def _project(hidden, message, down, paired, normalized=None):
     if hidden.shape[-1] == 2304 and hidden.dtype == message.dtype == mx.float32:
-        joined = paired_norm.join(hidden, message, down.dtype)
+        joined = paired_norm.join(hidden, message if normalized is None else normalized, down.dtype, normalized is not None)
     else:
         joined = mx.concatenate(
             (layers.unweighted_rms_norm(hidden), layers.unweighted_rms_norm(message)), axis=-1
@@ -27,7 +27,7 @@ def _project(hidden, message, down, paired):
     return (1 - forget) * hidden + gain * message
 
 
-def project(layer, hidden_states, message):
+def project(layer, hidden_states, message, normalized=None):
     if hidden_states.shape[:2] != (1, 1) or any(
         type(p) is not nn.Linear or "bias" in p
         for p in (layer.down_proj, layer.forget_gate_proj, layer.message_gate_proj)
@@ -39,7 +39,7 @@ def project(layer, hidden_states, message):
     if cached is None or cached[0] is not forget or cached[1] is not gain:
         cached = (forget, gain, mx.concatenate((native(layer.forget_gate_proj), native(layer.message_gate_proj)), axis=0))
         object.__setattr__(layer, "_paired_weights", cached)
-    return _project(hidden_states, message, layer.down_proj.weight, cached[2])
+    return _project(hidden_states, message, layer.down_proj.weight, cached[2], normalized)
 
 
 def install():

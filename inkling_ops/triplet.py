@@ -12,10 +12,10 @@ _reference = layers.DecoderLayer._mix_messages
 
 
 @mx.compile
-def _apply(states, messages, down, up):
+def _apply(states, messages, down, up, normalized=None):
     norm = layers.unweighted_rms_norm
     if states.shape[-1] == 2304 and states.dtype == messages.dtype == mx.float32:
-        joined = paired_norm.join(states, messages, down.dtype)
+        joined = paired_norm.join(states, messages if normalized is None else normalized, down.dtype, normalized is not None)
     else:
         joined = mx.concatenate((norm(states), norm(messages)), axis=-1).astype(down.dtype)
     reduced = (joined @ down.swapaxes(-1, -2)).astype(mx.float32)
@@ -27,6 +27,9 @@ def _apply(states, messages, down, up):
 
 
 def mix_messages(layer, states, messages):
+    normalized = None
+    if isinstance(messages,tuple):
+        messages, normalized = messages
     if states[0].shape[:2] != (1, 1):
         return _reference(layer, states, messages)
     gates = (layer.q_message_gate, layer.k_message_gate, layer.v_message_gate)
@@ -43,7 +46,8 @@ def mix_messages(layer, states, messages):
         object.__setattr__(layer, "_message_triplet", cache)
     x = mx.concatenate(states, axis=0)
     msg = messages.reshape(4, 1, -1)[:3]
-    outputs = _apply(x, msg, cache[1], cache[2])
+    prepared = None if normalized is None else normalized.reshape(4,1,-1)[:3]
+    outputs = _apply(x, msg, cache[1], cache[2], prepared)
     return tuple(mx.split(outputs, 3, axis=0))
 
 

@@ -10,6 +10,9 @@ _reference = layers.DecoderLayer.__call__
 def decode(layer, hidden_states, block_states, *, cache=None, conv_mask=None, messages=None):
     from inkling_kernel import _finish_mix, can_fuse_down
     from .compiled_ring import _DeviceRing
+    normalized_messages = None
+    if isinstance(messages,tuple):
+        messages, normalized_messages = messages
     moe = layer.mlp
     post = layer.post_mlp_convolution
     down = moe.experts.down_proj
@@ -31,7 +34,8 @@ def decode(layer, hidden_states, block_states, *, cache=None, conv_mask=None, me
             inputs = None
         else:
             inputs, normed = depth_norm.evaluate(layer.attention_input, block_states, hidden_states)
-        attention = layer._self_attention(hidden_states,inputs,cache,history,None,messages)
+        payload = (messages, normalized_messages) if normalized_messages is not None else messages
+        attention = layer._self_attention(hidden_states,inputs,cache,history,None,payload)
     if layer.is_block_boundary:
         block = normed[None]
         block_states = block if block_states is None else mx.concatenate((block_states, block))
@@ -44,7 +48,10 @@ def decode(layer, hidden_states, block_states, *, cache=None, conv_mask=None, me
             residual = hidden_states.astype(mx.float32) + residual
         mixed, _ = depth_norm.evaluate(layer.mlp_input, block_states, residual)
     x = mixed[...,0,:]
-    if messages is not None:
+    if normalized_messages is not None and type(layer.mlp_message_gate) is layers.MessageGate:
+        from . import message_gate
+        x = message_gate.project(layer.mlp_message_gate,x,messages[...,3,:],normalized_messages[...,3,:])
+    elif messages is not None:
         x = layer.mlp_message_gate(x,messages[...,3,:])
     x, selected, routing = router.route(layer, x, hidden_states.dtype)
     active = expert_gate.gated_activation(moe.experts,x,selected)
