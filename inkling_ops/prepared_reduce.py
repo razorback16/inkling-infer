@@ -23,7 +23,7 @@ _kernel=mx.fast.metal_kernel(
         float dots[4]={};
         for (uint d=tid*4;d<4608;d+=1024) {
             for (uint j=0;j<4;++j) {
-                float raw=d<2304 ? state[state_base+d+j]*inv : message[bank*2304+d+j-2304];
+                float raw=d<2304 ? state[state_base+d+j]*inv : float(message[bank*2304+d+j-2304]);
                 float x=float(bfloat16_t(raw));
                 for (uint r=0;r<4;++r) dots[r]=fma(x,float(weight[(bank*64+row+r)*4608+d+j]),dots[r]);
             }
@@ -44,7 +44,7 @@ _kernel=mx.fast.metal_kernel(
 
 
 def applicable(state, msg, down, up):
-    return (msg is not None and state.dtype==msg.dtype==mx.float32 and state.shape[-1]==2304
+    return (msg is not None and state.dtype==mx.float32 and msg.dtype in (mx.bfloat16,mx.float32) and state.shape[-1]==2304
             and down.dtype==mx.bfloat16 and down.shape[-2:]==(64,4608)
             and up.shape[-2:]==(4608,64) and up.dtype in (mx.bfloat16,mx.float32))
 

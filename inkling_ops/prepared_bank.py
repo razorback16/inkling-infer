@@ -46,22 +46,23 @@ _kernel = mx.fast.metal_kernel(
         if (!lane) sums[sg]=sum;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         float inv=precise::rsqrt(simd_sum(lane<18 ? sums[lane]:0.f)/2304.f+1e-6f);
-        for (uint i=0;i<4;++i) normalized[q*2304+tid*4+i]=values[i]*inv;
+        for (uint i=0;i<4;++i) normalized[q*2304+tid*4+i]=T(values[i]*inv);
     """,
 )
 
 
 def messages(layer, bank, index):
-    entries = _trace.get()
-    if (entries is None or bank[0].shape != (1,1,1,2304) or bank[1].shape != (1,1,2304)
+    trace = _trace.get()
+    if (trace is None or bank[0].shape != (1,1,1,2304) or bank[1].shape != (1,1,2304)
             or layer.query.shape[1:] != (4,2304) or layer.query.dtype != mx.float32):
         return _reference(layer,bank,index)
+    entries,dtype=trace
     key = (id(layer),id(bank))
     if key not in entries:
         count = layer.query.shape[0]
         outputs = _kernel(inputs=[*bank,layer.query], grid=(count*4*576,1,1),
-                          threadgroup=(576,1,1), output_shapes=[(count,1,1,4,2304)]*2,
-                          output_dtypes=[mx.float32]*2)
+                          threadgroup=(576,1,1), template=[("T",dtype)], output_shapes=[(count,1,1,4,2304)]*2,
+                          output_dtypes=[mx.float32,dtype])
         entries[key] = (bank, outputs)
     raw, normalized = entries[key][1]
     shape = raw.shape[1:]
@@ -69,7 +70,15 @@ def messages(layer, bank, index):
 
 
 def run(reference, model, x, caches):
-    token = _trace.set({})
+    from mlx.nn import Linear
+    compact=True
+    for i in model.args.loop_core:
+        layer=model.layers[i]
+        for name in ("q_message_gate","k_message_gate","v_message_gate","mlp_message_gate"):
+            proj=getattr(getattr(layer,name,None),"down_proj",None)
+            if type(proj) is not Linear or proj.weight.dtype!=mx.bfloat16:
+                compact=False
+    token = _trace.set(({},mx.bfloat16 if compact else mx.float32))
     try:
         return reference(model, x, caches, None)
     finally:

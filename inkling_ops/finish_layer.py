@@ -55,7 +55,7 @@ def decode(layer, hidden_states, block_states, *, cache=None, conv_mask=None, me
                 and gate.weight.shape==(128,2304) and layer.mlp_input.query.size==2304):
             from .exact_sources import native
             mixed,logits=depth_norm.from_projection(layer,block_states,residual,squares,True,native(gate))
-        elif (normalized_messages is not None and normalized_messages.dtype==mx.float32
+        elif (normalized_messages is not None and normalized_messages.dtype in (mx.float32,mx.bfloat16)
               and type(layer.mlp_message_gate) is layers.MessageGate and layer.mlp_input.query.size==2304
               and type(layer.mlp_message_gate.down_proj) is nn.Linear
               and "bias" not in layer.mlp_message_gate.down_proj
