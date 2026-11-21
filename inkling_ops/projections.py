@@ -1,4 +1,6 @@
 """Pack attention projections with a common one-token input."""
+import math
+
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.inkling2 import layers
@@ -34,7 +36,8 @@ def prepare_query_weights(model):
     tables = {}
     for index, block in enumerate(model.layers):
         layer = block.self_attn
-        if isinstance(layer,layers.FullAttention):
+        if isinstance(layer,layers.FullAttention) and (layer.log_scaling_n_floor<8192 or
+                not math.isfinite(layer.log_scaling_alpha) or not math.isfinite(layer.log_scaling_n_floor)):
             params=(layer.log_scaling_alpha,layer.log_scaling_n_floor)
             if params not in tables:
                 tables[params]=_position_table(mx.arange(8192,dtype=mx.float32),*params)
@@ -108,7 +111,9 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
         value, conv_states[1] = layer.v_sconv(value, conv_states[1], conv_mask)
     kv = cache[0] if cache is not None else None
     position=None
-    if dynamic_norm and hasattr(kv,"page_prefix") and kv.keys.shape[2]<=8192:
+    unscaled=(dynamic_norm and hasattr(kv,"page_prefix") and math.isfinite(layer.log_scaling_alpha)
+              and kv.keys.shape[2]<=layer.log_scaling_n_floor)
+    if dynamic_norm and not unscaled and hasattr(kv,"page_prefix") and kv.keys.shape[2]<=8192:
         table=getattr(layer,"_decode_position_table",None)
         if table is not None and table[0]==(layer.log_scaling_alpha,layer.log_scaling_n_floor):
             position=(table[1],kv.offset)
@@ -129,7 +134,7 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
         value = value.reshape(1, 1, layer.num_key_value_heads, -1)
         value = layers.unweighted_rms_norm(value.astype(mx.float32), layer.eps).astype(value.dtype)
         rel = layer.rel_l2_clip(relative.reshape(1, 1, layer.num_heads, -1))
-    if full and position is None:
+    if full and position is None and not unscaled:
         offset = kv.offset if kv is not None else 0
         pos = layers._positions(offset, 1).astype(mx.float32)
         tau = 1.0 + layer.log_scaling_alpha * mx.log(mx.maximum((pos + 1) / layer.log_scaling_n_floor, 1.0))
