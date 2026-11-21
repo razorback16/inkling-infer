@@ -47,12 +47,9 @@ _kernel = mx.fast.metal_kernel(
             float scale = amax[expert] / 2688.f;
             ushort g = as_type<ushort>(bfloat16_t(sums[lane*2]*scale));
             ushort u = as_type<ushort>(bfloat16_t(sums[lane*2+1]*scale));
-            uint gm=g&32767,um=u&32767;
-            float gate=activation[gm*3+(g>>15)];
-            uint abs_up=as_type<uint>(activation[um*3+2]);
-            float up=as_type<float>(abs_up^((uint(u)>>15)<<31));
-            if ((u>>15) && um>=FIRST_EXCEPTION) up=activation[32768*3+um-FIRST_EXCEPTION];
-            out[slot*1152+first/2+lane]=bfloat16_t(gate*up);
+            uint gi=((uint(g)&32767)<<2)|((g>>15)<<1);
+            uint ui=((uint(u)&32767)<<2)|((u>>15)<<1);
+            out[slot*1152+first/2+lane]=bfloat16_t(activation[gi]*activation[ui+1]);
         }
     """,
 )
@@ -63,15 +60,9 @@ def activation_tables():
     values = mx.arange(65536, dtype=mx.uint32).astype(mx.uint16).view(mx.bfloat16).astype(mx.float32)
     gates = (mx.tanh(values / 4)*4) * mx.sigmoid(values)
     ups = mx.tanh(values / 25)*25
-    pos,neg=mx.split(ups,2)
-    bits=pos.view(mx.uint32)^0x80000000
-    mags=mx.arange(32768,dtype=mx.uint32)
-    cutoff=int(mx.min(mx.where(bits!=neg.view(mx.uint32),mags,32768)).item())
-    table=mx.stack((gates[:32768],gates[32768:],pos),axis=1).reshape(-1)
-    if cutoff<32768:
-        table=mx.concatenate((table,neg[cutoff:]))
+    table=mx.contiguous(mx.stack((gates,ups),axis=1).reshape(2,32768,2).transpose(1,0,2))
     mx.eval(table)
-    return table,cutoff
+    return table
 
 
 def gated_activation(layer, x, indices):
@@ -83,9 +74,8 @@ def gated_activation(layer, x, indices):
             or layer.act_fn.gate_softcap != 4 or layer.act_fn.up_softcap != 25):
         pair = proj(x[..., None, None, :], indices)
         return layer.act_fn(pair[..., 0::2], pair[..., 1::2])
-    table,cutoff=activation_tables()
     active = _kernel(
-        inputs=[x, indices, proj.weight, proj.scales, proj.global_scale, table], template=[("FIRST_EXCEPTION",cutoff)],
+        inputs=[x, indices, proj.weight, proj.scales, proj.global_scale, activation_tables()],
         grid=(144 * 128, 8, 1), threadgroup=(128, 1, 1),
         output_shapes=[(1, 1, 8, 1, 1152)], output_dtypes=[x.dtype],
     )[0]
