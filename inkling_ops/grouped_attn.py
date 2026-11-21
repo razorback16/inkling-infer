@@ -64,6 +64,7 @@ _partial = mx.fast.metal_kernel(
                     bool in_tail = PAGED && position >= S-256;
                     uint pos = in_tail ? position-(S-256) : position;
                     uint length = in_tail ? 256 : (PAGED ? S-256 : S);
+                    if (PAGED && !in_tail) pos=(pos%128)*(length/128)+pos/128;
                     uint p = (kv*length+pos)*128+d;
                     auto keys = in_tail ? tail : k;
                     auto values = in_tail ? tail+NKV*256*128 : v;
@@ -130,7 +131,7 @@ def attend(layer,q,k,v,rel,sinks,cache,gate):
     paged = hasattr(cache, "page_tail")
     tail = cache.page_tail if paged else q
     if paged:
-        k, v = mx.split(cache.page_prefix, 2, axis=1)
+        k, v = mx.split(cache.page_tiles, 2, axis=1)
     parts,stats = _partial(
         inputs=[q,k,v,tail,rel,w,mx.array(slot,mx.int32).reshape(1),mx.array(cache.offset,mx.int32).reshape(1),
                 sinks.astype(q.dtype),scalar(layer.scaling)],
