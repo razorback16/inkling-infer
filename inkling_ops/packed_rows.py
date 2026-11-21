@@ -56,11 +56,12 @@ _pack = mx.fast.metal_kernel(
     """,
 )
 _dot = mx.fast.metal_kernel(
-    name="inkling_four_row_gemv", input_names=["x","payload","bases","flags"],output_names=["out"],
+    name="inkling_four_row_gemv", input_names=["x","payload","formats"],output_names=["out"],
     source="""
         uint lane=thread_index_in_simdgroup, group=thread_position_in_grid.x/32;
-        uchar4 base=*(device const uchar4*)(bases+group*4);
-        uint raw_tiles=flags[group];
+        uint2 meta=*(device const uint2*)(formats+group*2);
+        uchar4 base=as_type<uchar4>(meta.x);
+        uint raw_tiles=meta.y;
         float sums[4]={};
         for (uint block=0;block<18;++block) {
             uint tile=((group/4)*18+block)*4+group%4;
@@ -101,7 +102,8 @@ def encode(weight):
                   output_shapes=[(rows,)],output_dtypes=[mx.uint8])[0]
     payload,flags=_pack(inputs=[weight,bases],grid=(count//16,1,1),threadgroup=(128,1,1),
                  output_shapes=[(count//512,256),(rows//4,18)],output_dtypes=[mx.uint32,mx.uint32])
-    return payload,bases,mx.sum(flags,axis=1)
+    formats=mx.stack((bases.view(mx.uint32),mx.sum(flags,axis=1)),axis=1)
+    return payload,formats
 
 
 def project(x,weight,encoded):
