@@ -26,7 +26,7 @@ def mix(states, weights, dtype):
                 output_shapes=[(1, 1, 2304)], output_dtypes=[dtype])[0]
 
 
-def _make_down(finish, squares=False):
+def _make_down(finish):
     inputs = ["hidden", "indices", "routing", "packed", "scales", "amax"]
     outputs = ["out"]
     store = "out[channel + lane] = T(value);"
@@ -47,22 +47,8 @@ def _make_down(finish, squares=False):
             float filtered = float(T((float(W(total)) + current) * 0.4472135954999579f));
             out[c] = T(residual[c] + filtered);
         """
-    if squares:
-        outputs.append("partials")
-        store=store.replace("out[c] = T(residual[c] + filtered);",
-                            "rounded=float(T(residual[c]+filtered)); out[c]=T(rounded);")
-    finish_partial = """
-        if (!slot) {
-            float sum=0;
-            for (ushort i=0;i<4;++i) {
-                float v=simd_shuffle(rounded,i);
-                sum+=v*v;
-            }
-            if (!lane) partials[channel/4]=sum;
-        }
-    """ if squares else ""
     return mx.fast.metal_kernel(
-        name="inkling_finish_nvfp4_squares" if squares else "inkling_finish_nvfp4_layer" if finish else "inkling_nvfp4_down_mix",
+        name="inkling_finish_nvfp4_layer" if finish else "inkling_nvfp4_down_mix",
         input_names=inputs, output_names=outputs,
     header="""
         constant float fp4_values[16] = {
@@ -111,7 +97,6 @@ def _make_down(finish, squares=False):
                 projected[slot][r] = float(T(dot * (amax[expert] / 2688.f)));
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        float rounded=0;
         if (slot == 0 && lane < 4) {
             float value = 0;
             for (uint e = 0; e < 8; ++e) {
@@ -120,13 +105,12 @@ def _make_down(finish, squares=False):
             }
             STORE
         }
-    """.replace("STORE", store)+finish_partial,
+    """.replace("STORE", store),
     )
 
 
 _down_mix = _make_down(False)
 _finish_mix = _make_down(True)
-_finish_squares = _make_down(True,True)
 
 
 def can_fuse_down(down, x):

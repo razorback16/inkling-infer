@@ -96,11 +96,6 @@ def cached_source(source):
     return source
 
 
-def previous_source(source):
-    return source.replace("sum += v*v;", "if (!PREVIOUS) sum += v*v;", 1).replace(
-        "sum = simd_sum(sum);", "sum = simd_sum(PREVIOUS ? prior[tid] : sum);", 1)
-
-
 def make_kernel(filtered):
     inputs = ["x", "blocks", "queries"]
     outputs = ["mixed", "normalized"]
@@ -109,8 +104,8 @@ def make_kernel(filtered):
         outputs.extend(["residual", "window"])
     source = _source.replace("FILTER", _filter if filtered else "")
     if not filtered:
-        inputs.extend(["closed","prior"])
-        source = previous_source(cached_source(source))
+        inputs.append("closed")
+        source = cached_source(source)
     return mx.fast.metal_kernel(
         name="inkling_filtered_depth" if filtered else "inkling_residual_depth",
         input_names=inputs, output_names=outputs,
@@ -138,8 +133,8 @@ def _message_state_kernel():
         }
     """
     return mx.fast.metal_kernel(name="inkling_depth_message_inverse",
-                                input_names=["x","blocks","queries","closed","prior"],
-                                output_names=["mixed","normalized","inverse"],source=previous_source(source))
+                                input_names=["x","blocks","queries","closed"],
+                                output_names=["mixed","normalized","inverse"],source=source)
 
 
 _message_state = _message_state_kernel()
@@ -152,8 +147,7 @@ def evaluate(module, blocks, x, prepare_messages=False):
     kernel = _message_state if prepare_messages else _kernel
     if prepare_messages:
         shapes.append((q,))
-    prior,used=block_lookahead.previous_partials(x)
-    result = kernel(inputs=[x,blocks,module.query,closed,prior], template=[("PREVIOUS",used),("K",blocks.shape[0]), *config],
+    result = kernel(inputs=[x,blocks,module.query,closed], template=[("K",blocks.shape[0]), *config],
                     grid=(q*576,1,1),threadgroup=(576,1,1),
                     output_shapes=shapes,output_dtypes=[mx.float32]*len(shapes))
     if prepare_messages:
@@ -181,8 +175,8 @@ def normalized_source(filtered=False):
 
 _normalized_inputs = mx.fast.metal_kernel(
     name="inkling_depth_attention_input_norm",
-    input_names=["x","blocks","queries","weights","eps","closed","prior"], output_names=["mixed","normalized"],
-    source=previous_source(cached_source(normalized_source())),
+    input_names=["x","blocks","queries","weights","eps","closed"], output_names=["mixed","normalized"],
+    source=cached_source(normalized_source()),
 )
 _mlp_inputs = mx.fast.metal_kernel(
     name="inkling_depth_mlp_input_norm",
@@ -210,10 +204,9 @@ def attention_inputs(layer, blocks, x):
         joined = saved[1]
     q = len(norms)
     closed, config = block_lookahead.lookup(layer.attention_input, blocks)
-    prior,used=block_lookahead.previous_partials(x)
     states, normalized = _normalized_inputs(
-        inputs=[x,blocks,layer.attention_input.query,joined,scalar(norms[0].eps),closed,prior],
-        template=[("PREVIOUS",used),("K",blocks.shape[0]), *config], grid=(q*576,1,1), threadgroup=(576,1,1),
+        inputs=[x,blocks,layer.attention_input.query,joined,scalar(norms[0].eps),closed],
+        template=[("K",blocks.shape[0]), *config], grid=(q*576,1,1), threadgroup=(576,1,1),
         output_shapes=[(1,q,2304),x.shape],output_dtypes=[mx.bfloat16,mx.float32])
     inputs = (states,)*3 if q==1 else tuple(mx.split(states,3,axis=1))
     return inputs, normalized
