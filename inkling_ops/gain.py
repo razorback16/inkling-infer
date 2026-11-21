@@ -23,11 +23,14 @@ _source = """
         ushort leader=ushort(lane&~3u);
         float gain_dot=simd_shuffle(g,leader);
         float gate=precise::tanh((lane&1) ? gain_dot : f);
-        float gain=simd_shuffle(gate,ushort(leader+1));
+        uint c = bank * 2304 + row;
+        #pragma clang fp contract(off)
+        float term;
+        if (lane & 1) term = gate * float(msg[c]);
+        else term = (1.f - gate) * float(state[SHARED ? row : c]);
+        float added = simd_shuffle(term,ushort(leader+1));
         if ((lane % 4) == 0) {
-            uint c = bank * 2304 + row;
-            volatile float retained = (1.f - gate) * float(state[SHARED ? row : c]);
-            volatile float added = gain * float(msg[c]);
+            float retained=term;
             out[c] = retained + added;
         }
     """
