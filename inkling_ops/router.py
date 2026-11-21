@@ -12,8 +12,8 @@ _ROUTE_PAIR_HEADER = """
     inline void store_route_pair(device float* pairs, device const B* bias, uint e, float x) {
         float p=1.f/(1.f+precise::exp(abs(x)));
         float score=x<0 ? p : 1.f-p;
-        pairs[e]=score+float(bias[e]);
-        pairs[128+e]=score;
+        pairs[2*e]=score;
+        pairs[2*e+1]=score+float(bias[e]);
     }
 """
 
@@ -158,11 +158,12 @@ _rank_pairs = mx.fast.metal_kernel(
         uint tid=thread_position_in_threadgroup.x, lane=thread_index_in_simdgroup;
         uint warp=simdgroup_index_in_threadgroup;
         threadgroup float selected[8];
-        float other[4];
+        float scores[4], other[4];
         bool special=false;
         for (uint j=0;j<4;++j) {
-            other[j]=logits[lane+32*j];
-            special |= !isfinite(other[j]);
+            float2 pair=((device const float2*)logits)[lane+32*j];
+            scores[j]=pair.x; other[j]=pair.y;
+            special |= !isfinite(pair.y);
         }
         if (simd_any(special)) {
             if (!warp) {
@@ -179,7 +180,7 @@ _rank_pairs = mx.fast.metal_kernel(
                     uint winner=simd_min(best==peak ? which : 128u);
                     float keep=0;
                     for (uint j=0;j<4;++j) if (lane+32*j==winner) {
-                        keep=logits[128+winner]; b[j]=-INFINITY;
+                        keep=scores[j]; b[j]=-INFINITY;
                     }
                     float w=simd_sum(keep);
                     if (!lane) {inds[k]=winner; selected[k]=w;}
@@ -193,7 +194,8 @@ _rank_pairs = mx.fast.metal_kernel(
                 for (uint j=0;j<4;++j)
                     ahead+=uint(other[j]>query || (other[j]==query && lane+32*j<e));
                 uint rank=simd_sum(ahead);
-                if (!lane && rank<8) {inds[rank]=e; selected[rank]=logits[128+e];}
+                float score=simd_shuffle(scores[i],warp);
+                if (!lane && rank<8) {inds[rank]=e; selected[rank]=score;}
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -221,9 +223,9 @@ def route(layer, x, dtype, normalized=False, logits=None, squares=None):
         x, logits = _kernel(inputs=[x,norm.weight,native(gate),scalar(norm.eps),x if squares is None else squares,gate.e_score_correction_bias],
                             template=[("PAIRED",paired),("PRECOMPUTED",squares is not None),("ROWS",2 if squares is not None else 4)],
                             grid=((64 if squares is not None else 32)*256,1,1),threadgroup=(256,1,1),
-                            output_shapes=[x.shape,(1,1,2,128) if paired else (1,1,128)],output_dtypes=[dtype,mx.float32])
+                            output_shapes=[x.shape,(1,1,128,2) if paired else (1,1,128)],output_dtypes=[dtype,mx.float32])
     if gate.top_k == 8:
-        paired = logits.shape==(1,1,2,128)
+        paired = logits.shape==(1,1,128,2)
         kernel = _rank_pairs if paired else _select
         args = [logits] if paired else [logits,gate.e_score_correction_bias]
         args.extend([scalar(layers._ROUTER_SCORE_EPS),scalar(gate.routed_scaling_factor)])

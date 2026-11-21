@@ -318,7 +318,7 @@ def from_projection(layer, blocks, residual, squares, normalize, gate=None, mess
     if gate is not None:
         return _projected_routes(inputs=[*inputs,gate,layer.mlp.gate.e_score_correction_bias],template=[("K",blocks.shape[0]),*config],
                                  grid=(64*576,1,1),threadgroup=(576,1,1),
-                                 output_shapes=[(1,1,1,2304),(1,1,2,128)],output_dtypes=[mx.bfloat16,mx.float32])
+                                 output_shapes=[(1,1,1,2304),(1,1,128,2)],output_dtypes=[mx.bfloat16,mx.float32])
     return _projected[normalize](inputs=inputs,template=[("K",blocks.shape[0]),*config],
                                  grid=(576,1,1),threadgroup=(576,1,1),
                                  output_shapes=[(1,1,1,2304)],
