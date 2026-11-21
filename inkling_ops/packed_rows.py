@@ -42,7 +42,9 @@ _pack = mx.fast.metal_kernel(
 
     """,
 )
-_dot_source = """
+_dot = mx.fast.metal_kernel(
+    name="inkling_four_row_gemv", input_names=["x","weight","payload","bases"],output_names=["out"],
+    source="""
         uint lane=thread_index_in_simdgroup, group=thread_position_in_grid.x/32;
         uchar4 base=*(device const uchar4*)(bases+group*4);
         float sums[4]={};
@@ -70,26 +72,8 @@ _dot_source = """
             for (ushort step=16;step;step>>=1) dot+=simd_shuffle_down(dot,step);
             if (!lane) out[group*4+r]=bfloat16_t(dot);
         }
-    """
-_dot = mx.fast.metal_kernel(
-    name="inkling_four_row_gemv", input_names=["x","weight","payload","bases"],output_names=["out"],
-    source=_dot_source,
+    """,
 )
-_three = mx.fast.metal_kernel(
-    name="inkling_three_source_gemv", input_names=["x","kx","vx","weight","payload","bases"],output_names=["out"],
-    source=_dot_source.replace("float sums[4]={};",
-        "auto input=group*4<KEY_START ? x : group*4<VALUE_START ? kx : vx; float sums[4]={};"
-    ).replace("(x+d)", "(input+d)"),
-)
-
-
-def project_three(q,k,v,weight,encoded,boundaries):
-    rows=weight.shape[0]
-    return _three(inputs=[q,k,v,weight,*encoded],
-                  template=[("KEY_START",boundaries[-2]),("VALUE_START",boundaries[-1])],
-                  grid=(rows*8,1,1),threadgroup=(128,1,1),
-                  output_shapes=[(1,1,rows)],output_dtypes=[q.dtype])[0]
-
 
 
 def encode(weight):
