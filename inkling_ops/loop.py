@@ -2,7 +2,7 @@
 import weakref
 
 import mlx.core as mx
-from mlx.utils import tree_flatten
+from .parameter_guard import CapturedParameters
 from mlx_lm.models.cache import ArraysCache, CacheList, KVCache, RotatingKVCache
 from mlx_lm.models.inkling2.model import TextModel
 
@@ -52,14 +52,15 @@ def loop(model, x, cache, conv_mask):
             slot = offset
         slots.append(slot)
         states.append((k.keys, k.values, tuple(conv.cache)))
-    weights = tuple(v for _, v in tree_flatten(model) if isinstance(v, mx.array))
     saved = getattr(model, "_decode_loop", None)
-    if saved is None or len(weights) != len(saved[0]) or any(a is not b for a,b in zip(weights, saved[0])):
+    if saved is None or not saved[0].matches(model):
         if any(layer.mlp.sharding_group is not None for layer in model.layers):
             return _reference(model, x, cache, conv_mask)
-        object.__setattr__(model, "_decode_loop", (weights, _compile(model)))
-        # Populate lazy weight packs before tracing the complete recurrent graph.
-        return _reference(model, x, cache, conv_mask)
+        guard = CapturedParameters()
+        object.__setattr__(model, "_decode_loop", (guard, _compile(model)))
+        result = _reference(model, x, cache, conv_mask)
+        guard.capture(model)
+        return result
     params = {slot: mx.array([slot], mx.int32) for slot in set(slots + [offset])}
     result, updated = saved[1](x, states, params[offset], [params[i] for i in slots])
     for c, slot, (keys, values, history) in zip(cache, slots, updated):
