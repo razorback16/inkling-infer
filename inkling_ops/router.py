@@ -151,8 +151,8 @@ def route(layer, x, dtype, normalized=False, logits=None, squares=None):
                            output_shapes=[(1,1,128)],output_dtypes=[mx.float32])[0]
     elif not normalized:
         x, logits = _kernel(inputs=[x,norm.weight,native(gate),scalar(norm.eps),x if squares is None else squares],
-                            template=[("PRECOMPUTED",squares is not None),("ROWS",1 if squares is not None else 4)],
-                            grid=((128 if squares is not None else 32)*256,1,1),threadgroup=(256,1,1),
+                            template=[("PRECOMPUTED",squares is not None),("ROWS",2 if squares is not None else 4)],
+                            grid=((64 if squares is not None else 32)*256,1,1),threadgroup=(256,1,1),
                             output_shapes=[x.shape,(1,1,128)],output_dtypes=[dtype,mx.float32])
     if gate.top_k == 8:
         indices, weights = _select(
