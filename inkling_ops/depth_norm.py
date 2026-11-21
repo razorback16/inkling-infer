@@ -1,7 +1,6 @@
 """Normalize the residual and evaluate the learned depth queries in one launch."""
 import mlx.core as mx
 import mlx.nn as nn
-from . import closed_scores
 from mlx_lm.kernels.common import scalar
 
 _filter = """
@@ -42,7 +41,7 @@ _source = """
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         uint group = tid/288;
-        for (uint i=(CLOSED ? K+group : group); i<=K; i+=2) {
+        for (uint i=group; i<=K; i+=2) {
             float dot=0;
             for (uint d=tid%288; d<2304; d+=288)
                 dot+=(i==K ? norm[d] : blocks[i*2304+d])*queries[query*2304+d];
@@ -55,8 +54,7 @@ _source = """
             float logit=-INFINITY;
             if (lane<=K) {
                 float dot=0;
-                if (CLOSED && lane<K) dot=closed[lane*STRIDE+Q0+query];
-                else for (uint j=0; j<9; ++j) dot+=scores[lane][j];
+                for (uint j=0; j<9; ++j) dot+=scores[lane][j];
                 logit=dot*(1.f/48.f);
             }
             float weight=metal::exp(logit-simd_max(logit));
@@ -89,7 +87,7 @@ _source = """
 
 
 def make_kernel(filtered):
-    inputs = ["x", "blocks", "queries", "closed"]
+    inputs = ["x", "blocks", "queries"]
     outputs = ["mixed", "normalized"]
     if filtered:
         inputs.extend(["history", "w", "hidden"])
@@ -107,8 +105,7 @@ _filtered = make_kernel(True)
 
 def evaluate(module, blocks, x):
     q = module.query.size // 2304
-    closed, config = closed_scores.lookup(module,blocks)
-    return _kernel(inputs=[x,blocks,module.query,closed], template=[("K",blocks.shape[0]),*config],
+    return _kernel(inputs=[x,blocks,module.query], template=[("K",blocks.shape[0])],
                    grid=(q*576,1,1),threadgroup=(576,1,1),
                    output_shapes=[(1,1,q,2304),x.shape],output_dtypes=[mx.float32,mx.float32])
 
@@ -118,7 +115,7 @@ _normalized_input_source = _source.replace("FILTER", "").replace(
     "values[j] = v + norm[d]*coeff[K];")
 _normalized_inputs = mx.fast.metal_kernel(
     name="inkling_depth_attention_input_norm",
-    input_names=["x", "blocks", "queries", "closed", "weights", "eps"],
+    input_names=["x", "blocks", "queries", "weights", "eps"],
     output_names=["mixed", "normalized"],
     source=_normalized_input_source + """
         float norm2=0;
@@ -152,10 +149,9 @@ def attention_inputs(layer, blocks, x):
             object.__setattr__(layer, "_attention_norm_weights", saved)
         joined = saved[1]
     q = len(norms)
-    closed, config = closed_scores.lookup(layer.attention_input,blocks)
     states, normalized = _normalized_inputs(
-        inputs=[x,blocks,layer.attention_input.query,closed,joined,scalar(norms[0].eps)],
-        template=[("K",blocks.shape[0]),*config], grid=(q*576,1,1), threadgroup=(576,1,1),
+        inputs=[x,blocks,layer.attention_input.query,joined,scalar(norms[0].eps)],
+        template=[("K",blocks.shape[0])], grid=(q*576,1,1), threadgroup=(576,1,1),
         output_shapes=[(1,q,2304),x.shape],output_dtypes=[mx.bfloat16,mx.float32])
     inputs = (states,)*3 if q==1 else tuple(mx.split(states,3,axis=1))
     return inputs, normalized
@@ -163,10 +159,9 @@ def attention_inputs(layer, blocks, x):
 
 def post_attention(layer, blocks, attention, history, hidden):
     weights = layer.post_attention_convolution.conv1d.weight
-    closed, config = closed_scores.lookup(layer.mlp_input,blocks)
     mixed, _, residual, window = _filtered(
-        inputs=[attention, blocks, layer.mlp_input.query, closed, history, weights, hidden],
-        template=[("K", blocks.shape[0]), *config, ("T", attention.dtype), ("W", weights.dtype),
+        inputs=[attention, blocks, layer.mlp_input.query, history, weights, hidden],
+        template=[("K", blocks.shape[0]), ("T", attention.dtype), ("W", weights.dtype),
                   ("BOUNDARY", layer.is_block_boundary)],
         grid=(576,1,1), threadgroup=(576,1,1),
         output_shapes=[(1,1,1,2304), hidden.shape, hidden.shape, (1,4,2304)],

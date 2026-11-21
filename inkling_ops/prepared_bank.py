@@ -70,9 +70,7 @@ def messages(layer, bank, index):
 def run(reference, model, x, caches):
     token = _trace.set({})
     try:
-        from . import closed_scores
-        with closed_scores.trace(model):
-            return reference(model, x, caches, None)
+        return reference(model, x, caches, None)
     finally:
         _trace.reset(token)
 
