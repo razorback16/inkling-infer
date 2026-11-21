@@ -30,6 +30,12 @@ def _project(hidden, message, down, paired, normalized=None):
 
 
 @mx.compile
+def _prompt_bottleneck(hidden,message,weight):
+    states=mx.concatenate((layers.unweighted_rms_norm(hidden),layers.unweighted_rms_norm(message)),axis=-1)
+    return states.astype(weight.dtype) @ weight.T
+
+
+@mx.compile
 def _prompt_message(hidden, message, down, paired):
     states=mx.concatenate((layers.unweighted_rms_norm(hidden),layers.unweighted_rms_norm(message)),axis=-1)
     reduced=(states.astype(down.dtype) @ down.T).astype(mx.float32)
@@ -45,6 +51,15 @@ def project(layer, hidden_states, message, normalized=None, reduced=None, with_s
         forget=layer.forget_gate_proj.weight
         gain=layer.message_gate_proj.weight
         if forget.shape==gain.shape==(2304,64) and forget.dtype==gain.dtype==mx.float32:
+            down=layer.down_proj.weight
+            if hidden_states.shape[0]==1 and down.dtype==mx.bfloat16 and down.shape==(64,4608):
+                from . import prefill_message
+                saved=getattr(layer,"_prompt_gate_fragments",None)
+                if saved is None or saved[0] is not forget or saved[1] is not gain:
+                    saved=(forget,gain,prefill_message.pack(forget,gain))
+                    object.__setattr__(layer,"_prompt_gate_fragments",saved)
+                reduced=_prompt_bottleneck(hidden_states,message,down)
+                return prefill_message.apply(reduced,saved[2],hidden_states,message)
             saved=getattr(layer,"_prompt_gate_rows",None)
             if saved is None or saved[0] is not forget or saved[1] is not gain:
                 saved=(forget,gain,mx.concatenate((forget,gain)))
