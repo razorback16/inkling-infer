@@ -7,7 +7,7 @@ from mlx_lm.models.inkling2 import layers
 _reference = layers.Experts.__call__
 _kernel = mx.fast.metal_kernel(
     name="inkling_stock_order_gate_up_fp4",
-    input_names=["x", "ids", "packed", "scales", "amax", "activation", "tiles"],
+    input_names=["x", "ids", "packed", "scales", "amax", "activation"],
     output_names=["out"],
     header="""
         constant float levels[16] = {
@@ -29,9 +29,6 @@ _kernel = mx.fast.metal_kernel(
         for (uint word = lane; word < 288; word += 32) {
             float v[8];
             for (uint i = 0; i < 8; ++i) v[i] = float(x[word * 8 + i]);
-            uint tile = ((expert * 2304 + first) / 4 * 9 + word / 32) * 9;
-            uchar4 bases;
-            if (DELTA) bases = as_type<uchar4>(tiles[tile]);
             for (uint r = 0; r < 4; ++r) {
                 uint row = expert * 2304 + first + r;
                 uint bits = packed[row * 288 + word];
@@ -41,14 +38,7 @@ _kernel = mx.fast.metal_kernel(
                              + v[i+2] * levels[(bits >> 8) & 15] + v[i+3] * levels[(bits >> 12) & 15];
                     bits >>= 16;
                 }
-                uchar code;
-                if (DELTA && bases[r] != 255) {
-                    uint nibbles = tiles[tile + 1 + (word % 32 / 16) * 4 + r];
-                    code = bases[r] + ((nibbles >> ((word / 2 % 8) * 4)) & 15);
-                } else {
-                    code = scales[row * 144 + word / 2];
-                }
-                float term = partial * fp8_scale(code);
+                float term = partial * fp8_scale(scales[row * 144 + word / 2]);
                 sums[r] += term;
             }
         }
@@ -63,48 +53,6 @@ _kernel = mx.fast.metal_kernel(
         }
     """,
 )
-
-
-_encode_scale_tiles = mx.fast.metal_kernel(
-    name="inkling_expert_scale_tiles", input_names=["scales"], output_names=["tiles"],
-    source="""
-        uint tile = thread_position_in_grid.x;
-        uint row = (tile / 9) * 4;
-        uint col = (tile % 9) * 16;
-        uchar4 bases;
-        for (uint r=0; r<4; ++r) {
-            auto src = scales + (row+r)*144+col;
-            uchar lo=255, hi=0;
-            for (uint j=0; j<16; ++j) {lo=min(lo,src[j]); hi=max(hi,src[j]);}
-            bases[r] = hi-lo <= 15 ? lo : uchar(255);
-            for (uint k=0; k<2; ++k) {
-                uint bits=0;
-                for (uint j=0; j<8; ++j) bits |= ((uint(src[k*8+j])-lo)&15) << (4*j);
-                tiles[tile*9+1+k*4+r]=bits;
-            }
-        }
-        tiles[tile*9]=as_type<uint>(bases);
-    """,
-)
-
-
-def prepare_scales(model):
-    buffers = []
-    for layer in model.layers:
-        proj = layer.mlp.experts.gate_up_proj
-        if (getattr(proj, "mode", None) != "nvfp4" or proj.scales.shape[1:] != (2304, 144)
-                or proj.scales.dtype != mx.uint8):
-            continue
-        raw = proj.scales
-        saved = getattr(proj, "_delta_scales", None)
-        if saved is None or saved[0] is not raw:
-            count = raw.size // 64
-            tiles, = _encode_scale_tiles(inputs=[raw], grid=(count,1,1), threadgroup=(128,1,1),
-                                         output_shapes=[(count,9)],output_dtypes=[mx.uint32])
-            object.__setattr__(proj, "_delta_scales", (raw,tiles))
-            buffers.append(tiles)
-    if buffers:
-        mx.eval(buffers)
 
 
 _mx_gate = mx.fast.metal_kernel(
@@ -178,11 +126,8 @@ def gated_activation(layer, x, indices):
             or layer.act_fn.gate_softcap != 4 or layer.act_fn.up_softcap != 25):
         pair = proj(x[..., None, None, :], indices)
         return layer.act_fn(pair[..., 0::2], pair[..., 1::2])
-    saved = getattr(proj, "_delta_scales", None)
-    tiled = saved is not None and saved[0] is proj.scales
     active = _kernel(
-        inputs=[x, indices, proj.weight, proj.scales, proj.global_scale, activation_tables(),
-                saved[1] if tiled else proj.weight], template=[("DELTA",tiled)],
+        inputs=[x, indices, proj.weight, proj.scales, proj.global_scale, activation_tables()],
         grid=(144 * 128, 8, 1), threadgroup=(128, 1, 1),
         output_shapes=[(1, 1, 8, 1, 1152)], output_dtypes=[x.dtype],
     )[0]
