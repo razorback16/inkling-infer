@@ -229,12 +229,44 @@ def post_attention(layer, blocks, attention, history, hidden, normalize=False):
         output_dtypes=[attention.dtype if normalize else mx.float32]+[mx.float32]*3)
     return mixed, residual, window
 
+_mix_start = "        for (uint j = 0; j < 4; ++j) {\n            uint d = tid*4+j;\n            float v = 0;"
+
+
+def _make_coeff_kernel():
+    source = _source.replace("FILTER","")
+    source = source.replace("sum += v*v;", "").replace("sum = simd_sum(sum);","sum = simd_sum(squares[tid]);",1)
+    source = source.replace("if (!query) normalized[d] = norm[d];","")
+    source = cached_source(source)
+    source = source[:source.index(_mix_start)] + """
+        if (tid<=K) factors[tid]=coeff[tid];
+        if (!tid) factors[K+1]=scale;
+    """
+    return mx.fast.metal_kernel(name="inkling_shared_depth_coefficients",
+                                input_names=["x","blocks","queries","squares","closed"],
+                                output_names=["factors"],source=source)
+
+
+_depth_coefficients = _make_coeff_kernel()
+
+
 def make_projected(normalize,routes=False,bottleneck=False):
     source = normalized_source() if normalize else _source.replace("FILTER","")
     source = source.replace("sum += v*v;", "").replace("sum = simd_sum(sum);","sum = simd_sum(squares[tid]);",1)
     source = source.replace("if (!query) normalized[d] = norm[d];","")
     source = cached_source(source)
     inputs = ["x","blocks","queries","squares","closed"]
+    if routes or bottleneck:
+        inputs = ["x","blocks","coeff"]
+        source = """
+            uint tid=thread_position_in_threadgroup.x, lane=thread_index_in_simdgroup;
+            uint sg=simdgroup_index_in_threadgroup, query=0;
+            threadgroup float norm[2304], sums[18];
+            float4 values;
+            for (uint j=0;j<4;++j) {
+                uint d=tid*4+j;
+                norm[d]=float(x[d])*coeff[K+1];
+            }
+        """ + source[source.index(_mix_start):]
     if normalize:
         inputs.extend(["weights","eps"])
     if routes:
@@ -304,6 +336,11 @@ _projected_message = make_projected(False,bottleneck=True)
 def from_projection(layer, blocks, residual, squares, normalize, gate=None, message=None):
     closed,config=block_lookahead.lookup(layer.mlp_input,blocks)
     inputs = [residual,blocks,layer.mlp_input.query,squares,closed]
+    if message is not None or gate is not None:
+        factors, = _depth_coefficients(inputs=inputs,template=[("K",blocks.shape[0]),*config],
+                                       grid=(576,1,1),threadgroup=(576,1,1),
+                                       output_shapes=[(blocks.shape[0]+2,)],output_dtypes=[mx.float32])
+        inputs = [residual,blocks,factors]
     if normalize:
         norm=layer.post_attention_layernorm
         inputs.extend([norm.weight,scalar(norm.eps)])
