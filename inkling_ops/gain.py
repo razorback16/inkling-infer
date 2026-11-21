@@ -20,10 +20,14 @@ _source = """
         g += simd_shuffle_down(g, 2);
         f += simd_shuffle_down(f, 1);
         g += simd_shuffle_down(g, 1);
+        ushort leader=ushort(lane&~3u);
+        float gain_dot=simd_shuffle(g,leader);
+        float gate=precise::tanh((lane&1) ? gain_dot : f);
+        float gain=simd_shuffle(gate,ushort(leader+1));
         if ((lane % 4) == 0) {
             uint c = bank * 2304 + row;
-            volatile float retained = (1.f - precise::tanh(f)) * float(state[SHARED ? row : c]);
-            volatile float added = precise::tanh(g) * float(msg[c]);
+            volatile float retained = (1.f - gate) * float(state[SHARED ? row : c]);
+            volatile float added = gain * float(msg[c]);
             out[c] = retained + added;
         }
     """
