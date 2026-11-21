@@ -42,24 +42,7 @@ _pack = mx.fast.metal_kernel(
         bool any_raw=simd_any(raw);
         if (!lane) flags[tile]=uint(any_raw)<<block;
         uint physical=((group/4)*18+block)*4+group%4;
-        if (COLUMN && any_raw) {
-            ushort4 bits[4];
-            for (uint r=0;r<4;++r)
-                bits[r]=((device const ushort4*)weight)[(4*group+r)*576+block*32+lane];
-            for (uint j=0;j<4;++j)
-                ((device ushort4*)(payload+physical*256))[4*lane+j]=ushort4(bits[0][j],bits[1][j],bits[2][j],bits[3][j]);
-        } else if (COLUMN) {
-            uint4 lo;
-            ushort4 hi;
-            for (uint j=0;j<4;++j) {
-                uchar4 bytes=uchar4(low>>(j*8));
-                lo[j]=as_type<uint>(bytes);
-                ushort4 n=(high>>(j*4))&15;
-                hi[j]=n.x|(n.y<<4)|(n.z<<8)|(n.w<<12);
-            }
-            *(device uint4*)(payload+physical*256+lane*4)=lo;
-            *(device ushort4*)(payload+physical*256+128+lane*2)=hi;
-        } else if (any_raw) {
+        if (any_raw) {
             for (uint r=0;r<4;++r) {
                 uint i=(4*group+r)*2304+block*128+lane*4;
                 *(device uint2*)(payload+physical*256+r*64+lane*2)=
@@ -111,42 +94,6 @@ _dot = mx.fast.metal_kernel(
     name="inkling_four_row_gemv", input_names=["x","payload"],output_names=["out"],
     source=_dot_source,
 )
-_column_dot = mx.fast.metal_kernel(
-    name="inkling_column_lanes",input_names=["x","payload"],output_names=["out"],
-    source="""
-        uint lane=thread_index_in_simdgroup,group=thread_position_in_grid.x/32;
-        uint2 meta=((device const uint2*)(payload+(group/4)*18688))[group%4];
-        ushort4 base=ushort4(as_type<uchar4>(meta.x))<<8;
-        float4 sums=0;
-        for (uint block=0;block<18;++block) {
-            uint tile=(group/4)*73+1+block*4+group%4;
-            float4 a=float4(((device const bfloat4*)x)[block*32+lane]);
-            if (meta.y&(1u<<block)) {
-                for (uint j=0;j<4;++j) {
-                    float4 w=float4(((device const bfloat4*)(payload+tile*256))[lane*4+j]);
-                    sums=fma(float4(a[j]),w,sums);
-                }
-            } else {
-                uint4 low=*(device const uint4*)(payload+tile*256+lane*4);
-                ushort4 high=*(device const ushort4*)(payload+tile*256+128+lane*2);
-                for (uint j=0;j<4;++j) {
-                    ushort h=high[j];
-                    ushort4 n=ushort4(h,h>>4,h>>8,h>>12)&15;
-                    ushort4 rot=((n<<8)|ushort4(as_type<uchar4>(low[j])))+base;
-                    float4 w=float4(as_type<bfloat4>((rot>>1)|(rot<<15)));
-                    sums=fma(float4(a[j]),w,sums);
-                }
-            }
-        }
-        for (uint r=0;r<4;++r) {
-            float dot=sums[r];
-            for (ushort step=16;step;step>>=1) dot+=simd_shuffle_down(dot,step);
-            if (!lane) out[group*4+r]=bfloat16_t(dot);
-        }
-    """,
-)
-
-
 _pair = mx.fast.metal_kernel(
     name="inkling_four_row_global_kv",input_names=["kx","vx","payload"],output_names=["out"],
     source=_dot_source.replace("group=thread_position_in_grid.x/32",
@@ -168,12 +115,12 @@ def project_kv(layer,k,v):
 
 
 
-def encode(weight,columns=True):
+def encode(weight):
     count=weight.size
     rows=weight.shape[0]
     bases=_ranges(inputs=[weight],grid=(rows*32,1,1),threadgroup=(128,1,1),
                   output_shapes=[(rows,)],output_dtypes=[mx.uint8])[0]
-    payload,flags=_pack(inputs=[weight,bases],template=[("COLUMN",columns)],grid=(count//16,1,1),threadgroup=(128,1,1),
+    payload,flags=_pack(inputs=[weight,bases],grid=(count//16,1,1),threadgroup=(128,1,1),
                  output_shapes=[(count//512,256),(rows//4,18)],output_dtypes=[mx.uint32,mx.uint32])
     formats=mx.stack((bases.view(mx.uint32),mx.sum(flags,axis=1)),axis=1)
     # One aligned header per set of sixteen rows, followed by its 72 coefficient tiles.
@@ -183,5 +130,5 @@ def encode(weight,columns=True):
 
 def project(x,weight,encoded):
     rows=weight.shape[0]
-    return _column_dot(inputs=[x,*encoded],grid=(rows*8,1,1),threadgroup=(128,1,1),
+    return _dot(inputs=[x,*encoded],grid=(rows*8,1,1),threadgroup=(128,1,1),
                 output_shapes=[(1,1,rows)],output_dtypes=[x.dtype])[0]

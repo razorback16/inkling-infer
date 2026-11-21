@@ -49,7 +49,7 @@ def prepare_query_weights(model):
             k,v=layer.k_proj.weight,layer.v_proj.weight
             saved=getattr(layer,"_four_row_kv",None)
             if saved is None or saved[0] is not k or saved[1] is not v:
-                encoded=packed_rows.encode(mx.concatenate((k,v)),columns=False)
+                encoded=packed_rows.encode(mx.concatenate((k,v)))
                 object.__setattr__(layer,"_four_row_kv",(k,v,encoded))
                 arrays.extend(encoded)
         common = (layer.q_proj,layer.r_proj,layer.gate_proj)
@@ -81,7 +81,7 @@ def prepare_query_weights(model):
             saved = getattr(layer,name+"_tiles",None)
             if weight.shape[0]%16 or (saved is not None and saved[0] is weight):
                 continue
-            encoded = packed_rows.encode(weight,columns=True)
+            encoded = packed_rows.encode(weight)
             object.__setattr__(layer,name+"_tiles",(weight,encoded))
             arrays.extend(encoded)
     if arrays:
