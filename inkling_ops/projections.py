@@ -88,6 +88,14 @@ def prepare_query_weights(model):
         mx.eval(arrays)
 
 
+def _grouped_output(layer,q,k,v,rel,sinks,kv,gate,scaled_query):
+    from . import grouped_attn
+    features=grouped_attn.attend(layer,q,k,v,rel,sinks,kv,gate,scaled_query)
+    from . import filtered_output
+    out=filtered_output.apply(layer.o_proj,features,getattr(kv,"output_filter",None))
+    return layer.o_proj(features) if out is None else out
+
+
 def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cache, conv_states, conv_mask):
     full = isinstance(layer, layers.FullAttention)
     same = hidden_states is key_hidden_states and hidden_states is value_hidden_states
@@ -100,6 +108,12 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
     name = "_all_qkv" if same else "_common_q"
     packed, boundaries = projection(layer,modules,name)
     tiles = getattr(layer,name+"_tiles",None)
+    if same and not full and cache is not None:
+        from . import project_heads
+        prepared=project_heads.compute(layer,hidden_states,packed,tiles,conv_states,conv_mask,cache[0])
+        if prepared is not None:
+            q,k,v,rel,gate,scaled=prepared
+            return _grouped_output(layer,q,k,v,rel,layer.sink_proj(hidden_states),cache[0],gate,scaled)
     projected = (packed_rows.project(hidden_states,packed,tiles[1])
                  if tiles is not None and tiles[0] is packed and hidden_states.dtype==mx.bfloat16
                  else hidden_states @ packed.T)
@@ -184,11 +198,7 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
         k, v = kv.update_and_fetch(k, v)
     if (kv is not None and 1024 <= k.shape[2] <= 8192 and q.shape[-1] == 128
             and type(layer.rel_logits_proj) is layers.RelativeLogits and rel.dtype == q.dtype == mx.bfloat16):
-        from . import grouped_attn
-        features=grouped_attn.attend(layer,q,k,v,rel,sinks,kv,gate,scaled_query)
-        from . import filtered_output
-        out=filtered_output.apply(layer.o_proj,features,getattr(kv,"output_filter",None))
-        return layer.o_proj(features) if out is None else out
+        return _grouped_output(layer,q,k,v,rel,sinks,kv,gate,scaled_query)
     if kv is not None and type(layer.rel_logits_proj) is layers.RelativeLogits and rel.dtype == q.dtype:
         output = rel_mask.attend(layer, q, k, v, rel, sinks, kv)
     else:
