@@ -155,37 +155,55 @@ _select = mx.fast.metal_kernel(
 _rank_pairs = mx.fast.metal_kernel(
     name="inkling_rank_probability_pairs",input_names=["logits","eps","scale"],
     output_names=["inds","weights"],source="""
-        uint lane = thread_index_in_simdgroup;
-        float scores[4], keys[4];
-        for (uint j=0; j<4; ++j) {
-            float2 pair = ((device const float2*)logits)[lane+32*j];
-            scores[j] = pair.x;
-            keys[j] = pair.y;
+        uint tid=thread_position_in_threadgroup.x, lane=thread_index_in_simdgroup;
+        uint warp=simdgroup_index_in_threadgroup;
+        threadgroup float selected[8];
+        float scores[4], other[4];
+        bool special=false;
+        for (uint j=0;j<4;++j) {
+            float2 pair=((device const float2*)logits)[lane+32*j];
+            scores[j]=pair.x; other[j]=pair.y;
+            special |= !isfinite(pair.y);
         }
-        float total = 0, selected = 0;
-        for (uint k=0; k<8; ++k) {
-            float best = -INFINITY;
-            uint candidate = 128;
-            for (uint j=0; j<4; ++j) {
-                uint e = lane+32*j;
-                if (keys[j]>best || (keys[j]==best && e<candidate)) {
-                    best=keys[j]; candidate=e;
+        if (simd_any(special)) {
+            if (!warp) {
+                float b[4];
+                for (uint j=0;j<4;++j) b[j]=other[j];
+                for (uint k=0;k<8;++k) {
+                    float best=-INFINITY;
+                    uint which=128;
+                    for (uint j=0;j<4;++j) {
+                        uint e=lane+32*j;
+                        if (b[j]>best || (b[j]==best && e<which)) {best=b[j];which=e;}
+                    }
+                    float peak=simd_max(best);
+                    uint winner=simd_min(best==peak ? which : 128u);
+                    float keep=0;
+                    for (uint j=0;j<4;++j) if (lane+32*j==winner) {
+                        keep=scores[j]; b[j]=-INFINITY;
+                    }
+                    float w=simd_sum(keep);
+                    if (!lane) {inds[k]=winner; selected[k]=w;}
                 }
             }
-            float peak = simd_max(best);
-            uint winner = simd_min(best==peak ? candidate : 128u);
-            float keep = 0;
-            for (uint j=0; j<4; ++j) {
-                if (lane+32*j==winner) {
-                    keep=scores[j];
-                    keys[j]=-INFINITY;
-                }
+        } else {
+            for (uint i=0;i<4;++i) {
+                uint e=warp+32*i;
+                float query=simd_shuffle(other[i],warp);
+                uint ahead=0;
+                for (uint j=0;j<4;++j)
+                    ahead+=uint(other[j]>query || (other[j]==query && lane+32*j<e));
+                uint rank=simd_sum(ahead);
+                float score=simd_shuffle(scores[i],warp);
+                if (!lane && rank<8) {inds[rank]=e; selected[rank]=score;}
             }
-            float value = simd_sum(keep);
-            total = value + total;
-            if (lane==k) { inds[k]=winner; selected=value; }
         }
-        if (lane<8) weights[lane]=selected/(total+eps)*scale;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid<8) {
+            float total=0;
+            for (uint i=0;i<8;++i) total=selected[i]+total;
+            weights[tid]=selected[tid]/(total+eps)*scale;
+        }
     """,
 )
 
@@ -211,8 +229,7 @@ def route(layer, x, dtype, normalized=False, logits=None, squares=None):
         kernel = _rank_pairs if paired else _select
         args = [logits] if paired else [logits,gate.e_score_correction_bias]
         args.extend([scalar(layers._ROUTER_SCORE_EPS),scalar(gate.routed_scaling_factor)])
-        threads = 32 if paired else 1024
-        indices, weights = kernel(inputs=args, grid=(threads,1,1),threadgroup=(threads,1,1),
+        indices, weights = kernel(inputs=args, grid=(1024,1,1),threadgroup=(1024,1,1),
             output_shapes=[(1,1,8)]*2, output_dtypes=[mx.uint32,mx.float32])
     else:
         indices, weights = layers.expert_routing(
