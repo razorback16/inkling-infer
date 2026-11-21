@@ -42,15 +42,17 @@ _pack = mx.fast.metal_kernel(
         bool any_raw=simd_any(raw);
         if (!lane) flags[tile]=uint(any_raw)<<block;
         uint physical=((group/4)*18+block)*4+group%4;
+        uint super=physical/72*18432, sub=physical%72;
+        uint core=super+sub*192, extra=super+13824+sub*64;
         if (any_raw) {
             for (uint r=0;r<4;++r) {
                 uint i=(4*group+r)*2304+block*128+lane*4;
-                *(device uint2*)(payload+physical*256+r*64+lane*2)=
+                *(device uint2*)(payload+(r<3 ? core+r*64 : extra)+lane*2)=
                     *(device const uint2*)((device const ushort*)weight+i);
             }
         } else {
-            *(device uint4*)(payload+physical*256+lane*4)=low;
-            *(device ushort4*)(payload+physical*256+128+lane*2)=high;
+            *(device uint4*)(payload+core+lane*4)=low;
+            *(device ushort4*)(payload+core+128+lane*2)=high;
         }
 
     """,
@@ -64,17 +66,19 @@ _dot = mx.fast.metal_kernel(
         float sums[4]={};
         for (uint block=0;block<18;++block) {
             uint tile=((group/4)*18+block)*4+group%4;
+            uint super=tile/72*18432, sub=tile%72;
+            uint core=super+sub*192, extra=super+13824+sub*64;
             uint d=block*128+lane*4;
             float4 v=float4(*(device const bfloat4*)(x+d));
             if (raw_tiles & (1u<<block)) {
                 for (uint r=0;r<4;++r) {
-                    float4 w=float4(*(device const bfloat4*)(payload+tile*256+r*64+lane*2));
+                    float4 w=float4(*(device const bfloat4*)(payload+(r<3 ? core+r*64 : extra)+lane*2));
                     for (uint j=0;j<4;++j) sums[r]=fma(v[j],w[j],sums[r]);
                 }
                 continue;
             }
-            uint4 low=*(device const uint4*)(payload+tile*256+lane*4);
-            ushort4 high=*(device const ushort4*)(payload+tile*256+128+lane*2);
+            uint4 low=*(device const uint4*)(payload+core+lane*4);
+            ushort4 high=*(device const ushort4*)(payload+core+128+lane*2);
             for (uint r=0;r<4;++r) {
                 ushort h=high[r];
                 ushort4 ex=ushort4(h,h>>4,h>>8,h>>12)&15;
