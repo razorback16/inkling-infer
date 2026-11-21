@@ -34,13 +34,7 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
         return reference(layer, hidden_states, key_hidden_states, value_hidden_states,
                           cache=cache, conv_states=conv_states, conv_mask=conv_mask)
     packed, boundaries = projection(layer, modules, "_all_qkv" if same else "_common_q")
-    shared = (filtered_kv.shared(layer,hidden_states,packed,conv_states,conv_mask)
-              if same and not full else None)
-    if shared is None:
-        projected=hidden_states @ packed.T
-    else:
-        projected,conv_states[0],conv_states[1]=shared
-    parts = mx.split(projected,boundaries,axis=-1)
+    parts = mx.split(hidden_states @ packed.T, boundaries, axis=-1)
     query, relative, gate = parts[:3]
     sinks = layer.sink_proj(hidden_states)
     filtered = (None if full or same else
@@ -55,7 +49,7 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
     if full:
         key, conv_states[0] = layer.k_sconv(key, key_hidden_states, conv_states[0], conv_mask)
         value, conv_states[1] = layer.v_sconv(value, value_hidden_states, conv_states[1], conv_mask)
-    elif filtered is None and shared is None:
+    elif filtered is None:
         key, conv_states[0] = layer.k_sconv(key, conv_states[0], conv_mask)
         value, conv_states[1] = layer.v_sconv(value, conv_states[1], conv_mask)
     pair = None
