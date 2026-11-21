@@ -26,7 +26,7 @@ _partial = mx.fast.metal_kernel(
                 uint dist = uint(newest-int(tile+128*lane)) & 1023u;
                 if (dist<R) {
                     for (uint j=0; j<WIDTH; ++j)
-                        bias = fma(float(rel[head*WIDTH+j]),float(w[SWIZZLED ? ((dist%128)*WIDTH+j)*(R/128)+dist/128 : j*R+dist]),bias);
+                        bias = fma(float(rel[head*WIDTH+j]),float(T(w[j*R+dist])),bias);
                     bias = float(T(bias));
                 }
             }
@@ -60,7 +60,7 @@ _partial = mx.fast.metal_kernel(
                 if (pos >= S || dist >= valid || (WINDOW && dist >= WINDOW)) bias = -INFINITY;
                 else if (dist < R) {
                     for (uint j=0; j<WIDTH; ++j)
-                        bias = fma(float(rel[head*WIDTH+j]), float(w[SWIZZLED ? ((dist%128)*WIDTH+j)*(R/128)+dist/128 : j*R+dist]), bias);
+                        bias = fma(float(rel[head*WIDTH+j]), float(T(w[j*R+dist])), bias);
                     bias = float(T(bias));
                 }
                 for (uint i=0; i<32 && chunk+tile+i*128<S; ++i) {
@@ -156,17 +156,8 @@ def attend(layer,q,k,v,rel,sinks,cache,gate,scaled_query=None):
     slot = cache._idx if isinstance(cache,(RotatingKVCache,BatchRotatingKVCache)) else length
     before = getattr(cache, "write_coordinates", None)
     slot, end = before if before is not None else (slot, cache.offset)
-    w = layer.rel_logits_proj.proj.astype(rel.dtype)
+    w = layer.rel_logits_proj.proj
     width, extent = w.shape
-    swizzled = extent % 128 == 0
-    if swizzled:
-        weight = layer.rel_logits_proj.proj
-        saved = getattr(layer, "_relative_tiles", None)
-        if saved is None or saved[0] is not weight or saved[1] != rel.dtype:
-            tiled = mx.contiguous(w.reshape(width, extent//128, 128).transpose(2,0,1))
-            saved = (weight, rel.dtype, tiled)
-            object.__setattr__(layer, "_relative_tiles", saved)
-        w = saved[2]
     paged = hasattr(cache, "page_tail")
     tail = cache.page_tail if paged else q
     if paged:
@@ -180,7 +171,7 @@ def attend(layer,q,k,v,rel,sinks,cache,gate,scaled_query=None):
     parts,stats = _partial(
         inputs=[q if scaled_query is None else scaled_query,k if adjacent is None else adjacent,v if adjacent is None else adjacent,tail,q if fresh is None else fresh,rel,w,slot,end,
                 sinks.astype(q.dtype),scalar(layer.scaling)],
-        template=[("SCALED",scaled_query is not None),("T",q.dtype),("S",length),("PRE_UPDATE",before is not None),("PAGED",paged),("ADJACENT",adjacent is not None),("FRESH",fresh is not None),("NKV",k.shape[1]),("GQA",heads//k.shape[1]),("WIDTH",width),("SWIZZLED",swizzled),
+        template=[("SCALED",scaled_query is not None),("T",q.dtype),("S",length),("PRE_UPDATE",before is not None),("PAGED",paged),("ADJACENT",adjacent is not None),("FRESH",fresh is not None),("NKV",k.shape[1]),("GQA",heads//k.shape[1]),("WIDTH",width),
                   ("R",extent),("WINDOW",layer.sliding_window)],
         grid=(128*32,heads,1),threadgroup=(threads,1,1),
         output_shapes=[(heads,128,128),(heads,128,2)],output_dtypes=[q.dtype,mx.float32])

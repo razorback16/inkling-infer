@@ -36,7 +36,7 @@ _prefill_conv = mx.fast.metal_kernel(
             prev=float(x[(first-1)*C+c]);
         } else {
             if (HAS_HISTORY) { a=history[c]; b=history[C+c]; prev=history[2*C+c]; }
-            window[c]=a; window[C+c]=b; window[2*C+c]=prev;
+            if (!TAIL) {window[c]=a; window[C+c]=b; window[2*C+c]=prev;}
         }
         for (uint i=first;i<min(first+4u,uint(L));++i) {
             float v=float(x[i*C+c]);
@@ -45,7 +45,7 @@ _prefill_conv = mx.fast.metal_kernel(
             total=fma(float(W(prev)),w.z,total);
             total=fma(float(W(v)),w.w,total);
             y[i*C+c]=T((float(W(total))+v)*0.4472135954999579f);
-            window[(i+3)*C+c]=v;
+            if (!TAIL || i+3>=L) window[(TAIL ? i+3-L : i+3)*C+c]=v;
             a=b; b=prev; prev=v;
         }
     """,
@@ -59,11 +59,13 @@ def convolve(layer, x, conv_state, conv_mask):
             and (conv_state is None or (conv_state.shape==(1,3,x.shape[-1]) and conv_state.dtype==mx.float32))):
         _, length, width=x.shape
         weight=layer.conv1d.weight
+        from .prefill_layer import _tail_only
+        tail = _tail_only.get() and length>=3
         return _prefill_conv(
             inputs=[x, x if conv_state is None else conv_state, weight],
-            template=[("T",x.dtype),("W",weight.dtype),("C",width),("L",length),("HAS_HISTORY",conv_state is not None)],
+            template=[("TAIL",tail),("T",x.dtype),("W",weight.dtype),("C",width),("L",length),("HAS_HISTORY",conv_state is not None)],
             grid=(width,(length+3)//4,1),threadgroup=(min(128,width),1,1),
-            output_shapes=[x.shape,(1,length+3,width)],output_dtypes=[x.dtype,mx.float32],
+            output_shapes=[x.shape,(1,3 if tail else length+3,width)],output_dtypes=[x.dtype,mx.float32],
         )
     if (x.shape[:2] != (1, 1) or conv_mask is not None or layer.kernel_size != 4
             or conv_state is None or conv_state.shape != (1, 3, x.shape[-1])):

@@ -144,8 +144,6 @@ def single_token_moe(self, x):
 def install():
     from inkling_ops.grouped_attn import gate_probabilities
     gate_probabilities()
-    from inkling_ops import packed_vocab
-    packed_vocab.install()
     from inkling_ops import attention_mask, compiled_ring, dynamic_conv, message_gate, projections, short_conv, triplet
     from inkling_ops import expert_gate
     expert_gate.install()
@@ -153,13 +151,11 @@ def install():
     loop.install()
     from inkling_ops import input_heads
     input_heads.install()
-    from inkling_ops import exact_sources
-    exact_sources.install()
     short_conv.install()
     message_gate.install()
+    triplet.install()
     attention_mask.install()
     projections.install()
-    triplet.install()
     compiled_ring.install()
     dynamic_conv.install()
     layers.SparseMoeBlock.__call__ = single_token_moe

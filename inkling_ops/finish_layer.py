@@ -56,8 +56,7 @@ def decode(layer, hidden_states, block_states, *, cache=None, conv_mask=None, me
         gate = moe.gate
         if (prenormalized and hidden_states.dtype==mx.bfloat16 and type(gate) is layers.TopKRouter
                 and gate.weight.shape==(128,2304) and layer.mlp_input.query.size==2304):
-            from .exact_sources import native
-            mixed,logits=depth_norm.from_projection(layer,block_states,residual,squares,True,native(gate))
+            mixed,logits=depth_norm.from_projection(layer,block_states,residual,squares,True,gate.weight)
         elif (normalized_messages is not None and normalized_messages.dtype in (mx.float32,mx.bfloat16)
               and type(layer.mlp_message_gate) is layers.MessageGate and layer.mlp_input.query.size==2304
               and type(layer.mlp_message_gate.down_proj) is nn.Linear

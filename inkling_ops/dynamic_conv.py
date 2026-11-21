@@ -44,8 +44,8 @@ _prompt = mx.fast.metal_kernel(
             total+=product;
         }
         y[t*C+c]=T((total+original)/3.f);
-        window[(t+3)*C+c]=original;
-        if (t==0) {
+        if (!TAIL || t+3>=L) window[(TAIL ? t+3-L : t+3)*C+c]=original;
+        if (t==0 && !TAIL) {
             for (uint i=0;i<3;++i) window[i*C+c]=HAS_HISTORY ? float(history[i*C+c]) : 0.f;
         }
     """,
@@ -58,12 +58,14 @@ def convolve(layer, hidden_states, dynamic_input, conv_state, conv_mask):
             and hidden_states.shape[-1]%layer.num_heads==0
             and (conv_state is None or conv_state.shape==(1,3,hidden_states.shape[-1]))):
         _,length,width=hidden_states.shape
+        from .prefill_layer import _tail_only
+        tail = _tail_only.get() and length>=3
         return _prompt(
             inputs=[hidden_states,hidden_states if conv_state is None else conv_state,
                     layer.static_weight,layer.weight_proj(dynamic_input)],
-            template=[("T",hidden_states.dtype),("C",width),("H",layer.num_heads),("HAS_HISTORY",conv_state is not None)],
+            template=[("TAIL",tail),("L",length),("T",hidden_states.dtype),("C",width),("H",layer.num_heads),("HAS_HISTORY",conv_state is not None)],
             grid=(width,length,1),threadgroup=(min(128,width),1,1),
-            output_shapes=[hidden_states.shape,(1,length+3,width)],output_dtypes=[hidden_states.dtype,mx.float32],
+            output_shapes=[hidden_states.shape,(1,3 if tail else length+3,width)],output_dtypes=[hidden_states.dtype,mx.float32],
         )
     width = hidden_states.shape[-1]
     if (hidden_states.shape[:2] != (1, 1) or conv_mask is not None or layer.kernel_size != 4

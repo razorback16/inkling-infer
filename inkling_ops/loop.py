@@ -13,12 +13,7 @@ _reference = TextModel._run_loop
 
 
 def _compile(model):
-    from . import filtered_output, filtered_kv
-    filtered_output.prepare(model)
-    filtered_kv.prepare(model)
-    from .projections import prepare_query_weights
-    prepare_query_weights(model)
-    groups=block_lookahead.prepare(model)
+    groups = block_lookahead.prepare(model)
     owner = weakref.ref(model)
 
     @mx.compile

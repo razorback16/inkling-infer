@@ -1,4 +1,4 @@
-"""Pack attention projections with a common one-token input."""
+"""Project a single token directly from the checkpoint matrices."""
 import math
 
 import mlx.core as mx
@@ -6,86 +6,10 @@ import mlx.nn as nn
 from mlx_lm.models.inkling2 import layers
 
 from .head_norm import normalize
-from . import rel_mask, filtered_kv, packed_rows
+from . import rel_mask, filtered_kv
 
 _sliding = layers.SlidingAttention.__call__
 _full = layers.FullAttention.__call__
-
-
-def projection(layer, modules, key):
-    weights = tuple(module.weight for module in modules)
-    cached = getattr(layer, key, None)
-    if cached is None or not all(a is b for a, b in zip(weights, cached[0])):
-        boundaries = []
-        total = 0
-        for weight in weights[:-1]:
-            total += weight.shape[0]
-            boundaries.append(total)
-        cached = (weights, mx.concatenate(weights), boundaries)
-        object.__setattr__(layer, key, cached)
-    return cached[1:]
-
-
-@mx.compile
-def _position_table(pos,alpha,floor):
-    return 1.0+alpha*mx.log(mx.maximum((pos+1)/floor,1.0))
-
-
-def prepare_query_weights(model):
-    arrays = []
-    tables = {}
-    for index, block in enumerate(model.layers):
-        layer = block.self_attn
-        if isinstance(layer,layers.FullAttention) and (layer.log_scaling_n_floor<8192 or
-                not math.isfinite(layer.log_scaling_alpha) or not math.isfinite(layer.log_scaling_n_floor)):
-            params=(layer.log_scaling_alpha,layer.log_scaling_n_floor)
-            if params not in tables:
-                tables[params]=_position_table(mx.arange(8192,dtype=mx.float32),*params)
-                arrays.append(tables[params])
-            object.__setattr__(layer,"_decode_position_table",(params,tables[params]))
-        if (isinstance(layer,layers.FullAttention)
-                and all(type(p) is nn.Linear and "bias" not in p and p.weight.shape==(1024,2304)
-                        and p.weight.dtype==mx.bfloat16 for p in (layer.k_proj,layer.v_proj))):
-            k,v=layer.k_proj.weight,layer.v_proj.weight
-            saved=getattr(layer,"_four_row_kv",None)
-            if saved is None or saved[0] is not k or saved[1] is not v:
-                encoded=packed_rows.encode(mx.concatenate((k,v)))
-                object.__setattr__(layer,"_four_row_kv",(k,v,encoded))
-                arrays.extend(encoded)
-        common = (layer.q_proj,layer.r_proj,layer.gate_proj)
-        variants = []
-        if isinstance(layer,layers.SlidingAttention):
-            variants.append(("_all_qkv",common+(layer.k_proj,layer.v_proj)))
-        if isinstance(layer,layers.FullAttention) or index in model.args.loop_core:
-            variants.append(("_common_q",common))
-        for name, modules in variants:
-            if any(type(p) is not nn.Linear or "bias" in p or p.weight.dtype!=mx.bfloat16
-                   or p.weight.shape[1]!=2304 for p in modules):
-                continue
-            if name=="_common_q" and isinstance(layer,layers.SlidingAttention):
-                joint=getattr(layer,"_all_qkv",None)
-                tiles=getattr(layer,"_all_qkv_tiles",None)
-                rows=sum(p.weight.shape[0] for p in modules)
-                if (rows%16==0 and joint is not None and tiles is not None
-                        and tiles[0] is joint[1] and all(p.weight is w for p,w in zip(modules,joint[0]))):
-                    weights=tuple(p.weight for p in modules)
-                    w=joint[1][:rows]
-                    boundaries=joint[2][:len(modules)-1]
-                    data,=tiles[1]
-                    subset=(data[:rows//16],)
-                    object.__setattr__(layer,name,(weights,w,boundaries))
-                    object.__setattr__(layer,name+"_tiles",(w,subset))
-                    arrays.extend(subset)
-                    continue
-            weight,_ = projection(layer,modules,name)
-            saved = getattr(layer,name+"_tiles",None)
-            if weight.shape[0]%16 or (saved is not None and saved[0] is weight):
-                continue
-            encoded = packed_rows.encode(weight)
-            object.__setattr__(layer,name+"_tiles",(weight,encoded))
-            arrays.extend(encoded)
-    if arrays:
-        mx.eval(arrays)
 
 
 def _grouped_output(layer,q,k,v,rel,sinks,kv,gate,scaled_query):
@@ -105,25 +29,14 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
         reference = _full if full else _sliding
         return reference(layer, hidden_states, key_hidden_states, value_hidden_states,
                           cache=cache, conv_states=conv_states, conv_mask=conv_mask)
-    name = "_all_qkv" if same else "_common_q"
-    packed, boundaries = projection(layer,modules,name)
-    tiles = getattr(layer,name+"_tiles",None)
     if not full and cache is not None and getattr(cache[0],"grouped",False):
         from . import project_heads
         extra=() if same else (key_hidden_states,value_hidden_states)
-        joint=getattr(layer,"_all_qkv",None)
-        sources=common+(layer.k_proj,layer.v_proj)
-        if (joint is not None and joint[2]==[3072,3456,6528,7552]
-                and all(type(m) is nn.Linear and "bias" not in m and m.weight is w for m,w in zip(sources,joint[0]))):
-            prepared=project_heads.compute(layer,hidden_states,joint[1],getattr(layer,"_all_qkv_tiles",None),
-                                           conv_states,conv_mask,cache[0],extra)
-            if prepared is not None:
-                q,k,v,rel,gate,scaled=prepared
-                return _grouped_output(layer,q,k,v,rel,layer.sink_proj(hidden_states),cache[0],gate,scaled)
-    projected = (packed_rows.project(hidden_states,packed,tiles[1])
-                 if tiles is not None and tiles[0] is packed and hidden_states.dtype==mx.bfloat16
-                 else hidden_states @ packed.T)
-    parts = mx.split(projected,boundaries,axis=-1)
+        result=project_heads.compute(layer,hidden_states,conv_states,conv_mask,cache[0],extra)
+        if result is not None:
+            q,k,v,rel,gate,scaled=result
+            return _grouped_output(layer,q,k,v,rel,layer.sink_proj(hidden_states),cache[0],gate,scaled)
+    parts = [module(hidden_states) for module in modules]
     query, relative, gate = parts[:3]
     sinks = layer.sink_proj(hidden_states)
     filtered = (None if full or same else
@@ -133,12 +46,8 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
     elif same:
         key, value = parts[3:]
     else:
-        pair = packed_rows.project_kv(layer,key_hidden_states,value_hidden_states) if full else None
-        if pair is None:
-            key = layer.k_proj(key_hidden_states)
-            value = layer.v_proj(value_hidden_states)
-        else:
-            key,value = pair
+        key = layer.k_proj(key_hidden_states)
+        value = layer.v_proj(value_hidden_states)
     fused_norm = (same and not full and conv_mask is None and conv_states is not None and layer.head_dim == 128
                   and relative.shape[-1] // layer.num_heads <= 128
                   and key.dtype == value.dtype == query.dtype
@@ -158,13 +67,8 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
         key, conv_states[0] = layer.k_sconv(key, conv_states[0], conv_mask)
         value, conv_states[1] = layer.v_sconv(value, conv_states[1], conv_mask)
     kv = cache[0] if cache is not None else None
-    position=None
     unscaled=(dynamic_norm and hasattr(kv,"page_prefix") and math.isfinite(layer.log_scaling_alpha)
               and kv.keys.shape[2]<=layer.log_scaling_n_floor)
-    if dynamic_norm and not unscaled and hasattr(kv,"page_prefix") and kv.keys.shape[2]<=8192:
-        table=getattr(layer,"_decode_position_table",None)
-        if table is not None and table[0]==(layer.log_scaling_alpha,layer.log_scaling_n_floor):
-            position=(table[1],kv.offset)
     prepare_scale = (not full and getattr(kv,"grouped",False) and layer.head_dim==128
                      and query.dtype==relative.dtype==mx.bfloat16 and type(layer.rel_logits_proj) is layers.RelativeLogits)
     scaled_query = None
@@ -175,7 +79,7 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
                      layer.k_sconv.weight_proj(key_hidden_states),layer.v_sconv.weight_proj(value_hidden_states)]
         else:
             filters=[*conv_states[:2],layer.k_sconv.conv1d.weight,layer.v_sconv.conv1d.weight]
-        query, pair, rel, conv_states[:2] = normalize(layer,query,key,value,relative,filters=filters,position=position,prepare_scale=prepare_scale)
+        query, pair, rel, conv_states[:2] = normalize(layer,query,key,value,relative,filters=filters,prepare_scale=prepare_scale)
         key,value = mx.split(pair,2,axis=2)
     elif layer.head_dim == 128 and relative.shape[-1] // layer.num_heads <= 128:
         query, key, value, rel, pair = normalize(layer, query, key, value, relative, return_pair=True, prepare_scale=prepare_scale)
@@ -188,7 +92,7 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
     if isinstance(query,tuple):
         query,scaled_query = query
         scaled_query = scaled_query.transpose(0,2,1,3)
-    if full and position is None and not unscaled:
+    if full and not unscaled:
         offset = kv.offset if kv is not None else 0
         pos = layers._positions(offset, 1).astype(mx.float32)
         tau = 1.0 + layer.log_scaling_alpha * mx.log(mx.maximum((pos + 1) / layer.log_scaling_n_floor, 1.0))

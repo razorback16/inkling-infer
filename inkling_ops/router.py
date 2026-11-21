@@ -4,7 +4,6 @@ import mlx.nn as nn
 from mlx_lm.kernels.common import scalar
 from mlx_lm.models.inkling2 import layers
 
-from .exact_sources import native
 
 # Both projection paths finish the unbiased FP32 score and its rank key in the same lane.
 _ROUTE_PAIR_HEADER = """
@@ -216,11 +215,11 @@ def route(layer, x, dtype, normalized=False, logits=None, squares=None):
         indices, weights = gate(x)
         return x, indices, weights
     if normalized and logits is None:
-        logits = _dot_only(inputs=[x,native(gate)],grid=(32*256,1,1),threadgroup=(256,1,1),
+        logits = _dot_only(inputs=[x,gate.weight],grid=(32*256,1,1),threadgroup=(256,1,1),
                            output_shapes=[(1,1,128)],output_dtypes=[mx.float32])[0]
     elif not normalized:
         paired = gate.top_k==8
-        x, logits = _kernel(inputs=[x,norm.weight,native(gate),scalar(norm.eps),x if squares is None else squares,gate.e_score_correction_bias],
+        x, logits = _kernel(inputs=[x,norm.weight,gate.weight,scalar(norm.eps),x if squares is None else squares,gate.e_score_correction_bias],
                             template=[("PAIRED",paired),("PRECOMPUTED",squares is not None),("ROWS",2 if squares is not None else 4)],
                             grid=((64 if squares is not None else 32)*256,1,1),threadgroup=(256,1,1),
                             output_shapes=[x.shape,(1,1,128,2) if paired else (1,1,128)],output_dtypes=[dtype,mx.float32])

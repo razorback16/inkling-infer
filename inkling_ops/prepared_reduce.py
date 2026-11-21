@@ -3,11 +3,12 @@ import mlx.core as mx
 
 _kernel=mx.fast.metal_kernel(
     name="inkling_prepared_message_bottleneck",
-    input_names=["state","message","weight","inverse"],output_names=["out"],
+    input_names=["state","message","w0","w1","w2","inverse"],output_names=["out"],
     source="""
         uint tid=thread_position_in_threadgroup.x,lane=thread_index_in_simdgroup;
         uint sg=simdgroup_index_in_threadgroup,bank=threadgroup_position_in_grid.y;
         uint row=threadgroup_position_in_grid.x*ROWS;
+        auto weight=bank==0 ? w0 : bank==1 ? w1 : w2;
         uint state_base=SHARED ? 0 : bank*2304;
         threadgroup float norm[18],parts[8][ROWS];
         float inv;
@@ -30,7 +31,7 @@ _kernel=mx.fast.metal_kernel(
             for (uint j=0;j<4;++j) {
                 float raw=d<2304 ? state[state_base+d+j]*inv : float(message[bank*2304+d+j-2304]);
                 float x=float(bfloat16_t(raw));
-                for (uint r=0;r<ROWS;++r) dots[r]=fma(x,float(weight[(bank*64+row+r)*4608+d+j]),dots[r]);
+                for (uint r=0;r<ROWS;++r) dots[r]=fma(x,float(weight[(row+r)*4608+d+j]),dots[r]);
             }
         }
         for (uint r=0;r<ROWS;++r) {
@@ -48,16 +49,10 @@ _kernel=mx.fast.metal_kernel(
 )
 
 
-def applicable(state, msg, down, up):
-    return (msg is not None and state.dtype==mx.float32 and msg.dtype in (mx.bfloat16,mx.float32) and state.shape[-1]==2304
-            and down.dtype==mx.bfloat16 and down.shape[-2:]==(64,4608)
-            and up.shape[-2:]==(4608,64) and up.dtype in (mx.bfloat16,mx.float32))
-
-
-def reduce(state,msg,down,inverse=None,widen=False):
+def reduce(state,msg,weights,inverse=None,widen=False):
     banks=msg.size//2304
     rows=2 if inverse is not None else 4
-    return _kernel(inputs=[state,msg,down,state if inverse is None else inverse],
+    return _kernel(inputs=[state,msg,*weights,state if inverse is None else inverse],
                    template=[("ROWS",rows),("SHARED",state.size!=msg.size),("PRECOMPUTED",inverse is not None)],
                    grid=(64//rows*256,banks,1),threadgroup=(256,1,1),
                    output_shapes=[msg.shape[:-1]+(64,)],output_dtypes=[mx.float32 if widen else mx.bfloat16])[0]

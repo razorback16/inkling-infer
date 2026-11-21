@@ -3,7 +3,7 @@ import mlx.core as mx
 from mlx_lm.kernels.common import scalar
 from mlx_lm.models.inkling2 import layers
 
-from .packed_rows import _dot_source
+import mlx.nn as nn
 
 
 _epilogue = """
@@ -64,14 +64,31 @@ _epilogue = """
         }
 """
 def _make_kernel(distinct):
-    inputs=["x","payload","qs","rs","qt","rt","eps","attention_scale","kh","vh","kw","vw"]
+    inputs=["x","query_w","rel_w","gate_w","key_w","value_w","qs","rs","qt","rt","eps","attention_scale","kh","vh","kw","vw"]
     prefix="#pragma clang fp contract(off)\nthreadgroup float values[128]; float value=0; uint sg=simdgroup_index_in_threadgroup;\n"
-    projection=_dot_source.replace("if (!lane) out[group*4+r]=bfloat16_t(dot);",
-        "float projected=simd_broadcast_first(dot); if (lane==r) value=float(bfloat16_t(projected));")
     if distinct:
         inputs+=["kx","vx"]
-        prefix+="uint region=threadgroup_position_in_grid.x; auto input=region<51 ? x : region<59 ? kx : vx;\n"
-        projection=projection.replace("(x+d)","(input+d)")
+    projection="""
+        uint region=threadgroup_position_in_grid.x,lane=thread_index_in_simdgroup;
+        auto input=INPUT;
+        auto weights=region<24 ? query_w : region<27 ? rel_w : region<51 ? gate_w : region<59 ? key_w : value_w;
+        uint first_region=region<24 ? 0 : region<27 ? 24 : region<51 ? 27 : region<59 ? 51 : 59;
+        uint first=(region-first_region)*128+sg*4;
+        float dots[4]={};
+        for (uint col=lane*4;col<2304;col+=128) {
+            float4 v=float4(*(device const bfloat4*)(input+col));
+            for (uint r=0;r<4;++r) {
+                float4 w=float4(*(device const bfloat4*)(weights+(first+r)*2304+col));
+                for (uint j=0;j<4;++j) dots[r]=fma(v[j],w[j],dots[r]);
+            }
+        }
+        for (uint r=0;r<4;++r) {
+            float dot=dots[r];
+            for (ushort j=16;j;j>>=1) dot+=simd_shuffle_down(dot,j);
+            float all=simd_broadcast_first(dot);
+            if (lane==r) value=float(bfloat16_t(all));
+        }
+    """.replace("INPUT","region<51 ? x : region<59 ? kx : vx" if distinct else "x")
     return mx.fast.metal_kernel(
         name="inkling_project_recurrent_heads" if distinct else "inkling_project_complete_heads",input_names=inputs,
         output_names=["q","scaled","rel","gate","pair","k_window","v_window"],source=prefix+projection+_epilogue)
@@ -81,9 +98,12 @@ _kernel=_make_kernel(False)
 _distinct=_make_kernel(True)
 
 
-def compute(layer,x,packed,tiles,conv_states,conv_mask,kv,extra=()):
+def compute(layer,x,conv_states,conv_mask,kv,extra=()):
+    modules=(layer.q_proj,layer.r_proj,layer.gate_proj,layer.k_proj,layer.v_proj)
     if (not getattr(kv,"grouped",False) or layer.sliding_window!=1024 or conv_mask is not None
-            or tiles is None or tiles[0] is not packed or x.dtype!=mx.bfloat16 or packed.shape!=(8576,2304)
+            or x.dtype!=mx.bfloat16 or any(type(p) is not nn.Linear or "bias" in p
+                   or p.weight.shape!=(rows,2304) or p.weight.dtype!=x.dtype
+                   for p,rows in zip(modules,(3072,384,3072,1024,1024)))
             or any(v.shape!=x.shape or v.dtype!=x.dtype for v in extra)
             or (layer.head_dim,layer.num_heads,layer.num_key_value_heads)!=(128,24,8)
             or type(layer.rel_logits_proj) is not layers.RelativeLogits or conv_states is None
@@ -95,7 +115,7 @@ def compute(layer,x,packed,tiles,conv_states,conv_mask,kv,extra=()):
         return None
     kernel=_distinct if extra else _kernel
     q,scaled,rel,gate,pair,kh,vh=kernel(
-        inputs=[x,*tiles[1],layer.q_l2_clip.scale,layer.rel_l2_clip.scale,scalar(layer.q_l2_clip.threshold),
+        inputs=[x,*(p.weight for p in modules),layer.q_l2_clip.scale,layer.rel_l2_clip.scale,scalar(layer.q_l2_clip.threshold),
                 scalar(layer.rel_l2_clip.threshold),scalar(layer.eps),scalar(layer.scaling),*conv_states[:2],kw,vw,*extra],
         template=[("W",kw.dtype)],grid=(8576*8,1,1),threadgroup=(1024,1,1),
         output_shapes=[(1,24,1,128),(1,24,1,128),(1,1,24,16),(1,1,3072),(1,16,1,128),(1,4,1024),(1,4,1024)],

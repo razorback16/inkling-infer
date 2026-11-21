@@ -81,7 +81,7 @@ def attention(layer, x, inputs, cache, conv_states, conv_mask, messages):
             else:
                 states = result
         else:
-            states = layer._mix_messages(states,messages)
+            states = layer._mix_messages(states,messages[0] if isinstance(messages,tuple) else messages)
     weights = [n.weight for n in norms]
     from mlx_lm.kernels.common import scalar
     args = [*states,*weights,scalar(norms[0].eps)]

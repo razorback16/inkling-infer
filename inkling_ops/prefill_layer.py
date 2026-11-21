@@ -1,7 +1,11 @@
 """Finish the two prompt residuals while retaining three convolution samples."""
+from contextvars import ContextVar
+
 import mlx.core as mx
 from mlx_lm.models.cache import ArraysCache
 from mlx_lm.models.inkling2 import layers
+
+_tail_only = ContextVar("inkling_prefill_tail_only", default=False)
 
 _finish = mx.fast.metal_kernel(
     name="inkling_prompt_convolution_residual",
@@ -58,7 +62,11 @@ def run(layer, x, blocks, cache, messages):
     states = list(cache[1].cache)
     normed = layers.unweighted_rms_norm(x.astype(mx.float32))
     inputs = None if layer.attention_input is None else layer.attention_input(blocks,normed)
-    attention = layer._self_attention(x,inputs,cache,states,None,messages)
+    token = _tail_only.set(True)
+    try:
+        attention = layer._self_attention(x,inputs,cache,states,None,messages)
+    finally:
+        _tail_only.reset(token)
     residual, states[2] = finish(attention, states[2], layer.post_attention_convolution, x,
                                  not layer.is_block_boundary, mx.float32)
     if layer.is_block_boundary:
@@ -69,5 +77,5 @@ def run(layer, x, blocks, cache, messages):
         hidden=layer.mlp_message_gate(hidden,messages[...,3,:])
     output=layer.mlp(layer.post_attention_layernorm(hidden).astype(x.dtype))
     y, states[3]=finish(output,states[3],layer.post_mlp_convolution,residual,True,x.dtype)
-    cache[1].cache=[layers._conv_state(h,None,3) for h in states[:2]]+states[2:]
+    cache[1].cache=[h if h.shape[1]==3 else layers._conv_state(h,None,3) for h in states[:2]]+states[2:]
     return y,blocks

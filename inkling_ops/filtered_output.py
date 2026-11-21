@@ -1,7 +1,6 @@
 """Apply attention output projection, temporal filter, and residual in one pass."""
 import mlx.core as mx
 import mlx.nn as nn
-from . import single_row_tiles
 
 _kernel = mx.fast.metal_kernel(
     name="inkling_project_attention_residual",
@@ -41,54 +40,6 @@ _kernel = mx.fast.metal_kernel(
 )
 
 
-_compact_rows = mx.fast.metal_kernel(
-    name="inkling_stream_output_row",input_names=["x","history","conv","hidden","payload","formats"],
-    output_names=["residual","window","squares"],
-    source="""
-        uint lane=thread_index_in_simdgroup, row=thread_position_in_grid.x/32;
-        uint sg=simdgroup_index_in_threadgroup;
-    """ + single_row_tiles.DOT + """
-        threadgroup float values[16];
-        if (!lane) {
-            float v=float(bfloat16_t(dot)),filtered=0;
-            for (uint t=0;t<3;++t) {
-                float old=history[t*2304+row];
-                window[t*2304+row]=old;
-                filtered=fma(float(W(old)),float(conv[row*4+t]),filtered);
-            }
-            filtered=fma(float(W(v)),float(conv[row*4+3]),filtered);
-            window[3*2304+row]=v;
-            float out=float(bfloat16_t((float(W(filtered))+v)*0.4472135954999579f));
-            if (!BOUNDARY) out+=float(hidden[row]);
-            residual[row]=out;
-            values[sg]=out;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (sg%4==0 && !lane) {
-            float norm2=0;
-            for (uint i=0;i<4;++i) norm2+=values[sg+i]*values[sg+i];
-            squares[row/4]=norm2;
-        }
-    """,
-)
-
-
-def prepare(model):
-    arrays=[]
-    for block in model.layers:
-        proj=block.self_attn.o_proj
-        w=proj.weight
-        if type(proj) is not nn.Linear or w.shape!=(2304,3072) or w.dtype!=mx.bfloat16:
-            continue
-        saved=getattr(proj,"_output_rows",None)
-        if saved is None or saved[0] is not w:
-            encoded=single_row_tiles.encode(w)
-            object.__setattr__(proj,"_output_rows",(w,encoded))
-            arrays.extend(encoded)
-    if arrays:
-        mx.eval(arrays)
-
-
 def apply(projection, x, post):
     if (post is None or type(projection) is not nn.Linear or "bias" in projection
             or projection.weight.shape != (2304,3072) or projection.weight.dtype != mx.bfloat16
@@ -96,13 +47,8 @@ def apply(projection, x, post):
         return None
     layer,history,hidden=post
     conv=layer.post_attention_convolution.conv1d.weight
-    saved=getattr(projection,"_output_rows",None)
-    compact=saved is not None and saved[0] is projection.weight
-    kernel=_compact_rows if compact else _kernel
-    inputs=([x,history,conv,hidden,*saved[1]] if compact else
-            [x,projection.weight,history,conv,hidden])
-    return tuple(kernel(inputs=inputs,
+    return tuple(_kernel(inputs=[x,projection.weight,history,conv,hidden],
                          template=[("W",conv.dtype),("BOUNDARY",layer.is_block_boundary),("COLS",3072)],
-                         grid=((2304 if compact else 576)*32,1,1),threadgroup=(512 if compact else 128,1,1),
+                         grid=(576*32,1,1),threadgroup=(128,1,1),
                          output_shapes=[hidden.shape,(1,4,2304),(576,)],
                          output_dtypes=[mx.float32]*3))

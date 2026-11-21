@@ -1,9 +1,11 @@
-"""Grouped NVFP4 prompt GEMM with the checkpoint's BF16 coefficient values."""
+"""Grouped prompt GEMM consuming the original packed checkpoint weights and scales."""
 from functools import lru_cache
 from pathlib import Path
 import re
 
 import mlx.core as mx
+
+ROWS_PER_TILE = 32
 
 # Offsets and tile descriptors are shared by the gate and down projections.
 _offsets = mx.fast.metal_kernel(
@@ -30,8 +32,8 @@ _schedule = mx.fast.metal_kernel(
         uint row=0,count=0;
         if (lo<128) {
             uint first=lo ? ends[lo-1] : 0;
-            row=offsets[lo]+16*(tile-first);
-            count=min(16u,offsets[lo+1]-row);
+            row=offsets[lo]+BM*(tile-first);
+            count=min(uint(BM),offsets[lo+1]-row);
         }
         tiles[3*tile]=row; tiles[3*tile+1]=lo; tiles[3*tile+2]=count;
     """,
@@ -39,12 +41,13 @@ _schedule = mx.fast.metal_kernel(
 
 
 def schedule(ids):
+    bm = ROWS_PER_TILE
     m=ids.size
     offsets,=_offsets(inputs=[ids],template=[("M",m)],grid=(129,1,1),threadgroup=(32,1,1),
                       output_shapes=[(129,)],output_dtypes=[mx.uint32])
-    ends=mx.cumsum((offsets[1:]-offsets[:-1]+15)//16)
-    size=(m+15)//16+128
-    return _schedule(inputs=[offsets,ends],grid=(size,1,1),threadgroup=(64,1,1),
+    ends=mx.cumsum((offsets[1:]-offsets[:-1]+bm-1)//bm)
+    size=(m+bm-1)//bm+128
+    return _schedule(inputs=[offsets,ends],template=[("BM",bm)],grid=(size,1,1),threadgroup=(64,1,1),
                      output_shapes=[(size,3)],output_dtypes=[mx.uint32])[0]
 
 
@@ -63,65 +66,95 @@ def kernel():
         contents=(root/name).read_text().replace("#pragma once","")
         return re.sub(r'^#include "([^"]+)"',lambda m:include(m[1]),contents,flags=re.M)
     return mx.fast.metal_kernel(
-        name="inkling_prompt_lookup_gemm",input_names=["x","w","scales","table","tiles","activation","token_rows","original_slots"],
-        output_names=["out"],header=include(mma),source="""
-            uint tile=threadgroup_position_in_grid.y, row=tiles[3*tile], expert=tiles[3*tile+1];
+        name="inkling_prompt_lookup_gemm",input_names=["x","w","scales","table","global_scale","tiles","activation","token_rows","original_slots"],
+        output_names=["out"],header=include(mma)+"\nconstant float fp4[16]={0,.5,1,1.5,2,3,4,6,-0.f,-.5,-1,-1.5,-2,-3,-4,-6};\n",source="""
+            uint tile=threadgroup_position_in_grid.y*SWIZZLE+threadgroup_position_in_grid.x%SWIZZLE;
+            if (tile>=TILES) return;
+            uint row=tiles[3*tile], expert=tiles[3*tile+1];
             uint count=tiles[3*tile+2];
             if (!count) return;
-            uint column=threadgroup_position_in_grid.x*64, tid=thread_position_in_threadgroup.x;
-            mlx::steel::BlockMMA<bfloat16_t,bfloat16_t,16,64,32,1,4,false,true,40,40>
+            uint column=(threadgroup_position_in_grid.x/SWIZZLE)*BN, tid=thread_position_in_threadgroup.x;
+            constexpr short stride=BK;
+            constexpr uint threads=WM*WN*32;
+            // The workgroup decodes just this panel. All persistent inputs are
+            // the checkpoint words, scales, or checkpoint-independent codebooks.
+            threadgroup bfloat16_t Ws[BN*stride];
+            mlx::steel::BlockMMA<bfloat16_t,bfloat16_t,BM,BN,BK,WM,WN,false,true,stride,stride>
                 mma(simdgroup_index_in_threadgroup,thread_index_in_simdgroup);
-            uint input_rows[2];
-            uint fn=((thread_index_in_simdgroup/4)&2)*2+(thread_index_in_simdgroup%2)*2;
-            for (uint i=0;i<2;++i) {
-                uint at=row+min(uint(mma.sm)+i*8,count-1);
+            uint lane=thread_index_in_simdgroup;
+            uint fn=((lane/4)&2)*2+(lane%2)*2;
+            uint input_rows[BM/(WM*8)];
+            for (short i=0;i<BM/(WM*8);++i) {
+                uint at=row+min(uint(mma.sm)+i*(8*WM),count-1);
                 input_rows[i]=GATHER ? token_rows[at] : at;
             }
-            for (uint k=0;k<K;k+=32) {
-                uint tile=((expert*(N/64)+column/64)*(K/32)+k/32);
-                for (short frag=0;frag<4;++frag) {
-                    for (short i=0;i<2;++i) {
-                        uint addr=input_rows[i]*K+k+frag*8+fn;
-                        mma.Atile.frag_at(i,0)=float2(*(device const bfloat2*)(x+addr));
+            for (uint k=0;k<K;k+=BK) {
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (uint v=tid*16;v<BN*BK;v+=threads*16) {
+                    uint wr=v/BK,wc=v%BK;
+                    uint weight_row=expert*N+column+wr;
+                    if (MX8) {
+                        uint scale=scales[weight_row*(K/32)+(k+wc)/32];
+                        uint4 words=*(device const uint4*)(w+weight_row*(K/4)+(k+wc)/4);
+                        for (ushort j=0;j<16;++j)
+                            Ws[wr*stride+wc+j]=bfloat16_t(table[(scale<<8)+((words[j/4]>>((j%4)*8))&255)]);
+                    } else {
+                        uint scale=scales[weight_row*(K/16)+(k+wc)/16];
+                        float factor=(global_scale[expert]/2688.f)*table[scale];
+                        uint2 words=*(device const uint2*)(w+weight_row*(K/8)+(k+wc)/8);
+                        for (ushort j=0;j<16;++j)
+                            Ws[wr*stride+wc+j]=bfloat16_t(factor*fp4[(words[j/8]>>((j%8)*4))&15]);
                     }
-                    for (short j=0;j<2;++j) {
-                        uint nfrag=simdgroup_index_in_threadgroup%4+4*j;
-                        uint at=((tile*32+frag*8+nfrag)*32+thread_index_in_simdgroup);
-                        mma.Btile.frag_at(0,j)=float2(((device const bfloat2*)w)[at]);
-                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (short kk=0;kk<BK;kk+=8) {
+                    for (short i=0;i<BM/(8*WM);++i)
+                        mma.Atile.frag_at(i,0)=float2(*(device const bfloat2*)(x+input_rows[i]*K+k+kk+fn));
+                    mma.Btile.template load<bfloat16_t,1,WN,1,stride>(Ws+mma.Bs_offset+kk);
                     mlx::steel::tile_matmad(mma.Ctile,mma.Atile,mma.Btile,mma.Ctile);
                 }
             }
             if (GATED) {
-                for (short i=0;i<2;++i) {
-                    uint r=mma.sm+i*8;
+                for (short i=0;i<BM/(WM*8);++i) {
+                    uint r=mma.sm+i*(8*WM);
                     if (r>=count) continue;
-                    for (short j=0;j<2;++j) {
+                    for (short j=0;j<BN/(8*WN);++j) {
                         float2 frag=mma.Ctile.frag_at(i,j);
                         ushort g=as_type<ushort>(bfloat16_t(frag.x));
                         ushort u=as_type<ushort>(bfloat16_t(frag.y));
                         uint gi=((uint(g)&32767)<<2)|((g>>15)<<1);
                         uint ui=((uint(u)&32767)<<2)|((u>>15)<<1);
-                        uint c=column+mma.sn+j*32;
+                        uint c=column+mma.sn+j*(8*WN);
                         out[(row+r)*(N/2)+c/2]=bfloat16_t(activation[gi]*activation[ui+1]);
                     }
                 }
             } else if (ROUTE_LAYOUT) {
-                for (short i=0;i<2;++i) {
-                    uint r=mma.sm+i*8;
+                for (short i=0;i<BM/(WM*8);++i) {
+                    uint r=mma.sm+i*(8*WM);
                     if (r>=count) continue;
                     uint original=original_slots[row+r], token=original/8, slot=original%8;
-                    uint base=((token*(N/64)+column/64)*8+slot)*64;
-                    for (short j=0;j<2;++j)
-                        *(device bfloat2*)(out+base+mma.sn+j*32)=bfloat2(mma.Ctile.frag_at(i,j));
+                    for (short j=0;j<BN/(8*WN);++j) {
+                        uint channel=column+mma.sn+j*(8*WN);
+                        uint pos=((token*(N/64)+channel/64)*8+slot)*64+channel%64;
+                        *(device bfloat2*)(out+pos)=bfloat2(mma.Ctile.frag_at(i,j));
+                    }
                 }
             } else {
                 auto result=out+row*N+column;
-                if (count==16) mma.store_result(result,N);
-                else mma.store_result_safe(result,N,short2(64,count));
+                if (count==BM) mma.store_result(result,N);
+                else mma.store_result_safe(result,N,short2(BN,count));
             }
         """,
     )
+
+
+@lru_cache(maxsize=1)
+def mx8_codebook():
+    from .expert_gate import mx_codes
+    codes=mx_codes()
+    values=(codes[256:,None]*codes[None,:256]).astype(mx.bfloat16)
+    mx.eval(values)
+    return values
 
 
 def applicable(proj):
@@ -129,74 +162,23 @@ def applicable(proj):
     nv=(mode=="nvfp4" and proj.bits==4 and proj.group_size==16 and proj.global_scale is not None
         and proj.global_scale.shape==(128,))
     mx8=(mode=="mxfp8" and proj.bits==8 and proj.group_size==32 and proj.global_scale is None)
-    return (mx.device_info()["memory_size"] >= 192*1024**3 and (nv or mx8)
+    return ((nv or mx8)
             and "bias" not in proj and proj.weight.dtype==mx.uint32 and proj.scales.dtype==mx.uint8
-            and proj.weight.shape[0]==128 and proj.input_dims%32==0 and proj.output_dims%64==0)
-
-
-@lru_cache(maxsize=1)
-def mx8_coefficients():
-    from .expert_gate import mx_codes
-    codes=mx_codes()
-    table=(codes[256:,None]*codes[None,:256]).astype(mx.bfloat16)
-    mx.eval(table)
-    return table
-
-
-_expand = mx.fast.metal_kernel(
-    name="inkling_prompt_expand_expert_tiles",input_names=["weight","scales","table"],output_names=["data"],
-    source="""
-        uint index=thread_position_in_grid.x,tile=index/1024;
-        uint expert=tile/((N/64)*(K/32)), nb=(tile/(K/32))%(N/64), kb=tile%(K/32);
-        uint frag=(index/32)%32,lane=index%32;
-        uint fm=((lane/4)&4)+(lane/2)%4, fn=((lane/4)&2)*2+(lane%2)*2;
-        uint k=kb*32+(frag/8)*8+fm, row=expert*N+nb*64+(frag%8)*8+fn;
-        for (ushort j=0;j<2;++j) {
-            if (MX8) {
-                uint bits=weight[(row+j)*(K/4)+k/4];
-                uint scale=scales[(row+j)*(K/32)+k/32];
-                data[index*2+j]=table[scale*256+((bits>>((k%4)*8))&255)];
-            } else {
-            uint bits=weight[(row+j)*(K/8)+k/8];
-            uint scale=scales[(row+j)*(K/16)+k/16];
-            data[index*2+j]=table[(expert*256+scale)*16+((bits>>((k%8)*4))&15)];
-            }
-        }
-    """,
-)
-
-
-def expanded_tiles(proj,table):
-    saved=getattr(proj,"_prompt_expanded_tiles",None)
-    if saved is None or saved[0] is not proj.weight or saved[1] is not proj.scales or saved[2] is not table:
-        e,n,k=proj.num_experts,proj.output_dims,proj.input_dims
-        data,=_expand(inputs=[proj.weight,proj.scales,table],template=[("N",n),("K",k),("MX8",proj.mode=="mxfp8")],
-                      grid=(e*n*k//2,1,1),threadgroup=(128,1,1),
-                      output_shapes=[(e,n//64,k//32,64,32)],output_dtypes=[mx.bfloat16])
-        mx.eval(data)
-        saved=(proj.weight,proj.scales,table,data)
-        object.__setattr__(proj,"_prompt_expanded_tiles",saved)
-    return saved[3]
+            and proj.weight.shape[0]==128 and proj.input_dims%64==0 and proj.output_dims%64==0)
 
 
 def project(proj, x, tiles, activation=None, token_rows=None, original_slots=None):
-    scale=proj.global_scale
-    saved=getattr(proj,"_prompt_coefficients",None)
-    if saved is None or saved[0] is not scale:
-        if proj.mode=="mxfp8":
-            table=mx8_coefficients()
-        else:
-            codes=mx.array([0,.5,1,1.5,2,3,4,6,-0.,-.5,-1,-1.5,-2,-3,-4,-6],mx.float32)
-            fp8=mx.from_fp8(mx.arange(256).astype(mx.uint8),mx.float32)
-            table=((scale[:,None,None]/2688*fp8[None,:,None])*codes).astype(mx.bfloat16)
-            mx.eval(table)
-        saved=(scale,table)
-        object.__setattr__(proj,"_prompt_coefficients",saved)
+    bm, bn, bk, wm, wn = ROWS_PER_TILE, 64, 64, 1, 2
+    swizzle = 16
+    threads=32*wm*wn
+    from .expert_gate import mx_codes
+    table=mx8_codebook() if proj.mode=="mxfp8" else mx_codes()
+    scale=proj.global_scale if proj.global_scale is not None else table
     n=proj.output_dims
     width=n//2 if activation is not None else n
     m=x.shape[0] if token_rows is None else token_rows.size
-    return kernel()(inputs=[x,expanded_tiles(proj,saved[1]),proj.scales,saved[1],tiles,x if activation is None else activation,
+    return kernel()(inputs=[x,proj.weight,proj.scales,table,scale,tiles,x if activation is None else activation,
                             tiles if token_rows is None else token_rows,tiles if original_slots is None else original_slots],
-                    template=[("K",proj.input_dims),("N",n),("GATED",activation is not None),("GATHER",token_rows is not None),("ROUTE_LAYOUT",original_slots is not None)],
-                    grid=(n//64*128,tiles.shape[0],1),threadgroup=(128,1,1),
+                    template=[("SWIZZLE",swizzle),("TILES",tiles.shape[0]),("BM",bm),("BN",bn),("BK",bk),("WM",wm),("WN",wn),("MX8",proj.mode=="mxfp8"),("K",proj.input_dims),("N",n),("GATED",activation is not None),("GATHER",token_rows is not None),("ROUTE_LAYOUT",original_slots is not None)],
+                    grid=(n//bn*threads*swizzle,(tiles.shape[0]+swizzle-1)//swizzle,1),threadgroup=(threads,1,1),
                     output_shapes=[(m,1,width)],output_dtypes=[x.dtype])[0]

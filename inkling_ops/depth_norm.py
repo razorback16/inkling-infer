@@ -175,8 +175,9 @@ def normalized_source(filtered=False):
 
 _normalized_inputs = mx.fast.metal_kernel(
     name="inkling_depth_attention_input_norm",
-    input_names=["x","blocks","queries","weights","eps","closed"], output_names=["mixed","normalized"],
-    source=cached_source(normalized_source()),
+    input_names=["x","blocks","queries","qw","kw","vw","eps","closed"], output_names=["mixed","normalized"],
+    source=cached_source(normalized_source()).replace(
+        "weights[col]", "(query==0 ? qw : query==1 ? kw : vw)[tid*4+j]"),
 )
 _mlp_inputs = mx.fast.metal_kernel(
     name="inkling_depth_mlp_input_norm",
@@ -193,19 +194,11 @@ def attention_inputs(layer, blocks, x):
         norms = (layer.q_input_layernorm, layer.k_input_layernorm, layer.v_input_layernorm)
     if any(type(norm) is not nn.RMSNorm or norm.eps != norms[0].eps for norm in norms):
         return None
-    weights = tuple(norm.weight for norm in norms)
-    if len(weights) == 1:
-        joined = weights[0]
-    else:
-        saved = getattr(layer, "_attention_norm_weights", None)
-        if saved is None or any(a is not b for a,b in zip(saved[0],weights)):
-            saved = (weights, mx.concatenate(weights))
-            object.__setattr__(layer, "_attention_norm_weights", saved)
-        joined = saved[1]
     q = len(norms)
+    weights = [n.weight for n in (norms * 3 if q == 1 else norms)]
     closed, config = block_lookahead.lookup(layer.attention_input, blocks)
     states, normalized = _normalized_inputs(
-        inputs=[x,blocks,layer.attention_input.query,joined,scalar(norms[0].eps),closed],
+        inputs=[x,blocks,layer.attention_input.query,*weights,scalar(norms[0].eps),closed],
         template=[("K",blocks.shape[0]), *config], grid=(q*576,1,1), threadgroup=(576,1,1),
         output_shapes=[(1,q,2304),x.shape],output_dtypes=[mx.bfloat16,mx.float32])
     inputs = (states,)*3 if q==1 else tuple(mx.split(states,3,axis=1))

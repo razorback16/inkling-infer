@@ -53,10 +53,9 @@ def mix(layer, x):
         inputs=[ids,order],grid=(ids.size,1,1),threadgroup=(min(ids.size,256),1,1),
         output_shapes=[ids.shape]*3,output_dtypes=[mx.uint32,ids.dtype,mx.uint32],
     )
-    hidden=x.reshape(-1,1,x.shape[-1])[rows]
     experts = layer.experts
     from . import prefill_qmm
-    custom=(hidden.shape[0]>=4096 and prefill_qmm.applicable(experts.gate_up_proj)
+    custom=(ids.size>=4096 and prefill_qmm.applicable(experts.gate_up_proj)
             and prefill_qmm.applicable(experts.down_proj) and prefill_qmm.kernel() is not None)
     tiles=prefill_qmm.schedule(sorted_ids) if custom else None
     tabled=(type(experts.act_fn) is layers.SoftcappedSwiGLU and x.dtype==mx.bfloat16
@@ -65,6 +64,7 @@ def mix(layer, x):
         from .expert_gate import activation_tables
         active=prefill_qmm.project(experts.gate_up_proj,x.reshape(-1,1,x.shape[-1]),tiles,activation_tables(),rows)
     else:
+        hidden=x.reshape(-1,1,x.shape[-1])[rows]
         gated=(prefill_qmm.project(experts.gate_up_proj,hidden,tiles) if custom
                else experts.gate_up_proj(hidden,sorted_ids,sorted_indices=True))
         if tabled and gated.shape[-1]%8==0:
