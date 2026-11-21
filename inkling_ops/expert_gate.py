@@ -10,9 +10,11 @@ _kernel = mx.fast.metal_kernel(
     input_names=["x", "ids", "packed", "scales", "amax", "gate_lut", "up_lut"],
     output_names=["out"],
     header="""
-        constant float levels[16] = {
-            0, .5, 1, 1.5, 2, 3, 4, 6, -0., -.5, -1, -1.5, -2, -3, -4, -6
-        };
+        inline float fp4_value(uint code) {
+            uint magnitude = (0xc8643210u >> (4 * (code & 7u))) & 15u;
+            uint positive = as_type<uint>(float(magnitude) * .5f);
+            return as_type<float>(positive | ((code & 8u) << 28));
+        }
         inline float fp8_scale(uchar bits) {
             ushort mag = bits & 127;
             ushort raw = (mag << 7) | (((mag + 1) >> 7) << 14) | ((bits & 128) << 8);
@@ -34,8 +36,8 @@ _kernel = mx.fast.metal_kernel(
                 uint bits = packed[row * 288 + word];
                 float partial = 0.f;
                 for (uint i = 0; i < 8; i += 4) {
-                    partial += v[i] * levels[bits & 15] + v[i+1] * levels[(bits >> 4) & 15]
-                             + v[i+2] * levels[(bits >> 8) & 15] + v[i+3] * levels[(bits >> 12) & 15];
+                    partial += v[i] * fp4_value(bits & 15) + v[i+1] * fp4_value((bits >> 4) & 15)
+                             + v[i+2] * fp4_value((bits >> 8) & 15) + v[i+3] * fp4_value((bits >> 12) & 15);
                     bits >>= 16;
                 }
                 float term = partial * fp8_scale(scales[row * 144 + word / 2]);

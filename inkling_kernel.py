@@ -51,9 +51,11 @@ def _make_down(finish):
         name="inkling_finish_nvfp4_layer" if finish else "inkling_nvfp4_down_mix",
         input_names=inputs, output_names=outputs,
     header="""
-        constant float fp4_values[16] = {
-            0, .5, 1, 1.5, 2, 3, 4, 6, -0., -.5, -1, -1.5, -2, -3, -4, -6
-        };
+        inline float fp4_value(uint code) {
+            uint magnitude = (0xc8643210u >> (4 * (code & 7u))) & 15u;
+            uint positive = as_type<uint>(float(magnitude) * .5f);
+            return as_type<float>(positive | ((code & 8u) << 28));
+        }
 
         inline float decode_scale(uchar bits) {
             ushort magnitude = bits & 127;
@@ -80,10 +82,10 @@ def _make_down(finish):
                 uint q = packed[row * 144 + word];
                 float chunk = 0;
                 for (uint k = 0; k < 8; k += 4) {
-                    chunk += x[k] * fp4_values[q & 15]
-                           + x[k+1] * fp4_values[(q >> 4) & 15]
-                           + x[k+2] * fp4_values[(q >> 8) & 15]
-                           + x[k+3] * fp4_values[(q >> 12) & 15];
+                    chunk += x[k] * fp4_value(q & 15)
+                           + x[k+1] * fp4_value((q >> 4) & 15)
+                           + x[k+2] * fp4_value((q >> 8) & 15)
+                           + x[k+3] * fp4_value((q >> 12) & 15);
                     q >>= 16;
                 }
                 float term = decode_scale(scales[row * 72 + word / 2]) * chunk;
