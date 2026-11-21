@@ -4,5 +4,6 @@ model_list:
       model: openai/thinkingmachines/Inkling-2-Mini
       api_base: http://127.0.0.1:8089/v1
       api_key: local
+      use_chat_completions_api: true
 litellm_settings:
   drop_params: true
