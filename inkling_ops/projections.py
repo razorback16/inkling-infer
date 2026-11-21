@@ -59,32 +59,24 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
     elif filtered is None and not fused_norm:
         key, conv_states[0] = layer.k_sconv(key, conv_states[0], conv_mask)
         value, conv_states[1] = layer.v_sconv(value, conv_states[1], conv_mask)
-    kv = cache[0] if cache is not None else None
-    tau = None
-    if full:
-        scales = getattr(kv, "position_scales", None)
-        key_scale = (layer.log_scaling_alpha, layer.log_scaling_n_floor)
-        tau = scales.get(key_scale) if scales is not None else None
-        if tau is None:
-            offset = kv.offset if kv is not None else 0
-            pos = (offset.reshape(1,1) if scales is not None else layers._positions(offset,1)).astype(mx.float32)
-            tau = 1.0 + layer.log_scaling_alpha * mx.log(mx.maximum((pos+1)/layer.log_scaling_n_floor,1.0))
-            if scales is not None:
-                scales[key_scale] = tau
     pair = None
     if fused_norm:
         filters = [*conv_states[:2],layer.k_sconv.conv1d.weight,layer.v_sconv.conv1d.weight]
         query, pair, rel, conv_states[:2] = normalize(layer,query,key,value,relative,filters=filters)
         key,value = mx.split(pair,2,axis=2)
     elif layer.head_dim == 128 and relative.shape[-1] // layer.num_heads <= 128:
-        query, key, value, rel, pair = normalize(layer, query, key, value, relative, return_pair=True, tau=tau)
+        query, key, value, rel, pair = normalize(layer, query, key, value, relative, return_pair=True)
     else:
         query = layer.q_l2_clip(query.reshape(1, 1, layer.num_heads, -1))
         key = layer.k_l2_clip(key.reshape(1, 1, layer.num_key_value_heads, -1))
         value = value.reshape(1, 1, layer.num_key_value_heads, -1)
         value = layers.unweighted_rms_norm(value.astype(mx.float32), layer.eps).astype(value.dtype)
         rel = layer.rel_l2_clip(relative.reshape(1, 1, layer.num_heads, -1))
-    if full and pair is None:
+    kv = cache[0] if cache is not None else None
+    if full:
+        offset = kv.offset if kv is not None else 0
+        pos = layers._positions(offset, 1).astype(mx.float32)
+        tau = 1.0 + layer.log_scaling_alpha * mx.log(mx.maximum((pos + 1) / layer.log_scaling_n_floor, 1.0))
         query = (query.astype(mx.float32) * tau[..., None, None]).astype(query.dtype)
         rel = (rel.astype(mx.float32) * tau[..., None, None]).astype(rel.dtype)
     q, k, v = (x.transpose(0, 2, 1, 3) for x in (query, key, value))

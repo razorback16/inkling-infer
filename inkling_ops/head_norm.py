@@ -47,11 +47,6 @@ _inputs = ["q", "k", "v", "r", "qs", "rs", "threshold", "rel_threshold", "eps"]
 _outputs = ["qo", "kvo", "ro"]
 _kernel = mx.fast.metal_kernel(name="inkling_head_norm", input_names=_inputs,
                                output_names=_outputs, source=_source)
-_scaled = mx.fast.metal_kernel(
-    name="inkling_head_norm_position", input_names=_inputs + ["tau"], output_names=_outputs,
-    source=_source.replace("            if (query) qo",
-                           "            if (query || rel) x=T(float(x)*tau[0]);\n            if (query) qo"),
-)
 _filter = """
             if (key || val) {
                 auto history = key ? kh : vh;
@@ -76,7 +71,7 @@ _filtered = mx.fast.metal_kernel(
 
 
 
-def normalize(layer, query, key, value, relative, return_pair=False, filters=None, tau=None):
+def normalize(layer, query, key, value, relative, return_pair=False, filters=None):
     heads, kv, dim = layer.num_heads, layer.num_key_value_heads, layer.head_dim
     rel = relative.shape[-1] // heads
     inputs = [query, key, value, relative, layer.q_l2_clip.scale, layer.rel_l2_clip.scale,
@@ -91,9 +86,6 @@ def normalize(layer, query, key, value, relative, return_pair=False, filters=Non
         types.extend([mx.float32] * 2)
         template.append(("W", filters[2].dtype))
         kernel = _filtered
-    elif tau is not None:
-        kernel = _scaled
-        inputs.append(tau.reshape(1))
     q, pair, r, *windows = kernel(
         inputs=inputs, template=template, grid=(32*(2*heads+2*kv),1,1), threadgroup=(32,1,1),
         output_shapes=shapes, output_dtypes=types)
