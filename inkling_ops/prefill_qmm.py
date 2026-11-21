@@ -63,13 +63,15 @@ def kernel():
         contents=(root/name).read_text().replace("#pragma once","")
         return re.sub(r'^#include "([^"]+)"',lambda m:include(m[1]),contents,flags=re.M)
     return mx.fast.metal_kernel(
-        name="inkling_prompt_lookup_gemm",input_names=["x","w","scales","table","tiles","activation"],
+        name="inkling_prompt_lookup_gemm",input_names=["x","w","scales","table","tiles","activation","token_rows"],
         output_names=["out"],header=include(mma),source="""
             uint tile=threadgroup_position_in_grid.y, row=tiles[3*tile], expert=tiles[3*tile+1];
             uint count=tiles[3*tile+2];
             if (!count) return;
             uint column=threadgroup_position_in_grid.x*64, tid=thread_position_in_threadgroup.x;
             uint xr=tid/4, xc=(tid%4)*8, wr=tid/2, wc=(tid%2)*16;
+            uint input_row=row+xr;
+            if (GATHER && xr<count) input_row=token_rows[input_row];
             uint weight_row=expert*N+column+wr;
             threadgroup bfloat16_t Xs[32*40], Ws[64*40];
             mlx::steel::BlockMMA<bfloat16_t,bfloat16_t,32,64,32,2,2,false,true,40,40>
@@ -78,7 +80,7 @@ def kernel():
                 threadgroup_barrier(mem_flags::mem_threadgroup);
                 for (ushort j=0;j<8;j+=4) {
                     bfloat4 v=0;
-                    if (xr<count) v=*(device const bfloat4*)(x+(row+xr)*K+k+xc+j);
+                    if (xr<count) v=*(device const bfloat4*)(x+input_row*K+k+xc+j);
                     *(threadgroup bfloat4*)(Xs+xr*40+xc+j)=v;
                 }
                 uint scale=scales[weight_row*(K/16)+(k+wc)/16];
@@ -119,7 +121,7 @@ def applicable(proj):
             and proj.weight.shape[0]==128 and proj.input_dims%32==0 and proj.output_dims%64==0)
 
 
-def project(proj, x, tiles, activation=None):
+def project(proj, x, tiles, activation=None, token_rows=None):
     scale=proj.global_scale
     saved=getattr(proj,"_prompt_coefficients",None)
     if saved is None or saved[0] is not scale:
@@ -131,7 +133,9 @@ def project(proj, x, tiles, activation=None):
         object.__setattr__(proj,"_prompt_coefficients",saved)
     n=proj.output_dims
     width=n//2 if activation is not None else n
-    return kernel()(inputs=[x,proj.weight,proj.scales,saved[1],tiles,x if activation is None else activation],
-                    template=[("K",proj.input_dims),("N",n),("GATED",activation is not None)],
+    m=x.shape[0] if token_rows is None else token_rows.size
+    return kernel()(inputs=[x,proj.weight,proj.scales,saved[1],tiles,x if activation is None else activation,
+                            tiles if token_rows is None else token_rows],
+                    template=[("K",proj.input_dims),("N",n),("GATED",activation is not None),("GATHER",token_rows is not None)],
                     grid=(n//64*128,tiles.shape[0],1),threadgroup=(128,1,1),
-                    output_shapes=[(*x.shape[:-1],width)],output_dtypes=[x.dtype])[0]
+                    output_shapes=[(m,1,width)],output_dtypes=[x.dtype])[0]

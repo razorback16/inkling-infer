@@ -63,7 +63,7 @@ def mix(layer, x):
             and experts.act_fn.gate_softcap==4 and experts.act_fn.up_softcap==25)
     if custom and tabled:
         from .expert_gate import activation_tables
-        active=prefill_qmm.project(experts.gate_up_proj,hidden,tiles,activation_tables())
+        active=prefill_qmm.project(experts.gate_up_proj,x.reshape(-1,1,x.shape[-1]),tiles,activation_tables(),rows)
     else:
         gated=(prefill_qmm.project(experts.gate_up_proj,hidden,tiles) if custom
                else experts.gate_up_proj(hidden,sorted_ids,sorted_indices=True))
