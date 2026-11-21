@@ -6,7 +6,7 @@ from mlx_lm.models.inkling2 import layers
 _full = layers.FullDecoderLayer._self_attention
 _sliding = layers.SlidingDecoderLayer._self_attention
 _kernel = mx.fast.metal_kernel(
-    name="inkling_three_input_norm", input_names=["q","k","v","qw","kw","vw","eps"], output_names=["qo","ko","vo"],
+    name="inkling_three_input_norm", input_names=["q","k","v","qw","kw","vw","eps"], output_names=["qo","kv"],
     source="""
         uint h = threadgroup_position_in_grid.x;
         uint tid = thread_position_in_threadgroup.x, lane = thread_index_in_simdgroup;
@@ -28,8 +28,8 @@ _kernel = mx.fast.metal_kernel(
             uint d = tid*4+i;
             float x = float(A(values[i]*scale));
             if (h==0) qo[d] = T(x*float(qw[d]));
-            else if (h==1) ko[d] = T(x*float(kw[d]));
-            else vo[d] = T(x*float(vw[d]));
+            else if (h==1) kv[d] = T(x*float(kw[d]));
+            else kv[2304+d] = T(x*float(vw[d]));
         }
     """,
 )
@@ -53,10 +53,11 @@ def attention(layer, x, inputs, cache, conv_states, conv_mask, messages):
         states = layer._mix_messages(states, messages)
     weights = [n.weight for n in norms]
     from mlx_lm.kernels.common import scalar
-    q,k,v = _kernel(inputs=[*states,*weights,scalar(norms[0].eps)],
+    q,kv = _kernel(inputs=[*states,*weights,scalar(norms[0].eps)],
                     template=[("A",mx.result_type(states[0],weights[0])),("T",x.dtype)],
                     grid=(3*576,1,1),threadgroup=(576,1,1),
-                    output_shapes=[x.shape]*3,output_dtypes=[x.dtype]*3)
+                    output_shapes=[x.shape,(2,1,2304)],output_dtypes=[x.dtype]*2)
+    k,v = mx.split(kv,2,axis=0)
     return layer.self_attn(q,k,v,cache=cache,conv_states=conv_states,conv_mask=conv_mask)
 
 

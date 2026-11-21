@@ -39,6 +39,17 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
     sinks = layer.sink_proj(hidden_states)
     if same:
         key, value = parts[3:]
+    elif (type(layer.k_proj) is nn.Linear and type(layer.v_proj) is nn.Linear
+            and "bias" not in layer.k_proj and "bias" not in layer.v_proj
+            and layer.k_proj.weight.shape == layer.v_proj.weight.shape
+            and key_hidden_states.dtype == value_hidden_states.dtype):
+        kw, vw = layer.k_proj.weight, layer.v_proj.weight
+        saved = getattr(layer, "_native_paired_kv", None)
+        if saved is None or saved[0] is not kw or saved[1] is not vw:
+            saved = (kw, vw, mx.stack((kw,vw)).swapaxes(-1,-2))
+            object.__setattr__(layer, "_native_paired_kv", saved)
+        both = mx.concatenate((key_hidden_states,value_hidden_states),axis=0) @ saved[2]
+        key, value = mx.split(both,2,axis=0)
     else:
         key = layer.k_proj(key_hidden_states)
         value = layer.v_proj(value_hidden_states)
