@@ -28,7 +28,7 @@ def _apply(states, messages, down, up, normalized=None, inverse=None):
     return (1 - forget) * states + gain * messages
 
 
-def mix_messages(layer, states, messages, packed_states=None, inverse=None):
+def mix_messages(layer, states, messages, packed_states=None, inverse=None, with_sums=False):
     normalized = None
     if isinstance(messages,tuple):
         messages, normalized = messages
@@ -51,6 +51,10 @@ def mix_messages(layer, states, messages, packed_states=None, inverse=None):
          else mx.concatenate(states,axis=0))
     msg = messages.reshape(4, 1, -1)[:3]
     prepared = None if normalized is None else normalized.reshape(4,1,-1)[:3]
+    if with_sums and prepared_reduce.applicable(x,prepared,cache[1],cache[2]):
+        reduced = prepared_reduce.reduce(x,prepared,cache[1],inverse)
+        outputs, sums = apply(reduced,cache[2],x,msg,with_sums=True)
+        return tuple(mx.split(outputs,3,axis=0)), sums
     outputs = _apply(x, msg, cache[1], cache[2], prepared, inverse)
     return tuple(mx.split(outputs, 3, axis=0))
 
