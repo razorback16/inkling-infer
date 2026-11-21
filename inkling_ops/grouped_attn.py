@@ -95,22 +95,22 @@ _merge = mx.fast.metal_kernel(
     source="""
         uint lane = thread_index_in_simdgroup;
         uint head = threadgroup_position_in_grid.y;
-        uint d = (thread_position_in_grid.x/32)*4;
+        uint d = (thread_position_in_grid.x/32)*2;
         uint i = head*128 + lane;
         float peak = -FLT_MAX;
         for (uint n=0; n<128; n+=32) peak = max(peak,stats[(i+n)*2]);
         peak = simd_max(peak);
-        float4 acc = 0;
+        float2 acc = 0;
         float z = 0;
         for (uint n=0; n<128; n+=32) {
             float a = fast::exp(stats[(i+n)*2] - peak);
             z += a*stats[(i+n)*2+1];
-            for (uint j=0; j<4; ++j) acc[j] += a*float(partial[(i+n)*128+d+j]);
+            for (uint j=0; j<2; ++j) acc[j] += a*float(partial[(i+n)*128+d+j]);
         }
         z = simd_sum(z);
-        for (uint j=0; j<4; ++j) {
+        for (uint j=0; j<2; ++j) {
             float output = float(T(simd_sum(acc[j])/z));
-            if (!lane) {
+            if (lane==j) {
                 uint col = head*128+d+j;
                 float g = float(gate[col]);
                 float denom = 1.f/(1.f+precise::exp(abs(g)));
@@ -154,5 +154,5 @@ def attend(layer,q,k,v,rel,sinks,cache,gate,scaled_query=None):
         grid=(128*32,heads,1),threadgroup=(128,1,1),
         output_shapes=[(heads,128,128),(heads,128,2)],output_dtypes=[q.dtype,mx.float32])
     return _merge(inputs=[parts,stats,gate],template=[("T",q.dtype)],
-                  grid=(32*32,heads,1),threadgroup=(128,1,1),
+                  grid=(64*32,heads,1),threadgroup=(256,1,1),
                   output_shapes=[gate.shape],output_dtypes=[q.dtype])[0]
