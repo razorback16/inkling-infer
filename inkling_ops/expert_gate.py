@@ -55,6 +55,17 @@ _kernel = mx.fast.metal_kernel(
 )
 
 
+_activate_pairs = mx.fast.metal_kernel(
+    name="inkling_activate_bf16_pairs", input_names=["pairs","table"], output_names=["active"],
+    source="""
+        uint i = thread_position_in_grid.x;
+        ushort2 bits = ((device const ushort2*)pairs)[i];
+        uint2 idx = ((uint2(bits)&32767u)<<2) | (uint2(bits>>15)<<1);
+        active[i] = bfloat16_t(table[idx.x] * table[idx.y+1]);
+    """,
+)
+
+
 @lru_cache(maxsize=1)
 def activation_tables():
     values = mx.arange(65536, dtype=mx.uint32).astype(mx.uint16).view(mx.bfloat16).astype(mx.float32)
@@ -73,6 +84,12 @@ def gated_activation(layer, x, indices):
             or proj.global_scale is None or proj.global_scale.shape != (proj.weight.shape[0],)
             or layer.act_fn.gate_softcap != 4 or layer.act_fn.up_softcap != 25):
         pair = proj(x[..., None, None, :], indices)
+        if (getattr(proj, "mode", None) == "mxfp8" and pair.dtype == mx.bfloat16
+                and pair.shape == (1,1,8,1,2304) and type(layer.act_fn) is layers.SoftcappedSwiGLU
+                and layer.act_fn.gate_softcap == 4 and layer.act_fn.up_softcap == 25):
+            return _activate_pairs(inputs=[pair,activation_tables()], grid=(8*1152,1,1),
+                                   threadgroup=(128,1,1), output_shapes=[(1,1,8,1,1152)],
+                                   output_dtypes=[pair.dtype])[0]
         return layer.act_fn(pair[..., 0::2], pair[..., 1::2])
     active = _kernel(
         inputs=[x, indices, proj.weight, proj.scales, proj.global_scale, activation_tables()],
