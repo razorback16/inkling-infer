@@ -59,6 +59,10 @@ def _build(layer):
 
 
 def decode(layer, hidden_states, block_states, cache=None, conv_mask=None, messages=None):
+    if hidden_states.ndim==3 and hidden_states.shape[1]>1:
+        from . import prefill_layer
+        if prefill_layer.applicable(layer,hidden_states,cache,conv_mask):
+            return prefill_layer.run(layer,hidden_states,block_states,cache,messages)
     kwargs = dict(cache=cache, conv_mask=conv_mask, messages=messages)
     if (hidden_states.shape[:2] != (1, 1) or conv_mask is not None or cache is None
             or type(cache[0]) not in (KVCache, RotatingKVCache) or layer.mlp.sharding_group is not None):
