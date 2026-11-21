@@ -29,23 +29,16 @@ _kernel = mx.fast.metal_kernel(
         for (uint word = lane; word < 288; word += 32) {
             float v[8];
             for (uint i = 0; i < 8; ++i) v[i] = float(x[word * 8 + i]);
-            uint group = (expert * 2304 + first) / 4;
-            uint4 words;
-            uchar4 factors;
-            if (INTERLEAVED) {
-                words = ((device const uint4*)packed)[group * 288 + word];
-                factors = ((device const uchar4*)scales)[group * 144 + word / 2];
-            }
             for (uint r = 0; r < 4; ++r) {
                 uint row = expert * 2304 + first + r;
-                uint bits = INTERLEAVED ? words[r] : packed[row * 288 + word];
+                uint bits = packed[row * 288 + word];
                 float partial = 0.f;
                 for (uint i = 0; i < 8; i += 4) {
                     partial += v[i] * levels[bits & 15] + v[i+1] * levels[(bits >> 4) & 15]
                              + v[i+2] * levels[(bits >> 8) & 15] + v[i+3] * levels[(bits >> 12) & 15];
                     bits >>= 16;
                 }
-                float term = partial * fp8_scale(INTERLEAVED ? factors[r] : scales[row * 144 + word / 2]);
+                float term = partial * fp8_scale(scales[row * 144 + word / 2]);
                 sums[r] += term;
             }
         }
@@ -72,27 +65,6 @@ def activation_tables():
     return table
 
 
-def prepare_weights(model):
-    arrays = []
-    for layer in model.layers:
-        proj = layer.mlp.experts.gate_up_proj
-        if (getattr(proj, "mode", None) != "nvfp4" or proj.weight.shape[1:] != (2304, 288)
-                or proj.scales.shape[1:] != (2304, 144)):
-            continue
-        saved = getattr(proj, "_interleaved_gate", None)
-        if saved is not None and saved[0] is proj.weight and saved[1] is proj.scales:
-            continue
-        packed = []
-        for tensor in (proj.weight, proj.scales):
-            experts, rows, width = tensor.shape
-            tiles = tensor.reshape(experts, rows // 4, 4, width).transpose(0, 1, 3, 2)
-            packed.append(mx.contiguous(tiles))
-        object.__setattr__(proj, "_interleaved_gate", (proj.weight, proj.scales, packed))
-        arrays.extend(packed)
-    if arrays:
-        mx.eval(arrays)
-
-
 def gated_activation(layer, x, indices):
     proj = layer.gate_up_proj
     if (x.shape != (1, 1, 2304) or x.dtype != mx.bfloat16 or indices.shape != (1, 1, 8)
@@ -102,12 +74,8 @@ def gated_activation(layer, x, indices):
             or layer.act_fn.gate_softcap != 4 or layer.act_fn.up_softcap != 25):
         pair = proj(x[..., None, None, :], indices)
         return layer.act_fn(pair[..., 0::2], pair[..., 1::2])
-    saved = getattr(proj, "_interleaved_gate", None)
-    tiled = saved is not None and saved[0] is proj.weight and saved[1] is proj.scales
-    w, scales = saved[2] if tiled else (proj.weight, proj.scales)
     active = _kernel(
-        inputs=[x, indices, w, scales, proj.global_scale, activation_tables()],
-        template=[("INTERLEAVED", tiled)],
+        inputs=[x, indices, proj.weight, proj.scales, proj.global_scale, activation_tables()],
         grid=(144 * 128, 8, 1), threadgroup=(128, 1, 1),
         output_shapes=[(1, 1, 8, 1, 1152)], output_dtypes=[x.dtype],
     )[0]
