@@ -42,7 +42,7 @@ _kernel = mx.fast.metal_kernel(
 
 
 _compact_rows = mx.fast.metal_kernel(
-    name="inkling_stream_output_row",input_names=["x","history","conv","hidden","payload"],
+    name="inkling_stream_output_row",input_names=["x","history","conv","hidden","payload","formats"],
     output_names=["residual","window","squares"],
     source="""
         uint lane=thread_index_in_simdgroup, row=thread_position_in_grid.x/32;

@@ -43,7 +43,7 @@ _project = mx.fast.metal_kernel(
 
 
 _compact=mx.fast.metal_kernel(
-    name="inkling_inline_sliding_kv",input_names=["kx","vx","payload","kc","vc","kh","vh"],
+    name="inkling_inline_sliding_kv",input_names=["kx","vx","payload","formats","kc","vc","kh","vh"],
     output_names=["key","value","next_k","next_v"],source="""
         uint lane=thread_index_in_simdgroup,row=thread_position_in_grid.x/32;
         uint bank=row/1024,col=row%1024;
