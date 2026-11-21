@@ -58,7 +58,7 @@ _pack = mx.fast.metal_kernel(
 _dot = mx.fast.metal_kernel(
     name="inkling_four_row_gemv", input_names=["x","payload","bases","flags"],output_names=["out"],
     source="""
-        uint lane=thread_index_in_simdgroup, group=thread_position_in_grid.x/32;
+        uint lane=thread_index_in_simdgroup, warp=thread_position_in_grid.x/32, group=warp/(4/NR), start=(warp%(4/NR))*NR;
         uchar4 base=*(device const uchar4*)(bases+group*4);
         uint raw_tiles=flags[group];
         float sums[4]={};
@@ -67,7 +67,7 @@ _dot = mx.fast.metal_kernel(
             uint d=block*128+lane*4;
             float4 v=float4(*(device const bfloat4*)(x+d));
             if (raw_tiles & (1u<<block)) {
-                for (uint r=0;r<4;++r) {
+                for (uint r=start;r<start+NR;++r) {
                     float4 w=float4(*(device const bfloat4*)(payload+tile*256+r*64+lane*2));
                     for (uint j=0;j<4;++j) sums[r]=fma(v[j],w[j],sums[r]);
                 }
@@ -75,7 +75,7 @@ _dot = mx.fast.metal_kernel(
             }
             uint4 low=*(device const uint4*)(payload+tile*256+lane*4);
             ushort4 high=*(device const ushort4*)(payload+tile*256+128+lane*2);
-            for (uint r=0;r<4;++r) {
+            for (uint r=start;r<start+NR;++r) {
                 ushort h=high[r];
                 ushort4 ex=ushort4(h,h>>4,h>>8,h>>12)&15;
                 ushort4 code=(ex<<8)|ushort4(as_type<uchar4>(low[r]));
@@ -85,7 +85,7 @@ _dot = mx.fast.metal_kernel(
                 for (uint j=0;j<4;++j) sums[r]=fma(v[j],w[j],sums[r]);
             }
         }
-        for (uint r=0;r<4;++r) {
+        for (uint r=start;r<start+NR;++r) {
             float dot=sums[r];
             for (ushort step=16;step;step>>=1) dot+=simd_shuffle_down(dot,step);
             if (!lane) out[group*4+r]=bfloat16_t(dot);
@@ -104,7 +104,10 @@ def encode(weight):
     return payload,bases,mx.sum(flags,axis=1)
 
 
-def project(x,weight,encoded):
+def project(x,weight,encoded,*,vocabulary=False):
     rows=weight.shape[0]
-    return _dot(inputs=[x,*encoded],grid=(rows*8,1,1),threadgroup=(128,1,1),
+    per_warp=1 if vocabulary else 4
+    threads=256 if vocabulary else 128
+    return _dot(inputs=[x,*encoded],template=[("NR",per_warp)],
+                grid=(rows//per_warp*32,1,1),threadgroup=(threads,1,1),
                 output_shapes=[(1,1,rows)],output_dtypes=[x.dtype])[0]
