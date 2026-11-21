@@ -77,7 +77,7 @@ def _make_down(finish):
                 x[k] = float(hidden[slot * 1152 + word * 8 + k]);
             for (uint r = 0; r < 4; ++r) {
                 uint row = first_row + r;
-                uint q = packed[row * 144 + word];
+                uint q = packed[STRIPED ? ((row/2*9+word/16)*2+row%2)*16+word%16 : row*144+word];
                 float chunk = 0;
                 for (uint k = 0; k < 8; k += 4) {
                     chunk += x[k] * fp4_values[q & 15]
@@ -129,9 +129,11 @@ def single_token_moe(self, x):
     if can_fuse_down(down, x):
         from inkling_ops.expert_gate import gated_activation
         hidden = gated_activation(self.experts, x, experts)
+        from inkling_ops.expert_gate import decode_weights
+        weight, striped = decode_weights(down)
         return _down_mix(
-            inputs=[hidden, experts, weights, down.weight, down.scales, down.global_scale],
-            template=[("T", x.dtype)], grid=(576 * 256, 1, 1),
+            inputs=[hidden, experts, weights, weight, down.scales, down.global_scale],
+            template=[("STRIPED",striped),("T", x.dtype)], grid=(576 * 256, 1, 1),
             threadgroup=(256, 1, 1), output_shapes=[x.shape], output_dtypes=[x.dtype],
         )[0]
     return mix(self.experts(x, experts), weights, x.dtype)

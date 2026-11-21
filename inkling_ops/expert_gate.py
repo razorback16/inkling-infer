@@ -31,7 +31,7 @@ _kernel = mx.fast.metal_kernel(
             for (uint i = 0; i < 8; ++i) v[i] = float(x[word * 8 + i]);
             for (uint r = 0; r < 4; ++r) {
                 uint row = expert * 2304 + first + r;
-                uint bits = packed[row * 288 + word];
+                uint bits = packed[STRIPED ? ((row/2*18+word/16)*2+row%2)*16+word%16 : row*288+word];
                 float partial = 0.f;
                 for (uint i = 0; i < 8; i += 4) {
                     partial += v[i] * levels[bits & 15] + v[i+1] * levels[(bits >> 4) & 15]
@@ -108,6 +108,32 @@ def activation_tables():
     return table
 
 
+def prepare_stripes(model):
+    buffers = []
+    for layer in model.layers:
+        experts = layer.mlp.experts
+        for proj, cols in ((experts.gate_up_proj, 288), (experts.down_proj, 144)):
+            if (getattr(proj, "mode", None) != "nvfp4" or proj.weight.dtype != mx.uint32
+                    or proj.weight.shape[1:] != (2304, cols)):
+                continue
+            raw = proj.weight
+            saved = getattr(proj, "_striped_nvfp4", None)
+            if saved is None or saved[0] is not raw:
+                matrix = raw.reshape(raw.shape[0],1152,2,cols//16,16)
+                striped = mx.contiguous(matrix.transpose(0,1,3,2,4))
+                object.__setattr__(proj, "_striped_nvfp4", (raw,striped))
+                buffers.append(striped)
+    if buffers:
+        mx.eval(buffers)
+
+
+def decode_weights(proj):
+    saved = getattr(proj, "_striped_nvfp4", None)
+    if saved is not None and saved[0] is proj.weight:
+        return saved[1], True
+    return proj.weight, False
+
+
 def gated_activation(layer, x, indices):
     proj = layer.gate_up_proj
     if (x.shape == (1,1,2304) and x.dtype == mx.bfloat16 and indices.shape == (1,1,8)
@@ -126,8 +152,10 @@ def gated_activation(layer, x, indices):
             or layer.act_fn.gate_softcap != 4 or layer.act_fn.up_softcap != 25):
         pair = proj(x[..., None, None, :], indices)
         return layer.act_fn(pair[..., 0::2], pair[..., 1::2])
+    weight, striped = decode_weights(proj)
     active = _kernel(
-        inputs=[x, indices, proj.weight, proj.scales, proj.global_scale, activation_tables()],
+        inputs=[x, indices, weight, proj.scales, proj.global_scale, activation_tables()],
+        template=[("STRIPED",striped)],
         grid=(144 * 128, 8, 1), threadgroup=(128, 1, 1),
         output_shapes=[(1, 1, 8, 1, 1152)], output_dtypes=[x.dtype],
     )[0]
