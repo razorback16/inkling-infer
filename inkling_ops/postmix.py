@@ -41,30 +41,26 @@ _mx_down = mx.fast.metal_kernel(
     source="""
         #pragma clang fp contract(off)
         uint lane=thread_index_in_simdgroup, slot=simdgroup_index_in_threadgroup;
-        uint first=threadgroup_position_in_grid.x*4;
+        uint first=threadgroup_position_in_grid.x;
         uint expert=indices[slot];
-        float dots[4]={};
+        float dot=0;
+        uint row=expert*2304+first;
         for (uint word=lane; word<288; word+=32) {
             float4 activation=float4(*(device const bfloat4*)(x+slot*1152+word*4));
-            for (uint r=0; r<4; ++r) {
-                uint row=expert*2304+first+r;
-                uchar4 bytes=as_type<uchar4>(packed[row*288+word]);
-                float sum=0;
-                for (uint k=0;k<4;++k) sum+=activation[k]*codes[bytes[k]];
-                float scale=codes[256+uint(scales[row*36+word/8])];
-                dots[r]+=sum*scale;
-            }
+            uchar4 bytes=as_type<uchar4>(packed[row*288+word]);
+            float sum=0;
+            for (uint k=0;k<4;++k) sum+=activation[k]*codes[bytes[k]];
+            float scale=codes[256+uint(scales[row*36+word/8])];
+            dot+=sum*scale;
         }
-        threadgroup float value[8][4];
-        for (uint r=0;r<4;++r) {
-            float dot=simd_sum(dots[r]);
-            if (!lane) value[slot][r]=float(T(dot));
-        }
+        threadgroup float value[8];
+        dot=simd_sum(dot);
+        if (!lane) value[slot]=float(T(dot));
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (!slot && lane<4) {
-            uint c=first+lane;
+        if (!slot && !lane) {
+            uint c=first;
             float mixed=0;
-            for (uint e=0;e<8;++e) mixed+=value[e][lane]*route[e];
+            for (uint e=0;e<8;++e) mixed+=value[e]*route[e];
     """ + _filter + "}",
 )
 
@@ -80,5 +76,5 @@ def project_and_finish(down, active, selected, routing, history, conv, residual)
     from .expert_gate import mx_codes
     return _mx_down(inputs=[active,selected,routing,down.weight,down.scales,mx_codes(),history,conv,residual],
                     template=[("T",active.dtype),("W",conv.dtype)],
-                    grid=(576*256,1,1),threadgroup=(256,1,1),
+                    grid=(2304*256,1,1),threadgroup=(256,1,1),
                     output_shapes=[residual.shape,history.shape],output_dtypes=[active.dtype,mx.float32])
