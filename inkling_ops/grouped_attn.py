@@ -96,16 +96,19 @@ _gate_table = mx.fast.metal_kernel(
     name="inkling_attention_sigmoid_table", input_names=["codes"], output_names=["table"],
     source="""
         uint i=thread_position_in_grid.x;
-        float g=float(as_type<bfloat16_t>(ushort(codes[i])));
-        table[i]=1.f/(1.f+precise::exp(abs(g)));
+        uint index=codes[i];
+        ushort bits=ushort((index>>1)|((index&1)<<15));
+        float g=float(as_type<bfloat16_t>(bits));
+        float d=1.f/(1.f+precise::exp(abs(g)));
+        table[i]=g<0 ? d : 1.f-d;
     """,
 )
 
 
 @lru_cache(maxsize=1)
-def gate_denominators():
-    table,=_gate_table(inputs=[mx.arange(32768,dtype=mx.uint16)],grid=(32768,1,1),
-                       threadgroup=(128,1,1),output_shapes=[(32768,)],output_dtypes=[mx.float32])
+def gate_probabilities():
+    table,=_gate_table(inputs=[mx.arange(65536,dtype=mx.uint32)],grid=(65536,1,1),
+                       threadgroup=(128,1,1),output_shapes=[(65536,)],output_dtypes=[mx.float32])
     mx.eval(table)
     return table
 
@@ -133,8 +136,15 @@ _merge = mx.fast.metal_kernel(
             if (lane==j) {
                 uint col = head*128+d+j;
                 float g = float(gate[col]);
-                float denom = LOOKUP ? table[as_type<ushort>(bfloat16_t(gate[col]))&32767u] : 1.f/(1.f+precise::exp(abs(g)));
-                out[col] = T(output*(g<0 ? denom : 1.f-denom));
+                float probability;
+                if (LOOKUP) {
+                    ushort code=as_type<ushort>(bfloat16_t(gate[col]));
+                    probability=table[((uint(code)&32767u)<<1)|(code>>15)];
+                } else {
+                    float denom=1.f/(1.f+precise::exp(abs(g)));
+                    probability=g<0 ? denom : 1.f-denom;
+                }
+                out[col] = T(output*probability);
             }
         }
     """,
@@ -174,6 +184,6 @@ def attend(layer,q,k,v,rel,sinks,cache,gate,scaled_query=None):
                   ("R",extent),("WINDOW",layer.sliding_window)],
         grid=(128*32,heads,1),threadgroup=(threads,1,1),
         output_shapes=[(heads,128,128),(heads,128,2)],output_dtypes=[q.dtype,mx.float32])
-    return _merge(inputs=[parts,stats,gate,gate_denominators()],template=[("LOOKUP",gate.dtype==mx.bfloat16),("T",q.dtype)],
+    return _merge(inputs=[parts,stats,gate,gate_probabilities()],template=[("LOOKUP",gate.dtype==mx.bfloat16),("T",q.dtype)],
                   grid=(64*32,heads,1),threadgroup=(256,1,1),
                   output_shapes=[gate.shape],output_dtypes=[q.dtype])[0]
