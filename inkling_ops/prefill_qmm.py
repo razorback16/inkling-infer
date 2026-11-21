@@ -128,10 +128,22 @@ def kernel():
 
 
 def applicable(proj):
-    return (mx.device_info()["memory_size"] >= 192*1024**3 and getattr(proj,"mode",None)=="nvfp4" and proj.bits==4 and proj.group_size==16
-            and "bias" not in proj and proj.global_scale is not None and proj.global_scale.shape==(128,)
-            and proj.weight.dtype==mx.uint32 and proj.scales.dtype==mx.uint8
+    mode=getattr(proj,"mode",None)
+    nv=(mode=="nvfp4" and proj.bits==4 and proj.group_size==16 and proj.global_scale is not None
+        and proj.global_scale.shape==(128,))
+    mx8=(mode=="mxfp8" and proj.bits==8 and proj.group_size==32 and proj.global_scale is None)
+    return (mx.device_info()["memory_size"] >= 192*1024**3 and (nv or mx8)
+            and "bias" not in proj and proj.weight.dtype==mx.uint32 and proj.scales.dtype==mx.uint8
             and proj.weight.shape[0]==128 and proj.input_dims%32==0 and proj.output_dims%64==0)
+
+
+@lru_cache(maxsize=1)
+def mx8_coefficients():
+    from .expert_gate import mx_codes
+    codes=mx_codes()
+    table=(codes[256:,None]*codes[None,:256]).astype(mx.bfloat16)
+    mx.eval(table)
+    return table
 
 
 _expand = mx.fast.metal_kernel(
@@ -143,9 +155,15 @@ _expand = mx.fast.metal_kernel(
         uint fm=((lane/4)&4)+(lane/2)%4, fn=((lane/4)&2)*2+(lane%2)*2;
         uint k=kb*32+(frag/8)*8+fm, row=expert*N+nb*64+(frag%8)*8+fn;
         for (ushort j=0;j<2;++j) {
+            if (MX8) {
+                uint bits=weight[(row+j)*(K/4)+k/4];
+                uint scale=scales[(row+j)*(K/32)+k/32];
+                data[index*2+j]=table[scale*256+((bits>>((k%4)*8))&255)];
+            } else {
             uint bits=weight[(row+j)*(K/8)+k/8];
             uint scale=scales[(row+j)*(K/16)+k/16];
             data[index*2+j]=table[(expert*256+scale)*16+((bits>>((k%8)*4))&15)];
+            }
         }
     """,
 )
@@ -155,7 +173,7 @@ def expanded_tiles(proj,table):
     saved=getattr(proj,"_prompt_expanded_tiles",None)
     if saved is None or saved[0] is not proj.weight or saved[1] is not proj.scales or saved[2] is not table:
         e,n,k=proj.num_experts,proj.output_dims,proj.input_dims
-        data,=_expand(inputs=[proj.weight,proj.scales,table],template=[("N",n),("K",k)],
+        data,=_expand(inputs=[proj.weight,proj.scales,table],template=[("N",n),("K",k),("MX8",proj.mode=="mxfp8")],
                       grid=(e*n*k//2,1,1),threadgroup=(128,1,1),
                       output_shapes=[(e,n//64,k//32,64,32)],output_dtypes=[mx.bfloat16])
         mx.eval(data)
@@ -168,10 +186,13 @@ def project(proj, x, tiles, activation=None, token_rows=None, original_slots=Non
     scale=proj.global_scale
     saved=getattr(proj,"_prompt_coefficients",None)
     if saved is None or saved[0] is not scale:
-        codes=mx.array([0,.5,1,1.5,2,3,4,6,-0.,-.5,-1,-1.5,-2,-3,-4,-6],mx.float32)
-        fp8=mx.from_fp8(mx.arange(256).astype(mx.uint8),mx.float32)
-        table=((scale[:,None,None]/2688*fp8[None,:,None])*codes).astype(mx.bfloat16)
-        mx.eval(table)
+        if proj.mode=="mxfp8":
+            table=mx8_coefficients()
+        else:
+            codes=mx.array([0,.5,1,1.5,2,3,4,6,-0.,-.5,-1,-1.5,-2,-3,-4,-6],mx.float32)
+            fp8=mx.from_fp8(mx.arange(256).astype(mx.uint8),mx.float32)
+            table=((scale[:,None,None]/2688*fp8[None,:,None])*codes).astype(mx.bfloat16)
+            mx.eval(table)
         saved=(scale,table)
         object.__setattr__(proj,"_prompt_coefficients",saved)
     n=proj.output_dims
