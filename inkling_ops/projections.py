@@ -4,7 +4,7 @@ import mlx.nn as nn
 from mlx_lm.models.inkling2 import layers
 
 from .head_norm import normalize
-from . import rel_mask, packed_rows
+from . import rel_mask, filtered_kv, packed_rows
 
 _sliding = layers.SlidingAttention.__call__
 _full = layers.FullAttention.__call__
@@ -67,12 +67,16 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
     parts = mx.split(projected,boundaries,axis=-1)
     query, relative, gate = parts[:3]
     sinks = layer.sink_proj(hidden_states)
-    if same:
+    filtered = (None if full or same else
+                filtered_kv.apply(layer,key_hidden_states,value_hidden_states,conv_states,conv_mask))
+    if filtered is not None:
+        key,value,conv_states[0],conv_states[1] = filtered
+    elif same:
         key, value = parts[3:]
     else:
         key = layer.k_proj(key_hidden_states)
         value = layer.v_proj(value_hidden_states)
-    fused_norm = (not full and conv_mask is None and conv_states is not None and layer.head_dim == 128
+    fused_norm = (same and not full and conv_mask is None and conv_states is not None and layer.head_dim == 128
                   and relative.shape[-1] // layer.num_heads <= 128
                   and key.dtype == value.dtype == query.dtype
                   and all(type(c) is layers.ShortConvolution and c.kernel_size == 4
@@ -87,7 +91,7 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
     if full and not dynamic_norm:
         key, conv_states[0] = layer.k_sconv(key, key_hidden_states, conv_states[0], conv_mask)
         value, conv_states[1] = layer.v_sconv(value, value_hidden_states, conv_states[1], conv_mask)
-    elif not full and not fused_norm:
+    elif not full and filtered is None and not fused_norm:
         key, conv_states[0] = layer.k_sconv(key, conv_states[0], conv_mask)
         value, conv_states[1] = layer.v_sconv(value, conv_states[1], conv_mask)
     pair = None
