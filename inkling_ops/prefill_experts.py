@@ -59,16 +59,21 @@ def mix(layer, x):
     custom=(hidden.shape[0]>=4096 and prefill_qmm.applicable(experts.gate_up_proj)
             and prefill_qmm.applicable(experts.down_proj) and prefill_qmm.kernel() is not None)
     tiles=prefill_qmm.schedule(sorted_ids) if custom else None
-    gated=(prefill_qmm.project(experts.gate_up_proj,hidden,tiles) if custom
-           else experts.gate_up_proj(hidden,sorted_ids,sorted_indices=True))
-    if (type(experts.act_fn) is layers.SoftcappedSwiGLU and gated.dtype==mx.bfloat16
-            and gated.shape[-1]%8==0 and experts.act_fn.gate_softcap==4 and experts.act_fn.up_softcap==25):
+    tabled=(type(experts.act_fn) is layers.SoftcappedSwiGLU and x.dtype==mx.bfloat16
+            and experts.act_fn.gate_softcap==4 and experts.act_fn.up_softcap==25)
+    if custom and tabled:
         from .expert_gate import activation_tables
-        shape=(*gated.shape[:-1],gated.shape[-1]//2)
-        active=_activate(inputs=[gated,activation_tables()],grid=(gated.size//8,1,1),
-                         threadgroup=(128,1,1),output_shapes=[shape],output_dtypes=[gated.dtype])[0]
+        active=prefill_qmm.project(experts.gate_up_proj,hidden,tiles,activation_tables())
     else:
-        active = experts.act_fn(gated[..., 0::2], gated[..., 1::2])
+        gated=(prefill_qmm.project(experts.gate_up_proj,hidden,tiles) if custom
+               else experts.gate_up_proj(hidden,sorted_ids,sorted_indices=True))
+        if tabled and gated.shape[-1]%8==0:
+            from .expert_gate import activation_tables
+            shape=(*gated.shape[:-1],gated.shape[-1]//2)
+            active=_activate(inputs=[gated,activation_tables()],grid=(gated.size//8,1,1),
+                             threadgroup=(128,1,1),output_shapes=[shape],output_dtypes=[gated.dtype])[0]
+        else:
+            active=experts.act_fn(gated[...,0::2],gated[...,1::2])
     results=(prefill_qmm.project(experts.down_proj,active,tiles) if custom
              else experts.down_proj(active,sorted_ids,sorted_indices=True))
     return _mix_sorted(

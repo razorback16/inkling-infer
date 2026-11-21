@@ -63,7 +63,7 @@ def kernel():
         contents=(root/name).read_text().replace("#pragma once","")
         return re.sub(r'^#include "([^"]+)"',lambda m:include(m[1]),contents,flags=re.M)
     return mx.fast.metal_kernel(
-        name="inkling_prompt_lookup_gemm",input_names=["x","w","scales","table","tiles"],
+        name="inkling_prompt_lookup_gemm",input_names=["x","w","scales","table","tiles","activation"],
         output_names=["out"],header=include(mma),source="""
             uint tile=threadgroup_position_in_grid.y, row=tiles[3*tile], expert=tiles[3*tile+1];
             uint count=tiles[3*tile+2];
@@ -89,9 +89,25 @@ def kernel():
                 threadgroup_barrier(mem_flags::mem_threadgroup);
                 mma.mma(Xs,Ws);
             }
-            auto result=out+row*N+column;
-            if (count==32) mma.store_result(result,N);
-            else mma.store_result_safe(result,N,short2(64,count));
+            if (GATED) {
+                for (short i=0;i<2;++i) {
+                    uint r=mma.sm+i*16;
+                    if (r>=count) continue;
+                    for (short j=0;j<4;++j) {
+                        float2 frag=mma.Ctile.frag_at(i,j);
+                        ushort g=as_type<ushort>(bfloat16_t(frag.x));
+                        ushort u=as_type<ushort>(bfloat16_t(frag.y));
+                        uint gi=((uint(g)&32767)<<2)|((g>>15)<<1);
+                        uint ui=((uint(u)&32767)<<2)|((u>>15)<<1);
+                        uint c=column+mma.sn+j*16;
+                        out[(row+r)*(N/2)+c/2]=bfloat16_t(activation[gi]*activation[ui+1]);
+                    }
+                }
+            } else {
+                auto result=out+row*N+column;
+                if (count==32) mma.store_result(result,N);
+                else mma.store_result_safe(result,N,short2(64,count));
+            }
         """,
     )
 
@@ -103,7 +119,7 @@ def applicable(proj):
             and proj.weight.shape[0]==128 and proj.input_dims%32==0 and proj.output_dims%64==0)
 
 
-def project(proj, x, tiles):
+def project(proj, x, tiles, activation=None):
     scale=proj.global_scale
     saved=getattr(proj,"_prompt_coefficients",None)
     if saved is None or saved[0] is not scale:
@@ -114,6 +130,8 @@ def project(proj, x, tiles):
         saved=(scale,table)
         object.__setattr__(proj,"_prompt_coefficients",saved)
     n=proj.output_dims
-    return kernel()(inputs=[x,proj.weight,proj.scales,saved[1],tiles],template=[("K",proj.input_dims),("N",n)],
+    width=n//2 if activation is not None else n
+    return kernel()(inputs=[x,proj.weight,proj.scales,saved[1],tiles,x if activation is None else activation],
+                    template=[("K",proj.input_dims),("N",n),("GATED",activation is not None)],
                     grid=(n//64*128,tiles.shape[0],1),threadgroup=(128,1,1),
-                    output_shapes=[(*x.shape[:-1],n)],output_dtypes=[x.dtype])[0]
+                    output_shapes=[(*x.shape[:-1],width)],output_dtypes=[x.dtype])[0]
