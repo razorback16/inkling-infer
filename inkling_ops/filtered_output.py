@@ -1,7 +1,6 @@
 """Apply attention output projection, temporal filter, and residual in one pass."""
 import mlx.core as mx
 import mlx.nn as nn
-from .packed_rows import pair_table
 
 _kernel = mx.fast.metal_kernel(
     name="inkling_project_attention_residual",
@@ -52,15 +51,15 @@ _pack_rows = mx.fast.metal_kernel(
             highest=max(highest,max(max(e.x,e.y),max(e.z,e.w)));
         }
         highest=simd_max(highest);
-        ushort base=ushort(max(0,int(highest)-15)&~1);
+        ushort base=ushort(max(0,int(highest)-15));
         if (!lane) bases[row]=uchar(base);
         for (uint tile=0;tile<24;++tile) {
             uint d=tile*128+lane*4;
             ushort4 bits=*(device const ushort4*)((device const ushort*)w+row*3072+d);
             ushort4 delta=((bits>>7)&255)-base;
             bool4 escape=delta>15;
-            uchar4 bytes=select(uchar4(bits),uchar4(0),escape);
-            ushort4 n=select((delta>>1)|((bits>>12)&8),ushort4(0),escape);
+            uchar4 bytes=select(uchar4((bits<<1)|(bits>>15)),uchar4(0),escape);
+            ushort4 n=select(delta,ushort4(0),escape);
             // Four neighboring rows consume this 768-byte tile together.
             uint addr=((row/4*24+tile)*4+row%4)*48;
             payload[addr+lane]=as_type<uint>(bytes);
@@ -69,20 +68,21 @@ _pack_rows = mx.fast.metal_kernel(
     """,
 )
 _compact_rows = mx.fast.metal_kernel(
-    name="inkling_stream_output_row",header=pair_table,input_names=["x","weight","history","conv","hidden","payload","bases"],
+    name="inkling_stream_output_row",input_names=["x","weight","history","conv","hidden","payload","bases"],
     output_names=["residual","window","squares"],
     source="""
         uint lane=thread_index_in_simdgroup, row=thread_position_in_grid.x/32;
         uint sg=simdgroup_index_in_threadgroup;
-        ushort base=ushort(bases[row])<<7;
+        ushort base=ushort(bases[row])<<8;
         float dot=0;
         for (uint tile=0;tile<24;++tile) {
             uint d=tile*128+lane*4, addr=((row/4*24+tile)*4+row%4)*48;
             float4 a=float4(*(device const bfloat4*)(x+d));
             ushort h=((device const ushort*)(payload+addr+32))[lane];
-            uint2 hi=uint2(high_pairs[h&255],high_pairs[h>>8]);
-            ushort4 code=as_type<ushort4>(hi)|ushort4(as_type<uchar4>(payload[addr+lane]));
-            ushort4 bits=code+base;
+            ushort4 n=ushort4(h,h>>4,h>>8,h>>12)&15;
+            ushort4 code=(n<<8)|ushort4(as_type<uchar4>(payload[addr+lane]));
+            ushort4 rot=code+base;
+            ushort4 bits=(rot>>1)|(rot<<15);
             if (any(code==0))
                 bits=*(device const ushort4*)((device const ushort*)weight+row*3072+d);
             float4 w=float4(as_type<bfloat4>(bits));

@@ -1,14 +1,6 @@
 """Lossless four-row BF16 tiles for 2304-channel decode projections."""
 import mlx.core as mx
 
-# Each byte indexes the sign and three upper exponent bits of two BF16 values.
-def _pair_high_bits(index):
-    hi = lambda nibble: ((nibble & 7) << 8) | ((nibble & 8) << 12)
-    return hi(index & 15) | (hi(index >> 4) << 16)
-
-pair_table = "constant uint high_pairs[256]={" + ",".join(
-    f"0x{_pair_high_bits(i):08x}u" for i in range(256)) + "};"
-
 _ranges = mx.fast.metal_kernel(
     name="inkling_row_exponent_range",input_names=["weight"],output_names=["bases"],
     source="""
@@ -20,7 +12,7 @@ _ranges = mx.fast.metal_kernel(
             peak=max(peak,max(max(e.x,e.y),max(e.z,e.w)));
         }
         peak=simd_max(peak);
-        if (!lane) bases[row]=uchar(max(int(peak)-15,0)&~1);
+        if (!lane) bases[row]=uchar(max(int(peak)-15,0));
     """,
 )
 
@@ -40,9 +32,9 @@ _pack = mx.fast.metal_kernel(
             ushort4 e=(bits>>7)&255;
             ushort4 delta=e-ushort(base[row]);
             bool4 escapes=delta>15;
-            uchar4 bytes=select(uchar4(bits),uchar4(0),escapes);
+            uchar4 bytes=select(uchar4((bits<<1)|(bits>>15)),uchar4(0),escapes);
             low[row]=as_type<uint>(bytes);
-            ushort4 n=select((delta>>1)|((bits>>12)&8),ushort4(0),escapes);
+            ushort4 n=select(delta,ushort4(0),escapes);
             high[row]=n.x|(n.y<<4)|(n.z<<8)|(n.w<<12);
         }
         *(device uint4*)(payload+tile*192+lane*4)=low;
@@ -51,7 +43,7 @@ _pack = mx.fast.metal_kernel(
     """,
 )
 _dot = mx.fast.metal_kernel(
-    name="inkling_four_row_gemv",header=pair_table, input_names=["x","weight","payload","bases"],output_names=["out"],
+    name="inkling_four_row_gemv", input_names=["x","weight","payload","bases"],output_names=["out"],
     source="""
         uint lane=thread_index_in_simdgroup, group=thread_position_in_grid.x/32;
         uchar4 base=*(device const uchar4*)(bases+group*4);
@@ -64,9 +56,10 @@ _dot = mx.fast.metal_kernel(
             float4 v=float4(*(device const bfloat4*)(x+d));
             for (uint r=0;r<4;++r) {
                 ushort h=high[r];
-                uint2 hi=uint2(high_pairs[h&255],high_pairs[h>>8]);
-                ushort4 code=as_type<ushort4>(hi)|ushort4(as_type<uchar4>(low[r]));
-                ushort4 bits=code+(ushort(base[r])<<7);
+                ushort4 ex=ushort4(h,h>>4,h>>8,h>>12)&15;
+                ushort4 code=(ex<<8)|ushort4(as_type<uchar4>(low[r]));
+                ushort4 rotated=code+(ushort(base[r])<<8);
+                ushort4 bits=(rotated>>1)|(rotated<<15);
                 if (any(code==0)) {
                     bits=*(device const ushort4*)((device const ushort*)weight+(group*4+r)*2304+d);
                 }
