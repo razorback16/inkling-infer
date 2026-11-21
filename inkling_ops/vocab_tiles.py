@@ -1,72 +1,68 @@
-"""Eleven-bit vocabulary coefficients with exact BF16 escapes."""
+"""Store each vocabulary coefficient in twelve bits plus exact overflow nibbles."""
 import mlx.core as mx
 
 
-_counts = mx.fast.metal_kernel(
-    name="inkling_vocab_escape_counts", input_names=["weight"], output_names=["counts"],
-    source="""
-        uint group=thread_position_in_grid.x/32, lane=thread_index_in_simdgroup;
-        uint count=0;
-        for (uint t=0;t<2;++t) {
-            ushort4 bits=((device const ushort4*)weight)[group*64+t*32+lane];
+_formats = mx.fast.metal_kernel(
+    name="inkling_vocab_exponent_formats", input_names=["weight"],
+    output_names=["formats", "counts"], source="""
+        uint row=thread_position_in_grid.x/32, lane=thread_index_in_simdgroup;
+        ushort4 exponents[18];
+        ushort highest=0;
+        for (uint t=0;t<18;++t) {
+            ushort4 bits=((device const ushort4*)weight)[row*576+t*32+lane];
             ushort4 e=(bits>>7)&255;
-            for (uint j=0;j<4;++j) count+=uint(e[j]<116 || e[j]>122);
+            exponents[t]=e;
+            highest=max(highest,max(max(e.x,e.y),max(e.z,e.w)));
         }
-        count=simd_sum(count);
-        if (!lane) counts[group]=count;
+        ushort base=ushort(max(0,int(simd_max(highest))-15));
+        uint mask=0;
+        for (uint t=0;t<18;++t)
+            if (simd_any(any(exponents[t]-base>15))) mask|=1u<<t;
+        if (!lane) {
+            formats[row]=(uint(base)<<24)|mask;
+            counts[row]=popcount(mask);
+        }
     """,
 )
 
 _pack = mx.fast.metal_kernel(
-    name="inkling_vocab_pack_eleven",input_names=["weight","offsets"],
-    output_names=["tiles","overflow"],source="""
-        uint group=thread_position_in_grid.x/32,lane=thread_index_in_simdgroup;
-        uint row=group/9,first=(group%9)*2,prior=0;
-        for (uint t=0;t<2;++t) {
-            ushort4 bits=((device const ushort4*)weight)[group*64+t*32+lane];
-            ushort4 e=(bits>>7)&255;
-            bool4 rare=(e<116)|(e>122);
-            uint n=0;
-            for (uint j=0;j<4;++j) n+=uint(rare[j]);
-            uint index=prior+simd_prefix_exclusive_sum(n);
-            prior+=simd_sum(n);
-            uchar4 low=uchar4((bits<<1)|(bits>>15));
-            ushort4 code=e-116;
-            for (uint j=0;j<4;++j) {
-                if (rare[j]) {
-                    low[j]=uchar(index); code[j]=7;
-                    overflow[offsets[group]+index++]=bits[j];
-                }
-            }
-            uint addr=((row/4*18+first+t)*4+row%4)*44;
-            tiles[addr+lane]=as_type<uint>(low);
-            ushort4 mid=code&3;
-            ((device uchar*)(tiles+addr+32))[lane]=uchar(mid.x|(mid.y<<2)|(mid.z<<4)|(mid.w<<6));
-            ushort4 hi=code>>2;
-            uint nibble=hi.x|(hi.y<<1)|(hi.z<<2)|(hi.w<<3);
-            uint adjacent=simd_shuffle_xor(nibble,1);
-            if (!(lane&1)) ((device uchar*)(tiles+addr+40))[lane/2]=uchar(nibble|(adjacent<<4));
+    name="inkling_vocab_twelve_bit_tiles", input_names=["weight","formats","offsets"],
+    output_names=["tiles","overflow"], source="""
+        uint lane=thread_index_in_simdgroup, group=thread_position_in_grid.x/32;
+        uint row=group/18, tile=group%18;
+        uint addr=((row/4*18+tile)*4+row%4)*48;
+        ushort4 bits=((device const ushort4*)weight)[group*32+lane];
+        uint fmt=formats[row], mask=fmt&0x3ffffu;
+        ushort4 e=(((bits>>7)&255)-ushort(fmt>>24))&255;
+        tiles[addr+lane]=as_type<uint>(uchar4((bits<<1)|(bits>>15)));
+        ushort4 n=e&15;
+        ((device ushort*)(tiles+addr+32))[lane]=n.x|(n.y<<4)|(n.z<<8)|(n.w<<12);
+        if (mask&(1u<<tile)) {
+            uint index=offsets[row]+popcount(mask&((1u<<tile)-1));
+            n=e>>4;
+            ((device ushort*)overflow)[index*32+lane]=n.x|(n.y<<4)|(n.z<<8)|(n.w<<12);
         }
     """,
 )
 
 _dot = mx.fast.metal_kernel(
-    name="inkling_vocab_eleven_bit_dot",input_names=["x","tiles","overflow","offsets"],
-    output_names=["out"],source="""
-        uint lane=thread_index_in_simdgroup,row=thread_position_in_grid.x/32;
+    name="inkling_vocab_twelve_bit_dot", input_names=["x","tiles","overflow","formats","offsets"],
+    output_names=["out"], source="""
+        uint lane=thread_index_in_simdgroup, row=thread_position_in_grid.x/32;
+        uint fmt=formats[row], mask=fmt&0x3ffffu;
+        ushort base=ushort(fmt>>24)<<8;
         float dot=0;
         for (uint t=0;t<18;++t) {
-            uint addr=((row/4*18+t)*4+row%4)*44;
-            ushort4 low=ushort4(as_type<uchar4>(tiles[addr+lane]));
-            ushort mid=((device const uchar*)(tiles+addr+32))[lane];
-            ushort hi=((device const uchar*)(tiles+addr+40))[lane/2]>>((lane&1)*4);
-            ushort4 code=(ushort4(mid,mid>>2,mid>>4,mid>>6)&3)
-                         | ((ushort4(hi,hi>>1,hi>>2,hi>>3)&1)<<2);
-            ushort4 rot=((code+116)<<8)|low;
-            ushort4 bits=(rot>>1)|(rot<<15);
-            for (uint j=0;j<4;++j)
-                if (code[j]==7) bits[j]=overflow[offsets[row*9+t/2]+low[j]];
-            float4 w=float4(as_type<bfloat4>(bits));
+            uint addr=((row/4*18+t)*4+row%4)*48;
+            ushort h=((device const ushort*)(tiles+addr+32))[lane];
+            ushort4 n=ushort4(h,h>>4,h>>8,h>>12)&15;
+            if (mask&(1u<<t)) {
+                uint index=offsets[row]+popcount(mask&((1u<<t)-1));
+                ushort hi=((device const ushort*)overflow)[index*32+lane];
+                n|=(ushort4(hi,hi>>4,hi>>8,hi>>12)&15)<<4;
+            }
+            ushort4 rot=((n<<8)|ushort4(as_type<uchar4>(tiles[addr+lane])))+base;
+            float4 w=float4(as_type<bfloat4>((rot>>1)|(rot<<15)));
             float4 a=float4(((device const bfloat4*)x)[t*32+lane]);
             for (uint j=0;j<4;++j) dot=fma(a[j],w[j],dot);
         }
@@ -78,15 +74,14 @@ _dot = mx.fast.metal_kernel(
 
 def encode(w):
     rows=w.shape[0]
-    grid=(rows*9*32,1,1)
-    counts,=_counts(inputs=[w],grid=grid,threadgroup=(128,1,1),
-                    output_shapes=[(rows,9)],output_dtypes=[mx.uint32])
-    ends=mx.cumsum(counts.reshape(-1))
-    size=max(1,int(ends[-1].item()))
-    offsets=ends-counts.reshape(-1)
-    tiles,overflow=_pack(inputs=[w,offsets],grid=grid,threadgroup=(128,1,1),
-                         output_shapes=[(rows,18,44),(size,)],output_dtypes=[mx.uint32,mx.uint16])
-    return tiles,overflow,offsets
+    formats,counts=_formats(inputs=[w], grid=(rows*32,1,1), threadgroup=(128,1,1),
+                            output_shapes=[(rows,),(rows,)], output_dtypes=[mx.uint32]*2)
+    ends=mx.cumsum(counts)
+    n_overflow=max(1,int(ends[-1].item()))
+    offsets=ends-counts
+    tiles,overflow=_pack(inputs=[w,formats,offsets], grid=(rows*18*32,1,1), threadgroup=(128,1,1),
+                         output_shapes=[(rows,18,48),(n_overflow,16)], output_dtypes=[mx.uint32]*2)
+    return tiles,overflow,formats,offsets
 
 
 def project(x,weight,encoded):
