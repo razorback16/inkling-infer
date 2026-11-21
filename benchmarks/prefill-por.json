@@ -1,28 +1,55 @@
 {
   "model": "thinkingmachines/Inkling-2-Mini",
+  "checkpoint_revision": "ed40e7da625f594fc9c4990f5f66be24873c22d7",
+  "main_weight_file_bytes": 19526019168,
+  "main_weight_file_sha256": "65e60f51aa1284d4fb022584908c315270334d991828bb774af60584523539d1",
   "device": "Apple M3 Ultra",
-  "kernel_commit": "45d4082918ad96f0058c00c9d03f1fdadd9c550e",
+  "kernel_commit": "87f6570b735c36931a54a0ac1fed057e34bea608",
   "benchmark": "prefill_benchmark.py",
   "roofline_calibration": "prefill-roofline.json",
   "batch_size": 1,
   "prompt_tokens": 4096,
   "chunk_tokens": 2048,
   "method": "Warm model, fresh empty prompt cache per sample. Time both cache-fill chunks through GPU completion. Exclude token generation.",
-  "research_median_prompt_tps": 1994.487040121059,
   "independent_process_medians_prompt_tps": [
-    2001.7807589404235,
-    2012.1669941327111
+    1964.8412072316803,
+    1969.248127016815,
+    1967.7582219642345
   ],
-  "main_prompt_tps": [
-    2000.290000051077,
-    1996.7117141434635,
-    1994.9395941514022
-  ],
-  "main_median_prompt_tps": 1996.7117141434635,
-  "main_percent_of_empirical_roof": 81.6,
-  "main_first_prompt_seconds": 3.33788708299835,
-  "weight_tiles_GiB": 45.5625,
+  "median_prompt_tps": 1967.7582219642345,
+  "percent_of_empirical_roof": 80.41,
+  "decode": {
+    "context": 4096,
+    "generated_tokens": 128,
+    "median_tps_excluding_first_token": 80.98828233217675,
+    "calibrated_bandwidth_roof_tps": 112.09278255626771
+  },
+  "long_context": {
+    "context_tokens": 262144,
+    "generated_tokens": 8,
+    "method": "One text request, 2048-token prefill, ending with eight generated tokens. MLX live allocations and macOS per-process physical footprint are separate accounting measures.",
+    "loaded_MLX_GiB": 18.2259,
+    "active_MLX_after_generation_GiB": 26.3965,
+    "peak_MLX_GiB": 28.4924,
+    "process_after_generation_GiB": 36.0903,
+    "peak_process_GiB": 37.1245,
+    "physical_cache_GiB": {
+      "RotatingKVCache": 0.1562,
+      "convolution": 0.0036,
+      "KVCache": 8.0078
+    }
+  },
+  "matched_process_footprint_GiB_at_163840_tokens": {
+    "previous_expanded_weight_build": 77.4916,
+    "current_packed_weight_build": 31.088
+  },
+  "persistent_extra_weight_tensors": 0,
+  "weight_tiles_GiB": 0,
   "verification": {
+    "weight_memory_guard.py": {
+      "extra_retained_MLX_bytes_after_cache_release": 131208,
+      "canonical_parameter_ids_preserved": true
+    },
     "prefill_guard.py": "Exact stock cache and continuation matches for both prompts and all 48 visits.",
     "decode_guard.py": "Passed 18 full-vocabulary logit comparisons",
     "server_cached_tokens_first_and_repeat": [
