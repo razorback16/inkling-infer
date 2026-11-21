@@ -22,6 +22,7 @@ _kernel = mx.fast.metal_kernel(
     source="""
         #pragma clang fp contract(off)
         uint lane = thread_index_in_simdgroup;
+        float lane_level = levels[lane & 15];
         uint slot = threadgroup_position_in_grid.y;
         uint expert = ids[slot];
         uint first = threadgroup_position_in_grid.x * 16 + simdgroup_index_in_threadgroup * 4;
@@ -34,8 +35,8 @@ _kernel = mx.fast.metal_kernel(
                 uint bits = packed[row * 288 + word];
                 float partial = 0.f;
                 for (uint i = 0; i < 8; i += 4) {
-                    partial += v[i] * levels[bits & 15] + v[i+1] * levels[(bits >> 4) & 15]
-                             + v[i+2] * levels[(bits >> 8) & 15] + v[i+3] * levels[(bits >> 12) & 15];
+                    partial += v[i] * simd_shuffle(lane_level, ushort(bits & 15)) + v[i+1] * simd_shuffle(lane_level, ushort((bits >> 4) & 15))
+                             + v[i+2] * simd_shuffle(lane_level, ushort((bits >> 8) & 15)) + v[i+3] * simd_shuffle(lane_level, ushort((bits >> 12) & 15));
                     bits >>= 16;
                 }
                 float term = partial * fp8_scale(scales[row * 144 + word / 2]);
