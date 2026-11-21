@@ -63,8 +63,9 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
     else:
         key, conv_states[0] = layer.k_sconv(key, conv_states[0], conv_mask)
         value, conv_states[1] = layer.v_sconv(value, conv_states[1], conv_mask)
+    pair = None
     if layer.head_dim == 128 and relative.shape[-1] // layer.num_heads <= 128:
-        query, key, value, rel = normalize(layer, query, key, value, relative)
+        query, key, value, rel, pair = normalize(layer, query, key, value, relative, return_pair=True)
     else:
         query = layer.q_l2_clip(query.reshape(1, 1, layer.num_heads, -1))
         key = layer.k_l2_clip(key.reshape(1, 1, layer.num_key_value_heads, -1))
@@ -79,7 +80,9 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
         query = (query.astype(mx.float32) * tau[..., None, None]).astype(query.dtype)
         rel = (rel.astype(mx.float32) * tau[..., None, None]).astype(rel.dtype)
     q, k, v = (x.transpose(0, 2, 1, 3) for x in (query, key, value))
-    if kv is not None:
+    if pair is not None and getattr(kv, "packed", None) is not None and hasattr(kv, "update_packed"):
+        k, v = kv.update_packed(pair.transpose(0,2,1,3))
+    elif kv is not None:
         k, v = kv.update_and_fetch(k, v)
     if (kv is not None and 1024 <= k.shape[2] <= 8192 and q.shape[-1] == 128
             and type(layer.rel_logits_proj) is layers.RelativeLogits and rel.dtype == q.dtype == mx.bfloat16):

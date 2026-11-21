@@ -17,13 +17,14 @@ def _compile(model):
     @mx.compile
     def run(x, states, offset, slots):
         caches = []
-        for (keys, values, history), slot in zip(states, slots):
-            ring = _DeviceRing(keys, values, offset, slot)
+        for (packed, history), slot in zip(states, slots):
+            keys, values = mx.split(packed, 2, axis=1)
+            ring = _DeviceRing(keys, values, offset, slot, packed=packed)
             conv = ArraysCache(4)
             conv.cache = list(history)
             caches.append(CacheList(ring, conv))
         result = _reference(owner(), x, caches, None)
-        return result, [(c[0].keys, c[0].values, tuple(c[1].cache)) for c in caches]
+        return result, [(c[0].packed, c[0].keys, c[0].values, tuple(c[1].cache)) for c in caches]
 
     return run
 
@@ -51,7 +52,10 @@ def loop(model, x, cache, conv_mask):
                 return _reference(model, x, cache, conv_mask)
             slot = offset
         slots.append(slot)
-        states.append((k.keys, k.values, tuple(conv.cache)))
+        joined = getattr(k, "_joint_decode_state", None)
+        packed = (joined[0] if joined is not None and joined[1] is k.keys and joined[2] is k.values
+                  else mx.concatenate((k.keys, k.values), axis=1))
+        states.append((packed, tuple(conv.cache)))
     saved = getattr(model, "_decode_loop", None)
     if saved is None or not saved[0].matches(model):
         if any(layer.mlp.sharding_group is not None for layer in model.layers):
@@ -63,9 +67,10 @@ def loop(model, x, cache, conv_mask):
         return result
     params = {slot: mx.array([slot], mx.int32) for slot in set(slots + [offset])}
     result, updated = saved[1](x, states, params[offset], [params[i] for i in slots])
-    for c, slot, (keys, values, history) in zip(cache, slots, updated):
+    for c, slot, (packed, keys, values, history) in zip(cache, slots, updated):
         k, conv = c[0], c[1]
         k.keys, k.values = keys, values
+        k._joint_decode_state = (packed, keys, values)
         k.offset += 1
         if type(k) is RotatingKVCache:
             k._idx = slot + 1

@@ -10,15 +10,25 @@ from .finish_layer import decode as _reference
 
 
 class _DeviceRing(RotatingKVCache):
-    def __init__(self, keys, values, offset, slot):
+    def __init__(self, keys, values, offset, slot, packed=None):
+        self.packed = packed
         self.keys = keys
         self.values = values
         self.offset = offset
         self._idx = slot
 
     def update_and_fetch(self, keys, values):
+        if self.packed is not None:
+            return self.update_packed(mx.concatenate((keys, values), axis=1))
         self.keys = mx.slice_update(self.keys, keys, self._idx, axes=(2,))
         self.values = mx.slice_update(self.values, values, self._idx, axes=(2,))
+        self._idx = self._idx + 1
+        self.offset = self.offset + 1
+        return self.keys, self.values
+
+    def update_packed(self, new):
+        self.packed = mx.slice_update(self.packed, new, self._idx, axes=(2,))
+        self.keys, self.values = mx.split(self.packed, 2, axis=1)
         self._idx = self._idx + 1
         self.offset = self.offset + 1
         return self.keys, self.values

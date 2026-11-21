@@ -5,7 +5,7 @@ from mlx_lm.kernels.common import scalar
 _kernel = mx.fast.metal_kernel(
     name="inkling_head_norm",
     input_names=["q", "k", "v", "r", "qs", "rs", "threshold", "rel_threshold", "eps"],
-    output_names=["qo", "ko", "vo", "ro"],
+    output_names=["qo", "kvo", "ro"],
     source="""
         const uint head = threadgroup_position_in_grid.x;
         const uint lane = thread_index_in_simdgroup;
@@ -31,23 +31,24 @@ _kernel = mx.fast.metal_kernel(
         for (uint d = lane; d < width; d += 32) {
             T x = T(states[d/32] * scale);
             if (query) qo[base+d] = x;
-            else if (key) ko[base+d] = x;
-            else if (val) vo[base+d] = x;
+            else if (key) kvo[base+d] = x;
+            else if (val) kvo[KV*D+base+d] = x;
             else ro[base+d] = x;
         }
     """,
 )
 
 
-def normalize(layer, query, key, value, relative):
+def normalize(layer, query, key, value, relative, return_pair=False):
     heads, kv, dim = layer.num_heads, layer.num_key_value_heads, layer.head_dim
     rel = relative.shape[-1] // heads
-    q, k, v, r = _kernel(
+    q, pair, r = _kernel(
         inputs=[query, key, value, relative, layer.q_l2_clip.scale, layer.rel_l2_clip.scale,
                 scalar(layer.q_l2_clip.threshold), scalar(layer.rel_l2_clip.threshold), scalar(layer.eps)],
         template=[("T", query.dtype), ("H", heads), ("KV", kv), ("D", dim), ("R", rel)],
         grid=(32 * (2 * heads + 2 * kv), 1, 1), threadgroup=(32, 1, 1),
-        output_shapes=[(1, 1, heads, dim), (1, 1, kv, dim), (1, 1, kv, dim), (1, 1, heads, rel)],
-        output_dtypes=[query.dtype] * 4,
+        output_shapes=[(1, 1, heads, dim), (1, 1, 2*kv, dim), (1, 1, heads, rel)],
+        output_dtypes=[query.dtype] * 3,
     )
-    return q, k, v, r
+    k, v = mx.split(pair,2,axis=2)
+    return (q, k, v, r, pair) if return_pair else (q, k, v, r)
