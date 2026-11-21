@@ -2,7 +2,7 @@
 import mlx.core as mx
 from mlx_lm.models.inkling2 import layers
 
-from . import depth_norm, expert_gate, router
+from . import postmix, depth_norm, expert_gate, router
 
 _reference = layers.DecoderLayer.__call__
 
@@ -12,10 +12,12 @@ def decode(layer, hidden_states, block_states, *, cache=None, conv_mask=None, me
     from .compiled_ring import _DeviceRing
     moe = layer.mlp
     post = layer.post_mlp_convolution
+    down = moe.experts.down_proj
+    fused_down = can_fuse_down(down, hidden_states)
     if (hidden_states.shape != (1,1,2304) or hidden_states.dtype != mx.bfloat16 or conv_mask is not None
             or cache is None or type(cache[0]) is not _DeviceRing or type(post) is not layers.ShortConvolution
             or post.kernel_size != 4 or moe.sharding_group is not None or moe.gate.top_k != 8
-            or not can_fuse_down(moe.experts.down_proj, hidden_states)):
+            or (not fused_down and getattr(down, "mode", None) != "mxfp8")):
         return _reference(layer, hidden_states, block_states, cache=cache, conv_mask=conv_mask, messages=messages)
     history = list(cache[1].cache)
     if layer.attention_input is None:
@@ -40,12 +42,15 @@ def decode(layer, hidden_states, block_states, *, cache=None, conv_mask=None, me
         x = layer.mlp_message_gate(x,messages[...,3,:])
     x, selected, routing = router.route(layer, x, hidden_states.dtype)
     active = expert_gate.gated_activation(moe.experts,x,selected)
-    down = moe.experts.down_proj
     w = post.conv1d.weight
-    out, next_history = _finish_mix(
-        inputs=[active, selected, routing, down.weight, down.scales, down.global_scale,
-                history[3], w, residual],
-        template=[("T", x.dtype), ("W",w.dtype)], grid=(576*256,1,1), threadgroup=(256,1,1),
-        output_shapes=[x.shape, (1,3,2304)], output_dtypes=[x.dtype,mx.float32])
+    if fused_down:
+        out, next_history = _finish_mix(
+            inputs=[active, selected, routing, down.weight, down.scales, down.global_scale,
+                    history[3], w, residual],
+            template=[("T", x.dtype), ("W",w.dtype)], grid=(576*256,1,1), threadgroup=(256,1,1),
+            output_shapes=[x.shape, (1,3,2304)], output_dtypes=[x.dtype,mx.float32])
+    else:
+        states = down(active, selected).squeeze(-2)
+        out, next_history = postmix.finish(states, routing, history[3], w, residual)
     cache[1].cache = [layers._conv_state(h,None,3) for h in history[:3]] + [next_history]
     return out, block_states
