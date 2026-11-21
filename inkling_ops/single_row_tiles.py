@@ -32,13 +32,11 @@ _pack_rows = mx.fast.metal_kernel(
     """,
 )
 DOT="""
-        uint tiles=COLS/128;
-        uint header=(row/16)*(64+16*tiles*64);
-        uint format=payload[header+row%16];
+        uint format=formats[row];
         ushort base=ushort(format>>24)<<8;
         float dot=0;
         for (uint tile=0;tile<COLS/128;++tile) {
-            uint d=tile*128+lane*4, addr=header+64+(((row%16)/4*tiles+tile)*4+row%4)*64;
+            uint d=tile*128+lane*4, addr=((row/4*(COLS/128)+tile)*4+row%4)*64;
             float4 a=float4(*(device const bfloat4*)(x+d));
             ushort4 bits;
             if (format&(1u<<tile)) {
@@ -59,14 +57,12 @@ DOT="""
 
 def encode(w):
     rows,cols=w.shape
-    payload,formats=_pack_rows(inputs=[w],template=[("COLS",cols)],
+    return _pack_rows(inputs=[w],template=[("COLS",cols)],
                       grid=(rows*32,1,1),threadgroup=(128,1,1),
                       output_shapes=[(rows,cols//128,64),(rows,)],output_dtypes=[mx.uint32,mx.uint32])
-    headers=mx.pad(formats.reshape(-1,16),[(0,0),(0,48)])
-    return (mx.concatenate((headers,payload.reshape(rows//16,-1)),axis=1),)
 
 
-_matvec=mx.fast.metal_kernel(name="inkling_single_tile_matvec",input_names=["x","payload"],
+_matvec=mx.fast.metal_kernel(name="inkling_single_tile_matvec",input_names=["x","payload","formats"],
     output_names=["out"],source="""
         uint lane=thread_index_in_simdgroup,row=thread_position_in_grid.x/32;
     """ + DOT + """
