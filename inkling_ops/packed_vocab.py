@@ -8,7 +8,7 @@ _reference = Model.__call__
 from . import vocab_tiles
 
 
-def project(x, head):
+def project(x, head, rows=None):
     w = head.weight
     n, k = w.shape
     saved = getattr(head, "_encoded_vocab", None)
@@ -16,7 +16,7 @@ def project(x, head):
         packed = vocab_tiles.encode(w)
         saved = (w, packed)
         object.__setattr__(head, "_encoded_vocab", saved)
-    return vocab_tiles.project(x,w,saved[1])
+    return vocab_tiles.project(x,w,saved[1],rows)
 
 
 def call(model, inputs, cache=None, input_embeddings=None, pixel_values=None):
@@ -26,9 +26,11 @@ def call(model, inputs, cache=None, input_embeddings=None, pixel_values=None):
             or head.weight.shape[1] != 2304 or head.weight.shape[0] % 16):
         return _reference(model,inputs,cache=cache,input_embeddings=input_embeddings,pixel_values=pixel_values)
     h = model.model.language_model(inputs,cache=cache,input_embeddings=input_embeddings)
-    logits = project(h,head) if h.dtype == mx.bfloat16 else head(h)
+    limit = model.args.text.unpadded_vocab_size
+    rows = len(range(head.weight.shape[0])[:limit])
+    logits = project(h,head,rows) if h.dtype == mx.bfloat16 and rows else head(h)[...,:limit]
     cap = model.args.text.final_logit_softcapping
-    return (mx.tanh(logits.astype(mx.float32)/cap)*cap)[...,:model.args.text.unpadded_vocab_size]
+    return mx.tanh(logits.astype(mx.float32)/cap)*cap
 
 
 def install():

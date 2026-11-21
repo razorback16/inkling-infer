@@ -49,6 +49,7 @@ _dot = mx.fast.metal_kernel(
     name="inkling_vocab_twelve_bit_dot", input_names=["x","tiles","overflow","formats","offsets"],
     output_names=["out"], source="""
         uint lane=thread_index_in_simdgroup, row=thread_position_in_grid.x/32;
+        if (row>=ROWS) return;
         uint fmt=formats[row], mask=fmt&0x3ffffu;
         ushort base=ushort(fmt>>24)<<8;
         float dot=0;
@@ -84,7 +85,7 @@ def encode(w):
     return tiles,overflow,formats,offsets
 
 
-def project(x,weight,encoded):
-    rows=weight.shape[0]
-    return _dot(inputs=[x,*encoded], grid=(rows*32,1,1), threadgroup=(256,1,1),
+def project(x,weight,encoded,rows=None):
+    rows=weight.shape[0] if rows is None else rows
+    return _dot(inputs=[x,*encoded], template=[("ROWS",rows)], grid=(rows*32,1,1), threadgroup=(256,1,1),
                 output_shapes=[(1,1,rows)], output_dtypes=[x.dtype])[0]
