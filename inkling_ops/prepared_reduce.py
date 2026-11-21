@@ -3,15 +3,17 @@ import mlx.core as mx
 
 _kernel=mx.fast.metal_kernel(
     name="inkling_prepared_message_bottleneck",
-    input_names=["state","message","weight","prepared_state"],output_names=["out"],
+    input_names=["state","message","weight","inverse"],output_names=["out"],
     source="""
         uint tid=thread_position_in_threadgroup.x,lane=thread_index_in_simdgroup;
         uint sg=simdgroup_index_in_threadgroup,bank=threadgroup_position_in_grid.y;
         uint row=threadgroup_position_in_grid.x*4;
         uint state_base=SHARED ? 0 : bank*2304;
         threadgroup float norm[18],parts[8][4];
-        float inv=1;
-        if (!PRECOMPUTED) {
+        float inv;
+        if (PRECOMPUTED) {
+            inv=inverse[SHARED ? 0 : bank];
+        } else {
             for (uint g=sg;g<18;g+=8) {
                 float norm2=0;
                 for (uint i=0;i<4;++i) {
@@ -26,7 +28,7 @@ _kernel=mx.fast.metal_kernel(
         float dots[4]={};
         for (uint d=tid*4;d<4608;d+=1024) {
             for (uint j=0;j<4;++j) {
-                float raw=d<2304 ? (PRECOMPUTED ? float(prepared_state[state_base+d+j]) : state[state_base+d+j]*inv) : float(message[bank*2304+d+j-2304]);
+                float raw=d<2304 ? state[state_base+d+j]*inv : float(message[bank*2304+d+j-2304]);
                 float x=float(bfloat16_t(raw));
                 for (uint r=0;r<4;++r) dots[r]=fma(x,float(weight[(bank*64+row+r)*4608+d+j]),dots[r]);
             }
@@ -52,9 +54,9 @@ def applicable(state, msg, down, up):
             and up.shape[-2:]==(4608,64) and up.dtype in (mx.bfloat16,mx.float32))
 
 
-def reduce(state,msg,down,prepared_state=None):
+def reduce(state,msg,down,inverse=None):
     banks=msg.size//2304
-    return _kernel(inputs=[state,msg,down,state if prepared_state is None else prepared_state],
-                   template=[("SHARED",state.size!=msg.size),("PRECOMPUTED",prepared_state is not None)],
+    return _kernel(inputs=[state,msg,down,state if inverse is None else inverse],
+                   template=[("SHARED",state.size!=msg.size),("PRECOMPUTED",inverse is not None)],
                    grid=(16*256,banks,1),threadgroup=(256,1,1),
                    output_shapes=[msg.shape[:-1]+(64,)],output_dtypes=[mx.bfloat16])[0]

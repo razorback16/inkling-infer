@@ -36,9 +36,9 @@ _kernel = mx.fast.metal_kernel(
 
 
 def attention(layer, x, inputs, cache, conv_states, conv_mask, messages):
-    prepared_state = None
+    inverse = None
     if isinstance(inputs,tuple):
-        inputs, prepared_state = inputs
+        inputs, inverse = inputs
     full = isinstance(layer, layers.FullDecoderLayer)
     ref = _full if full else _sliding
     if x.shape != (1,1,2304) or (not full and messages is None):
@@ -56,7 +56,7 @@ def attention(layer, x, inputs, cache, conv_states, conv_mask, messages):
         from . import triplet
         if getattr(layer._mix_messages,"__func__",None) is triplet.mix_messages:
             source = x if inputs is None else inputs
-            states = triplet.mix_messages(layer,states,messages,source.reshape(-1,1,2304),prepared_state)
+            states = triplet.mix_messages(layer,states,messages,source.reshape(-1,1,2304),inverse)
         else:
             states = layer._mix_messages(states,messages)
     weights = [n.weight for n in norms]
