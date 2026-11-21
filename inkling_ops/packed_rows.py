@@ -42,9 +42,7 @@ _pack = mx.fast.metal_kernel(
 
     """,
 )
-_dot = mx.fast.metal_kernel(
-    name="inkling_four_row_gemv", input_names=["x","weight","payload","bases"],output_names=["out"],
-    source="""
+_dot_source = """
         uint lane=thread_index_in_simdgroup, group=thread_position_in_grid.x/32;
         uchar4 base=*(device const uchar4*)(bases+group*4);
         float sums[4]={};
@@ -72,8 +70,78 @@ _dot = mx.fast.metal_kernel(
             for (ushort step=16;step;step>>=1) dot+=simd_shuffle_down(dot,step);
             if (!lane) out[group*4+r]=bfloat16_t(dot);
         }
+    """
+_dot = mx.fast.metal_kernel(
+    name="inkling_four_row_gemv", input_names=["x","weight","payload","bases"],output_names=["out"],
+    source=_dot_source,
+)
+
+
+
+_count = mx.fast.metal_kernel(
+    name="inkling_count_raw_quads",input_names=["w","bases"],output_names=["counts"],
+    source="""
+        uint lane=thread_index_in_simdgroup,row=thread_position_in_grid.x/32;
+        ushort base=bases[row];
+        uint local=0;
+        for (uint d=lane*4;d<2304;d+=128) {
+            ushort4 bits=*(device const ushort4*)((device const ushort*)w+row*2304+d);
+            ushort4 delta=((bits>>7)&255)-base;
+            local+=uint(any(delta>15)||all(delta==15));
+        }
+        uint total=simd_sum(local);
+        if (!lane) counts[row]=total;
     """,
 )
+_sparse_pack = mx.fast.metal_kernel(
+    name="inkling_pack_raw_quads",input_names=["w","bases","ends"],output_names=["payload","raw"],
+    source="""
+        uint lane=thread_index_in_simdgroup,row=thread_position_in_grid.x/32;
+        ushort base=bases[row];
+        uint cursor=row ? ends[row-1] : 0;
+        for (uint block=0;block<18;++block) {
+            uint d=block*128+lane*4;
+            ushort4 bits=*(device const ushort4*)((device const ushort*)w+row*2304+d);
+            ushort4 delta=((bits>>7)&255)-base;
+            bool escaped=any(delta>15)||all(delta==15);
+            uint index=cursor+simd_prefix_exclusive_sum(uint(escaped));
+            cursor+=simd_sum(uint(escaped));
+            uint lo=as_type<uint>(uchar4((bits<<1)|(bits>>15)));
+            ushort hi=delta.x|(delta.y<<4)|(delta.z<<8)|(delta.w<<12);
+            if (escaped) {
+                *(device ushort4*)(raw+index*4)=bits;
+                lo=index; hi=65535;
+            }
+            uint tile=(row/4)*18+block;
+            payload[tile*192+lane*4+row%4]=lo;
+            ((device ushort*)(payload+tile*192+128))[lane*4+row%4]=hi;
+        }
+    """,
+)
+_sparse_dot = mx.fast.metal_kernel(
+    name="inkling_sparse_escape_gemv",input_names=["x","raw","payload","bases"],output_names=["out"],
+    source=_dot_source.replace("if (any(code==0))","if (h==65535)").replace(
+        "((device const ushort*)weight+(group*4+r)*2304+d)", "(raw+low[r]*4)"),
+)
+
+
+def encode_sparse(weight):
+    rows,cols=weight.shape
+    bases=_ranges(inputs=[weight],grid=(rows*32,1,1),threadgroup=(128,1,1),
+                  output_shapes=[(rows,)],output_dtypes=[mx.uint8])[0]
+    counts=_count(inputs=[weight,bases],grid=(rows*32,1,1),threadgroup=(128,1,1),
+                  output_shapes=[(rows,)],output_dtypes=[mx.uint32])[0]
+    ends=mx.cumsum(counts)
+    size=max(1,int(ends[-1].item()))
+    payload,raw=_sparse_pack(inputs=[weight,bases,ends],grid=(rows*32,1,1),threadgroup=(128,1,1),
+                             output_shapes=[(weight.size//512,192),(size,4)],output_dtypes=[mx.uint32,mx.uint16])
+    return raw,payload,bases
+
+
+def project_sparse(x,weight,encoded):
+    rows=weight.shape[0]
+    return _sparse_dot(inputs=[x,*encoded],grid=(rows*8,1,1),threadgroup=(128,1,1),
+                       output_shapes=[(1,1,rows)],output_dtypes=[x.dtype])[0]
 
 
 def encode(weight):

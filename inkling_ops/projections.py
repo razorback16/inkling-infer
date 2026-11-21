@@ -42,7 +42,7 @@ def prepare_query_weights(model):
             saved = getattr(layer,name+"_tiles",None)
             if weight.shape[0]%16 or (saved is not None and saved[0] is weight):
                 continue
-            encoded = packed_rows.encode(weight)
+            encoded = packed_rows.encode_sparse(weight)
             object.__setattr__(layer,name+"_tiles",(weight,encoded))
             arrays.extend(encoded)
     if arrays:
@@ -61,7 +61,7 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
     name = "_all_qkv" if same else "_common_q"
     packed, boundaries = projection(layer,modules,name)
     tiles = getattr(layer,name+"_tiles",None)
-    projected = (packed_rows.project(hidden_states,packed,tiles[1])
+    projected = (packed_rows.project_sparse(hidden_states,packed,tiles[1])
                  if tiles is not None and tiles[0] is packed and hidden_states.dtype==mx.bfloat16
                  else hidden_states @ packed.T)
     parts = mx.split(projected,boundaries,axis=-1)
