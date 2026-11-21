@@ -7,7 +7,6 @@ _kernel = mx.fast.metal_kernel(
     input_names=["q", "k", "v", "r", "qs", "rs", "threshold", "rel_threshold", "eps"],
     output_names=["qo", "kvo", "ro"],
     source="""
-        #pragma clang fp contract(off)
         const uint head = threadgroup_position_in_grid.x;
         const uint lane = thread_index_in_simdgroup;
         const bool query = head < H;
@@ -19,28 +18,18 @@ _kernel = mx.fast.metal_kernel(
         const uint base = local_head * width;
         float states[D / 32];
         float sum = 0;
-        for (uint d = lane * ((width+31)/32); d < min(width,(lane+1)*((width+31)/32)); ++d) {
+        for (uint d = lane; d < width; d += 32) {
             uint i = base + d;
             float x = query ? float(q[i]) * float(qs[i]) :
                       key ? float(k[i]) : val ? float(v[i]) : float(r[i]) * float(rs[i]);
-            states[d % ((width+31)/32)] = x;
-            float square = x*x;
-            sum += square;
+            states[d/32] = x;
+            sum += x*x;
         }
-        if (rel && R <= 64) {
-            sum = 0;
-            for (uint j = 0; j < R; ++j) {
-                float y = float(r[base+j]) * float(rs[base+j]);
-                float square = y*y;
-                sum += square;
-            }
-        } else {
-            sum = simd_sum(sum);
-        }
+        sum = simd_sum(sum);
         float scale = val ? metal::precise::rsqrt(sum / float(D) + eps) :
             min(1.0f, (rel ? rel_threshold : threshold) / (metal::precise::sqrt(sum) + 1e-6f));
-        for (uint d = lane * ((width+31)/32); d < min(width,(lane+1)*((width+31)/32)); ++d) {
-            T x = T(states[d % ((width+31)/32)] * scale);
+        for (uint d = lane; d < width; d += 32) {
+            T x = T(states[d/32] * scale);
             if (query) qo[base+d] = x;
             else if (key) kvo[base+d] = x;
             else if (val) kvo[KV*D+base+d] = x;
