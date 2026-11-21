@@ -1,6 +1,5 @@
 """Trace the recurrent layer visits together for one-token fixed-capacity decode."""
 import weakref
-from functools import lru_cache
 
 import mlx.core as mx
 from .parameter_guard import CapturedParameters
@@ -13,17 +12,7 @@ from . import prepared_bank, block_lookahead
 _reference = TextModel._run_loop
 
 
-@lru_cache(maxsize=1)
-def _coordinates():
-    # Keep immutable one-element Metal views for the supported compiled cache capacities.
-    table=mx.arange(8192,dtype=mx.int32)
-    views=tuple(mx.split(table,8192))
-    mx.eval(views)
-    return views
-
-
 def _compile(model):
-    _coordinates()
     from . import filtered_output, filtered_kv
     filtered_output.prepare(model)
     filtered_kv.prepare(model)
@@ -132,8 +121,7 @@ def loop(model, x, cache, conv_mask):
         result = _reference(model, x, cache, conv_mask)
         guard.capture(model)
         return result
-    coordinates=_coordinates()
-    params={s:coordinates[s] if 0<=s<len(coordinates) else mx.array([s],mx.int32) for s in set(slots+[offset])}
+    params = {slot: mx.array([slot], mx.int32) for slot in set(slots + [offset])}
     rows = [i for i,c in enumerate(cache) if type(c[0]) is RotatingKVCache
             and states[i][0].shape == (1,16,1024,128) and states[i][0].dtype == mx.bfloat16]
     slab = None
