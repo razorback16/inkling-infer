@@ -132,6 +132,7 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
         table=getattr(layer,"_decode_position_table",None)
         if table is not None and table[0]==(layer.log_scaling_alpha,layer.log_scaling_n_floor):
             position=(table[1],kv.offset)
+    bias_table=None
     pair = None
     if fused_norm or dynamic_norm:
         if dynamic_norm:
@@ -139,7 +140,17 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
                      layer.k_sconv.weight_proj(key_hidden_states),layer.v_sconv.weight_proj(value_hidden_states)]
         else:
             filters=[*conv_states[:2],layer.k_sconv.conv1d.weight,layer.v_sconv.conv1d.weight]
-        query, pair, rel, conv_states[:2] = normalize(layer,query,key,value,relative,filters=filters,position=position)
+        rel_weight=None
+        if (fused_norm and getattr(kv,"grouped",False) and query.dtype==mx.bfloat16
+                and type(layer.rel_logits_proj) is layers.RelativeLogits
+                and layer.rel_logits_proj.proj.shape==(16,1024)
+                and relative.shape[-1]==layer.num_heads*16):
+            rel_weight=layer.rel_logits_proj.proj.astype(query.dtype)
+        query,pair,rel,windows=normalize(layer,query,key,value,relative,filters=filters,
+                                        position=position,relative_weights=rel_weight)
+        if rel_weight is not None:
+            bias_table=windows.pop()
+        conv_states[:2]=windows
         key,value = mx.split(pair,2,axis=2)
     elif layer.head_dim == 128 and relative.shape[-1] // layer.num_heads <= 128:
         query, key, value, rel, pair = normalize(layer, query, key, value, relative, return_pair=True)
@@ -166,7 +177,7 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
     if (kv is not None and 1024 <= k.shape[2] <= 8192 and q.shape[-1] == 128
             and type(layer.rel_logits_proj) is layers.RelativeLogits and rel.dtype == q.dtype == mx.bfloat16):
         from . import grouped_attn
-        features=grouped_attn.attend(layer,q,k,v,rel,sinks,kv,gate)
+        features=grouped_attn.attend(layer,q,k,v,rel,sinks,kv,gate,bias_table)
         from . import filtered_output
         out=filtered_output.apply(layer.o_proj,features,getattr(kv,"output_filter",None))
         return layer.o_proj(features) if out is None else out

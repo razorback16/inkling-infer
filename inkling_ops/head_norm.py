@@ -110,7 +110,28 @@ _positioned=mx.fast.metal_kernel(
 )
 
 
-def normalize(layer, query, key, value, relative, return_pair=False, filters=None, position=None):
+_bias_source=_source.replace("const uint head = threadgroup_position_in_grid.x;",
+    "const uint g=threadgroup_position_in_grid.x; uint start=H+2*KV; "
+    "const uint head=g<start ? g : start+(g-start)/8; uint seg=(g-start)%8; float rv=0;")
+_bias_source=_bias_source.replace("            states[d",_filter+"            states[d",1)
+_bias_source=_bias_source.replace("else ro[base+d] = x;","else { rv=float(x); if (!seg) ro[base+d]=x; }")
+_bias_source+="""
+        if (rel) {
+            for (uint k=0;k<4;++k) {
+                uint pos=seg*128+k*32+lane;
+                float dot=0;
+                for (uint j=0;j<R;++j)
+                    dot=fma(simd_shuffle(rv,j),float(relative_w[j*1024+pos]),dot);
+                bias[local_head*1024+pos]=T(dot);
+            }
+        }
+"""
+_bias_kernel=mx.fast.metal_kernel(name="inkling_head_norm_relative_table",
+    input_names=_inputs+["kh","vh","kw","vw","relative_w"],
+    output_names=_outputs+["k_window","v_window","bias"],source=_bias_source)
+
+
+def normalize(layer, query, key, value, relative, return_pair=False, filters=None, position=None, relative_weights=None):
     heads, kv, dim = layer.num_heads, layer.num_key_value_heads, layer.head_dim
     rel = relative.shape[-1] // heads
     inputs = [query, key, value, relative, layer.q_l2_clip.scale, layer.rel_l2_clip.scale,
@@ -131,8 +152,15 @@ def normalize(layer, query, key, value, relative, return_pair=False, filters=Non
         else:
             template.append(("W", filters[2].dtype))
             kernel=_filtered
+    groups=2*heads+2*kv
+    if relative_weights is not None:
+        kernel=_bias_kernel
+        inputs.append(relative_weights)
+        shapes.append((heads,1024))
+        types.append(query.dtype)
+        groups+=7*heads
     q, pair, r, *windows = kernel(
-        inputs=inputs, template=template, grid=(32*(2*heads+2*kv),1,1), threadgroup=(32,1,1),
+        inputs=inputs, template=template, grid=(32*groups,1,1), threadgroup=(32,1,1),
         output_shapes=shapes, output_dtypes=types)
     if filters is not None:
         return q, pair, r, windows
