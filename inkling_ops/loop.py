@@ -12,6 +12,13 @@ from . import prepared_bank, block_lookahead
 _reference = TextModel._run_loop
 
 
+def _position_order(x, encode):
+    # The eight positions consumed by a sliding attention warp become neighbors.
+    batch, heads, size, dim = x.shape
+    groups, width = (8,128) if encode else (128,8)
+    return x.reshape(batch,heads,groups,width,dim).transpose(0,1,3,2,4).reshape(x.shape)
+
+
 def _compile(model):
     groups=block_lookahead.prepare(model)
     owner = weakref.ref(model)
@@ -26,7 +33,8 @@ def _compile(model):
                 slot = ring_slot if shared else offset
             if shared:
                 row = len(grouped)
-                packed = slab[row:row+1]
+                swizzled = slab[row:row+1]
+                packed = _position_order(swizzled,False)
             pages = packed if isinstance(packed, tuple) else None
             storage = mx.concatenate(pages, axis=2) if pages is not None else packed
             keys, values = mx.split(storage, 2, axis=1)
@@ -34,6 +42,7 @@ def _compile(model):
             if shared:
                 grouped.append(ring)
                 ring.grouped = True
+                ring.swizzled = swizzled
             if pages is not None:
                 ring.page_prefix, ring.page_tail = pages
             conv = ArraysCache(4)
@@ -47,8 +56,9 @@ def _compile(model):
                 if value is None:
                     value = mx.take(ring.packed,ring.write_coordinates[0],axis=2)
                 updates.append(value)
-            slab = mx.slice_update(slab, mx.concatenate(updates,axis=0),
-                                   grouped[0].write_coordinates[0], axes=(2,))
+            logical_slot = grouped[0].write_coordinates[0]
+            physical_slot = (logical_slot % 128)*8 + logical_slot//128
+            slab = mx.slice_update(slab,mx.concatenate(updates,axis=0),physical_slot,axes=(2,))
         return result, slab, [
             (tuple(c[1].cache),) if getattr(c[0],"grouped",False) else
             (c[0].page_tail, tuple(c[1].cache)) if hasattr(c[0], "page_tail")
@@ -111,7 +121,7 @@ def loop(model, x, cache, conv_mask):
         old = getattr(cache[rows[0]][0], "_shared_rings", None)
         reusable = old is not None and len(tensors)==len(old[1]) and all(
             a is b for a,b in zip(tensors,old[1]))
-        slab = old[0] if reusable else mx.concatenate(tensors,axis=0)
+        slab = old[0] if reusable else mx.contiguous(_position_order(mx.concatenate(tensors,axis=0),True))
         for i in rows:
             incoming[i] = (None,states[i][1])
     ring_slot = None if slab is None else params[slots[rows[0]]]
@@ -124,7 +134,7 @@ def loop(model, x, cache, conv_mask):
         if len(update) == 1:
             history = update[0]
             row = len(views)
-            packed = slab[row:row+1]
+            packed = _position_order(slab[row:row+1],False)
             views.append(packed)
             keys, values = mx.split(packed,2,axis=1)
         elif len(update) == 2:

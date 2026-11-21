@@ -31,7 +31,7 @@ _partial = mx.fast.metal_kernel(
             float scores[8];
             #pragma clang loop unroll(full)
             for (uint pos=0; pos<8; ++pos) {
-                uint at=((kv*1024+tile+pos*128)*128)+d;
+                uint at=((kv*1024+(SWIZZLE_KV ? tile*8+pos : tile+pos*128))*128)+d;
                 auto key_ptr = FRESH && uint(newest)==tile+pos*128 ? fresh+kv*128+d : k+at;
                 float4 key=float4(*(device const bfloat4*)key_ptr);
                 float score=0;
@@ -40,7 +40,7 @@ _partial = mx.fast.metal_kernel(
             }
             #pragma clang loop unroll(full)
             for (uint pos=0; pos<8; ++pos) {
-                uint at=((kv*1024+tile+pos*128)*128)+d;
+                uint at=((kv*1024+(SWIZZLE_KV ? tile*8+pos : tile+pos*128))*128)+d;
                 auto value_ptr = FRESH && uint(newest)==tile+pos*128 ? fresh+(NKV+kv)*128+d : v+at;
                 float4 value=float4(*(device const bfloat4*)value_ptr);
                 float score=scores[pos], top=max(peak,score);
@@ -141,10 +141,13 @@ def attend(layer,q,k,v,rel,sinks,cache,gate):
     if before is None:
         slot, end = mx.array(slot,mx.int32).reshape(1), mx.array(end,mx.int32).reshape(1)
     fresh = getattr(cache,"fresh",None)
+    swizzle_kv = fresh is not None and hasattr(cache,"swizzled")
+    if swizzle_kv:
+        k,v = mx.split(cache.swizzled,2,axis=1)
     parts,stats = _partial(
         inputs=[q,k,v,tail,q if fresh is None else fresh,rel,w,slot,end,
                 sinks.astype(q.dtype),scalar(layer.scaling)],
-        template=[("T",q.dtype),("S",length),("PRE_UPDATE",before is not None),("PAGED",paged),("FRESH",fresh is not None),("NKV",k.shape[1]),("GQA",heads//k.shape[1]),("WIDTH",width),("SWIZZLED",swizzled),
+        template=[("T",q.dtype),("S",length),("PRE_UPDATE",before is not None),("PAGED",paged),("FRESH",fresh is not None),("SWIZZLE_KV",swizzle_kv),("NKV",k.shape[1]),("GQA",heads//k.shape[1]),("WIDTH",width),("SWIZZLED",swizzled),
                   ("R",extent),("WINDOW",layer.sliding_window)],
         grid=(128*32,heads,1),threadgroup=(128,1,1),
         output_shapes=[(heads,128,128),(heads,128,2)],output_dtypes=[q.dtype,mx.float32])
