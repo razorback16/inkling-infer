@@ -145,6 +145,9 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
         table=getattr(layer,"_decode_position_table",None)
         if table is not None and table[0]==(layer.log_scaling_alpha,layer.log_scaling_n_floor):
             position=(table[1],kv.offset)
+    prepare_scale = (not full and getattr(kv,"grouped",False) and layer.head_dim==128
+                     and query.dtype==relative.dtype==mx.bfloat16 and type(layer.rel_logits_proj) is layers.RelativeLogits)
+    scaled_query = None
     pair = None
     if fused_norm or dynamic_norm:
         if dynamic_norm:
@@ -152,16 +155,19 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
                      layer.k_sconv.weight_proj(key_hidden_states),layer.v_sconv.weight_proj(value_hidden_states)]
         else:
             filters=[*conv_states[:2],layer.k_sconv.conv1d.weight,layer.v_sconv.conv1d.weight]
-        query, pair, rel, conv_states[:2] = normalize(layer,query,key,value,relative,filters=filters,position=position)
+        query, pair, rel, conv_states[:2] = normalize(layer,query,key,value,relative,filters=filters,position=position,prepare_scale=prepare_scale)
         key,value = mx.split(pair,2,axis=2)
     elif layer.head_dim == 128 and relative.shape[-1] // layer.num_heads <= 128:
-        query, key, value, rel, pair = normalize(layer, query, key, value, relative, return_pair=True)
+        query, key, value, rel, pair = normalize(layer, query, key, value, relative, return_pair=True, prepare_scale=prepare_scale)
     else:
         query = layer.q_l2_clip(query.reshape(1, 1, layer.num_heads, -1))
         key = layer.k_l2_clip(key.reshape(1, 1, layer.num_key_value_heads, -1))
         value = value.reshape(1, 1, layer.num_key_value_heads, -1)
         value = layers.unweighted_rms_norm(value.astype(mx.float32), layer.eps).astype(value.dtype)
         rel = layer.rel_l2_clip(relative.reshape(1, 1, layer.num_heads, -1))
+    if isinstance(query,tuple):
+        query,scaled_query = query
+        scaled_query = scaled_query.transpose(0,2,1,3)
     if full and position is None and not unscaled:
         offset = kv.offset if kv is not None else 0
         pos = layers._positions(offset, 1).astype(mx.float32)
@@ -179,7 +185,7 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
     if (kv is not None and 1024 <= k.shape[2] <= 8192 and q.shape[-1] == 128
             and type(layer.rel_logits_proj) is layers.RelativeLogits and rel.dtype == q.dtype == mx.bfloat16):
         from . import grouped_attn
-        features=grouped_attn.attend(layer,q,k,v,rel,sinks,kv,gate)
+        features=grouped_attn.attend(layer,q,k,v,rel,sinks,kv,gate,scaled_query)
         from . import filtered_output
         out=filtered_output.apply(layer.o_proj,features,getattr(kv,"output_filter",None))
         return layer.o_proj(features) if out is None else out

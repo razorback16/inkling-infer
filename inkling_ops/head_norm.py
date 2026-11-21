@@ -71,6 +71,24 @@ _filtered = mx.fast.metal_kernel(
 
 
 
+def _scaled_kernel(filtered):
+    source = _source
+    inputs = _inputs
+    outputs = _outputs
+    if filtered:
+        source = source.replace("            states[d", _filter + "            states[d", 1)
+        inputs = inputs + ["kh","vh","kw","vw"]
+        outputs = outputs + ["k_window","v_window"]
+    source = source.replace("if (query) qo[base+d] = x;",
+                            "if (query) { qo[base+d] = x; scaled[base+d] = attention_scale * float(x); }")
+    return mx.fast.metal_kernel(name="inkling_scaled_filtered_heads" if filtered else "inkling_scaled_heads",
+                                input_names=inputs+["attention_scale"],output_names=outputs+["scaled"],source=source)
+
+
+_scaled = _scaled_kernel(False)
+_scaled_filtered = _scaled_kernel(True)
+
+
 _dynamic_filter = """
             if (key || val) {
                 auto hist=key ? kh : vh;
@@ -110,7 +128,7 @@ _positioned=mx.fast.metal_kernel(
 )
 
 
-def normalize(layer, query, key, value, relative, return_pair=False, filters=None, position=None):
+def normalize(layer, query, key, value, relative, return_pair=False, filters=None, position=None, prepare_scale=False):
     heads, kv, dim = layer.num_heads, layer.num_key_value_heads, layer.head_dim
     rel = relative.shape[-1] // heads
     inputs = [query, key, value, relative, layer.q_l2_clip.scale, layer.rel_l2_clip.scale,
@@ -131,9 +149,17 @@ def normalize(layer, query, key, value, relative, return_pair=False, filters=Non
         else:
             template.append(("W", filters[2].dtype))
             kernel=_filtered
+    if prepare_scale:
+        kernel = _scaled_filtered if filters is not None else _scaled
+        inputs.append(scalar(layer.scaling))
+        shapes.append(shapes[0])
+        types.append(mx.float32)
     q, pair, r, *windows = kernel(
         inputs=inputs, template=template, grid=(32*(2*heads+2*kv),1,1), threadgroup=(32,1,1),
         output_shapes=shapes, output_dtypes=types)
+    if prepare_scale:
+        scaled = windows.pop()
+        q = (q, scaled)
     if filters is not None:
         return q, pair, r, windows
     k, v = mx.split(pair,2,axis=2)

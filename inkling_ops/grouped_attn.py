@@ -14,7 +14,7 @@ _partial = mx.fast.metal_kernel(
         uint kv = head / GQA, d = lane*4;
         uint addr = (head*128+tile);
         float4 query;
-        for (uint j=0; j<4; ++j) query[j] = scale*float(q[head*128+d+j]);
+        for (uint j=0; j<4; ++j) query[j] = SCALED ? float(q[head*128+d+j]) : scale*float(q[head*128+d+j]);
         float peak = tile ? -FLT_MAX : float(sinks[head]);
         float total = tile ? 0.f : 1.f;
         float4 accum = 0;
@@ -121,7 +121,7 @@ _merge = mx.fast.metal_kernel(
 )
 
 
-def attend(layer,q,k,v,rel,sinks,cache,gate):
+def attend(layer,q,k,v,rel,sinks,cache,gate,scaled_query=None):
     length, heads = k.shape[2], q.shape[1]
     slot = cache._idx if isinstance(cache,(RotatingKVCache,BatchRotatingKVCache)) else length
     before = getattr(cache, "write_coordinates", None)
@@ -147,9 +147,9 @@ def attend(layer,q,k,v,rel,sinks,cache,gate):
     fresh = getattr(cache,"fresh",None)
     adjacent=getattr(cache,"interleaved_prefix",None)
     parts,stats = _partial(
-        inputs=[q,k if adjacent is None else adjacent,v if adjacent is None else adjacent,tail,q if fresh is None else fresh,rel,w,slot,end,
+        inputs=[q if scaled_query is None else scaled_query,k if adjacent is None else adjacent,v if adjacent is None else adjacent,tail,q if fresh is None else fresh,rel,w,slot,end,
                 sinks.astype(q.dtype),scalar(layer.scaling)],
-        template=[("T",q.dtype),("S",length),("PRE_UPDATE",before is not None),("PAGED",paged),("ADJACENT",adjacent is not None),("FRESH",fresh is not None),("NKV",k.shape[1]),("GQA",heads//k.shape[1]),("WIDTH",width),("SWIZZLED",swizzled),
+        template=[("SCALED",scaled_query is not None),("T",q.dtype),("S",length),("PRE_UPDATE",before is not None),("PAGED",paged),("ADJACENT",adjacent is not None),("FRESH",fresh is not None),("NKV",k.shape[1]),("GQA",heads//k.shape[1]),("WIDTH",width),("SWIZZLED",swizzled),
                   ("R",extent),("WINDOW",layer.sliding_window)],
         grid=(128*32,heads,1),threadgroup=(128,1,1),
         output_shapes=[(heads,128,128),(heads,128,2)],output_dtypes=[q.dtype,mx.float32])
