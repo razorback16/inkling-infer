@@ -26,7 +26,7 @@ def mix(states, weights, dtype):
                 output_shapes=[(1, 1, 2304)], output_dtypes=[dtype])[0]
 
 
-def _make_down(finish):
+def _make_down(finish, interleaved=False):
     inputs = ["hidden", "indices", "routing", "packed", "scales", "amax"]
     outputs = ["out"]
     store = "out[channel + lane] = T(value);"
@@ -48,7 +48,7 @@ def _make_down(finish):
             out[c] = T(residual[c] + filtered);
         """
     return mx.fast.metal_kernel(
-        name="inkling_finish_nvfp4_layer" if finish else "inkling_nvfp4_down_mix",
+        name="inkling_interleaved_down_rows" if interleaved else ("inkling_finish_nvfp4_layer" if finish else "inkling_nvfp4_down_mix"),
         input_names=inputs, output_names=outputs,
     header="""
         constant float fp4_values[16] = {
@@ -105,12 +105,19 @@ def _make_down(finish):
             }
             STORE
         }
-    """.replace("STORE", store),
+    """.replace("STORE", store).replace(
+        "for (uint r = 0; r < 4; ++r) {\n                uint row",
+        ("uint4 words = *(device const uint4*)(packed+(first_row*144+word*4)); "
+         "uchar4 factors = *(device const uchar4*)(scales+(first_row*72+(word/2)*4)); "
+         if interleaved else "")+"for (uint r = 0; r < 4; ++r) {\n                uint row"
+    ).replace("packed[row * 144 + word]", "words[r]" if interleaved else "packed[row * 144 + word]"
+    ).replace("scales[row * 72 + word / 2]", "factors[r]" if interleaved else "scales[row * 72 + word / 2]"),
     )
 
 
 _down_mix = _make_down(False)
 _finish_mix = _make_down(True)
+_interleaved_finish = _make_down(True,True)
 
 
 def can_fuse_down(down, x):
@@ -157,3 +164,19 @@ def install():
     compiled_ring.install()
     dynamic_conv.install()
     layers.SparseMoeBlock.__call__ = single_token_moe
+
+
+def prepare_down_weights(model):
+    for layer in model.layers:
+        down=layer.mlp.experts.down_proj
+        if getattr(down,"mode",None)!="nvfp4" or down.weight.shape[1:]!=(2304,144) or down.scales.shape[1:]!=(2304,72):
+            continue
+        saved=getattr(down,"_interleaved_rows",None)
+        if saved is not None and saved[0] is down.weight and saved[1] is down.scales:
+            continue
+        def interleave(a):
+            experts,rows,width=a.shape
+            return mx.contiguous(a.reshape(experts,rows//4,4,width).transpose(0,1,3,2))
+        weights,scales=interleave(down.weight),interleave(down.scales)
+        mx.eval(weights,scales)
+        object.__setattr__(down,"_interleaved_rows",(down.weight,down.scales,weights,scales))

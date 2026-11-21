@@ -9,7 +9,7 @@ _reference = layers.DecoderLayer.__call__
 
 
 def decode(layer, hidden_states, block_states, *, cache=None, conv_mask=None, messages=None):
-    from inkling_kernel import _finish_mix, can_fuse_down
+    from inkling_kernel import _finish_mix, _interleaved_finish, can_fuse_down
     from .compiled_ring import _DeviceRing
     normalized_messages = None
     if isinstance(messages,tuple):
@@ -86,8 +86,12 @@ def decode(layer, hidden_states, block_states, *, cache=None, conv_mask=None, me
     active = expert_gate.gated_activation(moe.experts,x,selected)
     w = post.conv1d.weight
     if fused_down:
-        out, next_history = _finish_mix(
-            inputs=[active, selected, routing, down.weight, down.scales, down.global_scale,
+        saved=getattr(down,"_interleaved_rows",None)
+        tiled=saved is not None and saved[0] is down.weight and saved[1] is down.scales
+        weight,scales=saved[2:] if tiled else (down.weight,down.scales)
+        kernel=_interleaved_finish if tiled else _finish_mix
+        out, next_history = kernel(
+            inputs=[active, selected, routing, weight, scales, down.global_scale,
                     history[3], w, residual],
             template=[("T", x.dtype), ("W",w.dtype)], grid=(576*256,1,1), threadgroup=(256,1,1),
             output_shapes=[x.shape, (1,3,2304)], output_dtypes=[x.dtype,mx.float32])
