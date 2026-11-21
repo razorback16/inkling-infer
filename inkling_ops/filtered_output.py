@@ -48,7 +48,7 @@ _compact_rows = mx.fast.metal_kernel(
         uint lane=thread_index_in_simdgroup, row=thread_position_in_grid.x/32;
         uint sg=simdgroup_index_in_threadgroup;
     """ + single_row_tiles.DOT + """
-        threadgroup float values[4];
+        threadgroup float values[16];
         if (!lane) {
             float v=float(bfloat16_t(dot)),filtered=0;
             for (uint t=0;t<3;++t) {
@@ -64,9 +64,9 @@ _compact_rows = mx.fast.metal_kernel(
             values[sg]=out;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (!sg && !lane) {
+        if (sg%4==0 && !lane) {
             float norm2=0;
-            for (uint i=0;i<4;++i) norm2+=values[i]*values[i];
+            for (uint i=0;i<4;++i) norm2+=values[sg+i]*values[sg+i];
             squares[row/4]=norm2;
         }
     """,
@@ -103,6 +103,6 @@ def apply(projection, x, post):
             [x,projection.weight,history,conv,hidden])
     return tuple(kernel(inputs=inputs,
                          template=[("W",conv.dtype),("BOUNDARY",layer.is_block_boundary),("COLS",3072)],
-                         grid=((2304 if compact else 576)*32,1,1),threadgroup=(128,1,1),
+                         grid=((2304 if compact else 576)*32,1,1),threadgroup=(512 if compact else 128,1,1),
                          output_shapes=[hidden.shape,(1,4,2304),(576,)],
                          output_dtypes=[mx.float32]*3))

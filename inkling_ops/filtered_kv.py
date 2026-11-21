@@ -97,7 +97,7 @@ def apply(layer,k,v,histories,mask):
     saved=getattr(layer,"_filter_tiles",None)
     if saved is not None and saved[0] is layer.k_proj.weight and saved[1] is layer.v_proj.weight:
         return _compact(inputs=[k,v,*saved[2],kc,vc,*histories[:2]],
-                        template=[("COLS",2304),("W",kc.dtype)],grid=(2048*32,1,1),threadgroup=(128,1,1),
+                        template=[("COLS",2304),("W",kc.dtype)],grid=(2048*32,1,1),threadgroup=(1024,1,1),
                         output_shapes=[(1,1,1024)]*2+[(1,4,1024)]*2,output_dtypes=[k.dtype]*2+[mx.float32]*2)
     return _project(inputs=[k,v,layer.k_proj.weight,layer.v_proj.weight,kc,vc,*histories[:2]],
                     template=[("W",kc.dtype)],grid=(256*32,2,1),threadgroup=(128,1,1),
