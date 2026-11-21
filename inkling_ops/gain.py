@@ -9,11 +9,13 @@ _source = """
         uint base = (bank * 4608 + row) * 64;
         float f = 0, g = 0;
         for (uint tile = 0; tile < 64; tile += 16) {
+            uint k = tile + col;
+            float4 values = float4(*(device const vec<X, 4>*)(x + bank * 64 + k));
+            float4 forget = float4(*(device const vec<W, 4>*)(packed + base + k));
+            float4 gain = float4(*(device const vec<W, 4>*)(packed + base + 2304 * 64 + k));
             for (uint i = 0; i < 4; ++i) {
-                uint k = tile + col + i;
-                float v = float(x[bank * 64 + k]);
-                f = fma(v, float(packed[base + k]), f);
-                g = fma(v, float(packed[base + 2304 * 64 + k]), g);
+                f = fma(values[i], forget[i], f);
+                g = fma(values[i], gain[i], g);
             }
         }
         f += simd_shuffle_down(f, 2);
@@ -61,7 +63,8 @@ def apply(x, packed, state, messages, with_sums=False):
     if with_sums:
         shapes.append((banks,18))
     kernel = _with_sums if with_sums else _kernel
-    result = kernel(inputs=[x,packed,state,messages],template=[("SHARED",state.size != messages.size)],
+    result = kernel(inputs=[x,packed,state,messages],template=[("SHARED",state.size != messages.size),
+                                                             ("X",x.dtype),("W",packed.dtype)],
                     grid=(2304*4,banks,1),threadgroup=(512 if with_sums else 128,1,1),
                     output_shapes=shapes,output_dtypes=[mx.float32]*len(shapes))
     return tuple(result) if with_sums else result[0]
