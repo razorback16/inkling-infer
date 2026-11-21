@@ -61,17 +61,27 @@ _epilogue = """
             else pair[(key ? 0 : 1024)+d]=value;
         }
 """
-_kernel=mx.fast.metal_kernel(
-    name="inkling_project_complete_heads",input_names=["x","payload","qs","rs","qt","rt","eps","attention_scale","kh","vh","kw","vw"],
-    output_names=["q","scaled","rel","gate","pair","k_window","v_window"],
-    source="#pragma clang fp contract(off)\nthreadgroup bfloat16_t raw[128]; uint sg=simdgroup_index_in_threadgroup;\n"+
-    _dot_source.replace("out[group*4+r]=bfloat16_t(dot);","raw[sg*4+r]=bfloat16_t(dot);")+_epilogue,
-)
+def _make_kernel(distinct):
+    inputs=["x","payload","qs","rs","qt","rt","eps","attention_scale","kh","vh","kw","vw"]
+    prefix="#pragma clang fp contract(off)\nthreadgroup bfloat16_t raw[128]; uint sg=simdgroup_index_in_threadgroup;\n"
+    projection=_dot_source.replace("out[group*4+r]=bfloat16_t(dot);","raw[sg*4+r]=bfloat16_t(dot);")
+    if distinct:
+        inputs+=["kx","vx"]
+        prefix+="uint bank=threadgroup_position_in_grid.x; auto input=bank<51 ? x : bank<59 ? kx : vx;\n"
+        projection=projection.replace("(x+d)","(input+d)")
+    return mx.fast.metal_kernel(
+        name="inkling_project_recurrent_heads" if distinct else "inkling_project_complete_heads",input_names=inputs,
+        output_names=["q","scaled","rel","gate","pair","k_window","v_window"],source=prefix+projection+_epilogue)
 
 
-def compute(layer,x,packed,tiles,conv_states,conv_mask,kv):
+_kernel=_make_kernel(False)
+_distinct=_make_kernel(True)
+
+
+def compute(layer,x,packed,tiles,conv_states,conv_mask,kv,extra=()):
     if (not getattr(kv,"grouped",False) or layer.sliding_window!=1024 or conv_mask is not None
             or tiles is None or tiles[0] is not packed or x.dtype!=mx.bfloat16 or packed.shape!=(8576,2304)
+            or any(v.shape!=x.shape or v.dtype!=x.dtype for v in extra)
             or (layer.head_dim,layer.num_heads,layer.num_key_value_heads)!=(128,24,8)
             or type(layer.rel_logits_proj) is not layers.RelativeLogits or conv_states is None
             or any(type(c) is not layers.ShortConvolution or c.kernel_size!=4 for c in (layer.k_sconv,layer.v_sconv))
@@ -80,9 +90,10 @@ def compute(layer,x,packed,tiles,conv_states,conv_mask,kv):
     kw,vw=layer.k_sconv.conv1d.weight,layer.v_sconv.conv1d.weight
     if kw.dtype!=vw.dtype or kw.shape!=vw.shape:
         return None
-    q,scaled,rel,gate,pair,kh,vh=_kernel(
+    kernel=_distinct if extra else _kernel
+    q,scaled,rel,gate,pair,kh,vh=kernel(
         inputs=[x,*tiles[1],layer.q_l2_clip.scale,layer.rel_l2_clip.scale,scalar(layer.q_l2_clip.threshold),
-                scalar(layer.rel_l2_clip.threshold),scalar(layer.eps),scalar(layer.scaling),*conv_states[:2],kw,vw],
+                scalar(layer.rel_l2_clip.threshold),scalar(layer.eps),scalar(layer.scaling),*conv_states[:2],kw,vw,*extra],
         template=[("W",kw.dtype)],grid=(8576*8,1,1),threadgroup=(1024,1,1),
         output_shapes=[(1,24,1,128),(1,24,1,128),(1,1,24,16),(1,1,3072),(1,16,1,128),(1,4,1024),(1,4,1024)],
         output_dtypes=[mx.bfloat16,mx.float32,mx.bfloat16,mx.bfloat16,mx.bfloat16,mx.float32,mx.float32])

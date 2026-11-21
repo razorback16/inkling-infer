@@ -108,12 +108,18 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
     name = "_all_qkv" if same else "_common_q"
     packed, boundaries = projection(layer,modules,name)
     tiles = getattr(layer,name+"_tiles",None)
-    if same and not full and cache is not None:
+    if not full and cache is not None and getattr(cache[0],"grouped",False):
         from . import project_heads
-        prepared=project_heads.compute(layer,hidden_states,packed,tiles,conv_states,conv_mask,cache[0])
-        if prepared is not None:
-            q,k,v,rel,gate,scaled=prepared
-            return _grouped_output(layer,q,k,v,rel,layer.sink_proj(hidden_states),cache[0],gate,scaled)
+        extra=() if same else (key_hidden_states,value_hidden_states)
+        joint=getattr(layer,"_all_qkv",None)
+        sources=common+(layer.k_proj,layer.v_proj)
+        if (joint is not None and joint[2]==[3072,3456,6528,7552]
+                and all(type(m) is nn.Linear and "bias" not in m and m.weight is w for m,w in zip(sources,joint[0]))):
+            prepared=project_heads.compute(layer,hidden_states,joint[1],getattr(layer,"_all_qkv_tiles",None),
+                                           conv_states,conv_mask,cache[0],extra)
+            if prepared is not None:
+                q,k,v,rel,gate,scaled=prepared
+                return _grouped_output(layer,q,k,v,rel,layer.sink_proj(hidden_states),cache[0],gate,scaled)
     projected = (packed_rows.project(hidden_states,packed,tiles[1])
                  if tiles is not None and tiles[0] is packed and hidden_states.dtype==mx.bfloat16
                  else hidden_states @ packed.T)
