@@ -29,7 +29,27 @@ def _project(hidden, message, down, paired, normalized=None):
     return (1 - forget) * hidden + gain * message
 
 
+@mx.compile
+def _prompt_message(hidden, message, down, paired):
+    states=mx.concatenate((layers.unweighted_rms_norm(hidden),layers.unweighted_rms_norm(message)),axis=-1)
+    reduced=(states.astype(down.dtype) @ down.T).astype(mx.float32)
+    forget,gain=mx.split(mx.tanh(reduced @ paired.T),2,axis=-1)
+    return (1-forget)*hidden+gain*message
+
+
 def project(layer, hidden_states, message, normalized=None, reduced=None, with_sums=False):
+    if (hidden_states.ndim==3 and hidden_states.shape[1]>=8 and hidden_states.shape==message.shape
+            and hidden_states.shape[-1]==2304 and hidden_states.dtype==message.dtype==mx.float32
+            and all(type(p) is nn.Linear and "bias" not in p
+                    for p in (layer.down_proj,layer.forget_gate_proj,layer.message_gate_proj))):
+        forget=layer.forget_gate_proj.weight
+        gain=layer.message_gate_proj.weight
+        if forget.shape==gain.shape==(2304,64) and forget.dtype==gain.dtype==mx.float32:
+            saved=getattr(layer,"_prompt_gate_rows",None)
+            if saved is None or saved[0] is not forget or saved[1] is not gain:
+                saved=(forget,gain,mx.concatenate((forget,gain)))
+                object.__setattr__(layer,"_prompt_gate_rows",saved)
+            return _prompt_message(hidden_states,message,layer.down_proj.weight,saved[2])
     if hidden_states.shape[:2] != (1, 1) or any(
         type(p) is not nn.Linear or "bias" in p
         for p in (layer.down_proj, layer.forget_gate_proj, layer.message_gate_proj)
