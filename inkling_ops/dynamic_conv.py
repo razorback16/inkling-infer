@@ -34,11 +34,7 @@ def convolve(layer, hidden_states, dynamic_input, conv_state, conv_mask):
     if (hidden_states.shape[:2] != (1, 1) or conv_mask is not None or layer.kernel_size != 4
             or conv_state is None or conv_state.shape != (1, 3, width)):
         return _reference(layer, hidden_states, dynamic_input, conv_state, conv_mask)
-    return filtered(layer, hidden_states, conv_state, layer.weight_proj(dynamic_input))
-
-
-def filtered(layer, hidden_states, conv_state, dynamic):
-    width = hidden_states.shape[-1]
+    dynamic = layer.weight_proj(dynamic_input)
     return _kernel(
         inputs=[hidden_states, conv_state, layer.static_weight, dynamic],
         template=[("T", hidden_states.dtype), ("C", width), ("H", layer.num_heads)],
