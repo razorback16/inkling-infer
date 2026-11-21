@@ -49,24 +49,31 @@ _merge = mx.fast.metal_kernel(
     name="inkling_attention_gate", input_names=["partial","stats","gate"], output_names=["out"],
     source="""
         uint lane = thread_index_in_simdgroup;
+        uint warp = simdgroup_index_in_threadgroup;
         uint head = threadgroup_position_in_grid.y;
-        uint d = (thread_position_in_grid.x/32)*4;
-        uint i = head*128 + lane;
+        uint base = head*128;
+        uint d = lane*4;
         float peak = -FLT_MAX;
-        for (uint n=0; n<128; n+=32) peak = max(peak,stats[(i+n)*2]);
+        for (uint tile=lane; tile<128; tile+=32)
+            peak = max(peak,stats[(base+tile)*2]);
         peak = simd_max(peak);
         float4 acc = 0;
         float z = 0;
         for (uint n=0; n<128; n+=32) {
-            float a = fast::exp(stats[(i+n)*2] - peak);
-            z += a*stats[(i+n)*2+1];
-            for (uint j=0; j<4; ++j) acc[j] += a*float(partial[(i+n)*128+d+j]);
+            float a = fast::exp(stats[(base+lane+n)*2] - peak);
+            z += a*stats[(base+lane+n)*2+1];
+            float weight = simd_shuffle(a,warp);
+            for (uint j=0; j<4; ++j)
+                acc[j] += weight*float(partial[(base+warp+n)*128+d+j]);
         }
         z = simd_sum(z);
+        threadgroup float transposed[4][32][33];
+        for (uint j=0; j<4; ++j) transposed[j][lane][warp] = acc[j];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint j=0; j<4; ++j) {
-            float output = float(T(simd_sum(acc[j])/z));
+            float output = float(T(simd_sum(transposed[j][warp][lane])/z));
             if (!lane) {
-                uint col = head*128+d+j;
+                uint col = head*128+warp*4+j;
                 float g = float(gate[col]);
                 float denom = 1.f/(1.f+precise::exp(abs(g)));
                 out[col] = T(output*(g<0 ? denom : 1.f-denom));
@@ -88,5 +95,5 @@ def attend(layer,q,k,v,rel,sinks,cache,gate):
         grid=(128*32,heads,1),threadgroup=(128,1,1),
         output_shapes=[(heads,128,128),(heads,128,2)],output_dtypes=[q.dtype,mx.float32])
     return _merge(inputs=[parts,stats,gate],template=[("T",q.dtype)],
-                  grid=(32*32,heads,1),threadgroup=(128,1,1),
+                  grid=(32*32,heads,1),threadgroup=(1024,1,1),
                   output_shapes=[gate.shape],output_dtypes=[q.dtype])[0]
