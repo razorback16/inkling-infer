@@ -26,7 +26,7 @@ def mix(states, weights, dtype):
                 output_shapes=[(1, 1, 2304)], output_dtypes=[dtype])[0]
 
 
-def _make_down(finish,routed=False):
+def _make_down(finish):
     inputs = ["hidden", "indices", "routing", "packed", "scales", "amax"]
     outputs = ["out"]
     store = "out[channel + lane] = T(value);"
@@ -47,6 +47,9 @@ def _make_down(finish,routed=False):
             float filtered = float(T((float(W(total)) + current) * 0.4472135954999579f));
             out[c] = T(residual[c] + filtered);
         """
+    return mx.fast.metal_kernel(
+        name="inkling_finish_nvfp4_layer" if finish else "inkling_nvfp4_down_mix",
+        input_names=inputs, output_names=outputs,
     header="""
         constant float fp4_values[16] = {
             0, .5, 1, 1.5, 2, 3, 4, 6, -0., -.5, -1, -1.5, -2, -3, -4, -6
@@ -58,7 +61,7 @@ def _make_down(finish,routed=False):
                          | ((bits & 128) << 8);
             return float(as_type<half>(raw)) * 256.f;
         }
-    """
+    """,
     source="""
         #pragma clang fp contract(off)
         // Each SIMD group projects one expert into the same four channels.
@@ -102,22 +105,12 @@ def _make_down(finish,routed=False):
             }
             STORE
         }
-    """.replace("STORE", store)
-    name="inkling_finish_nvfp4_layer" if finish else "inkling_nvfp4_down_mix"
-    if routed:
-        inputs.remove("indices")
-        inputs.remove("amax")
-        name="inkling_finish_routed_layer"
-        source=source.replace("uint expert = indices[slot];", "uint4 entry=((device const uint4*)routing)[slot];").replace(
-            "expert * 2304 + channel","channel").replace("packed[row * 144 + word]", "packed[entry.x + row*144 + word]").replace(
-            "scales[row * 72 + word / 2]","scales[entry.y + row*72 + word/2]").replace(
-            "(amax[expert] / 2688.f)","as_type<float>(entry.z)").replace("float(routing[e])","as_type<float>(routing[e*4+3])")
-    return mx.fast.metal_kernel(name=name,input_names=inputs,output_names=outputs,header=header,source=source)
+    """.replace("STORE", store),
+    )
 
 
 _down_mix = _make_down(False)
 _finish_mix = _make_down(True)
-_finish_routed = _make_down(True,True)
 
 
 def can_fuse_down(down, x):

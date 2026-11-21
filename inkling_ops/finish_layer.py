@@ -9,7 +9,7 @@ _reference = layers.DecoderLayer.__call__
 
 
 def decode(layer, hidden_states, block_states, *, cache=None, conv_mask=None, messages=None):
-    from inkling_kernel import _finish_mix, _finish_routed, can_fuse_down
+    from inkling_kernel import _finish_mix, can_fuse_down
     from .compiled_ring import _DeviceRing
     normalized_messages = None
     if isinstance(messages,tuple):
@@ -91,17 +91,13 @@ def decode(layer, hidden_states, block_states, *, cache=None, conv_mask=None, me
             x = result
     elif messages is not None:
         x = layer.mlp_message_gate(x,messages[...,3,:])
-    x, selected, routing = router.route(layer, x, hidden_states.dtype, normalized=prenormalized, logits=logits, squares=route_squares,
-                                        down_scale=down.global_scale if fused_down else None)
+    x, selected, routing = router.route(layer, x, hidden_states.dtype, normalized=prenormalized, logits=logits, squares=route_squares)
     active = expert_gate.gated_activation(moe.experts,x,selected)
     w = post.conv1d.weight
     if fused_down:
-        packed = routing.shape==(8,4) and routing.dtype==mx.uint32
-        kernel = _finish_routed if packed else _finish_mix
-        args=([active,routing,down.weight,down.scales] if packed else
-              [active,selected,routing,down.weight,down.scales,down.global_scale])
-        out, next_history = kernel(
-            inputs=[*args,history[3],w,residual],
+        out, next_history = _finish_mix(
+            inputs=[active, selected, routing, down.weight, down.scales, down.global_scale,
+                    history[3], w, residual],
             template=[("T", x.dtype), ("W",w.dtype)], grid=(576*256,1,1), threadgroup=(256,1,1),
             output_shapes=[x.shape, (1,3,2304)], output_dtypes=[x.dtype,mx.float32])
     else:
