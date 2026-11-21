@@ -40,19 +40,7 @@ _from_sums = mx.fast.metal_kernel(
     output_names=["qo","ko","vo"],source="""
         uint head=threadgroup_position_in_grid.y, lane=thread_index_in_simdgroup;
         uint first=thread_position_in_grid.x*4;
-        threadgroup float totals[18];
-        float norm2;
-        if (FINE) {
-            for (uint g=simdgroup_index_in_threadgroup;g<18;g+=6) {
-                float block=simd_sum(sums[(head*18+g)*32+lane]);
-                if (!lane) totals[g]=block;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            norm2=simd_sum(lane<18 ? totals[lane] : 0.f);
-        } else {
-            norm2=simd_sum(lane<18 ? sums[head*18+lane] : 0.f);
-        }
-        float inv=precise::rsqrt(norm2/2304.f+eps);
+        float inv=precise::rsqrt(simd_sum(lane<18 ? sums[head*18+lane] : 0.f)/2304.f+eps);
         for (uint j=0;j<4;++j) {
             uint d=first+j;
             float v0=head==0 ? float(q[d]) : head==1 ? float(k[d]) : float(v[d]);
@@ -97,15 +85,12 @@ def attention(layer, x, inputs, cache, conv_states, conv_mask, messages):
     weights = [n.weight for n in norms]
     from mlx_lm.kernels.common import scalar
     args = [*states,*weights,scalar(norms[0].eps)]
-    template=[("A",mx.result_type(states[0],weights[0])),("T",x.dtype)]
     if sums is None:
         kernel,grid,group = _kernel,(3*576,1,1),(576,1,1)
     else:
-        fine = sums.shape[-1]==576
-        template.append(("FINE",fine))
         args.append(sums)
-        kernel,grid,group = _from_sums,(576,3,1),(192 if fine else 128,1,1)
-    q,k,v = kernel(inputs=args,template=template,
+        kernel,grid,group = _from_sums,(576,3,1),(128,1,1)
+    q,k,v = kernel(inputs=args,template=[("A",mx.result_type(states[0],weights[0])),("T",x.dtype)],
                    grid=grid,threadgroup=group,output_shapes=[x.shape]*3,output_dtypes=[x.dtype]*3)
     return layer.self_attn(q,k,v,cache=cache,conv_states=conv_states,conv_mask=conv_mask)
 
