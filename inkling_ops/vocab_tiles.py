@@ -30,7 +30,7 @@ _pack = mx.fast.metal_kernel(
     output_names=["tiles","overflow"], source="""
         uint lane=thread_index_in_simdgroup, group=thread_position_in_grid.x/32;
         uint row=group/18, tile=group%18;
-        uint addr=((row/4*18+tile)*4+row%4)*48;
+        uint addr=((row/2*18+tile)*2+row%2)*48;
         ushort4 bits=((device const ushort4*)weight)[group*32+lane];
         uint fmt=formats[row], mask=fmt&0x3ffffu;
         ushort4 e=(((bits>>7)&255)-ushort(fmt>>24))&255;
@@ -53,7 +53,7 @@ _dot = mx.fast.metal_kernel(
         ushort base=ushort(fmt>>24)<<8;
         float dot=0;
         for (uint t=0;t<18;++t) {
-            uint addr=((row/4*18+t)*4+row%4)*48;
+            uint addr=((row/2*18+t)*2+row%2)*48;
             ushort h=((device const ushort*)(tiles+addr+32))[lane];
             ushort4 n=ushort4(h,h>>4,h>>8,h>>12)&15;
             if (mask&(1u<<t)) {
@@ -86,5 +86,5 @@ def encode(w):
 
 def project(x,weight,encoded):
     rows=weight.shape[0]
-    return _dot(inputs=[x,*encoded], grid=(rows*32,1,1), threadgroup=(256,1,1),
+    return _dot(inputs=[x,*encoded], grid=(rows*32,1,1), threadgroup=(128,1,1),
                 output_shapes=[(1,1,rows)], output_dtypes=[x.dtype])[0]
