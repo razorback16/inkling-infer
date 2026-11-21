@@ -27,7 +27,12 @@ class _DeviceRing(RotatingKVCache):
         return self.keys, self.values
 
     def update_packed(self, new):
-        self.packed = mx.slice_update(self.packed, new, self._idx, axes=(2,))
+        if hasattr(self, "page_tail"):
+            slot = self._idx - self.page_prefix.shape[2]
+            self.page_tail = mx.slice_update(self.page_tail, new, slot, axes=(2,))
+            self.packed = mx.concatenate((self.page_prefix, self.page_tail), axis=2)
+        else:
+            self.packed = mx.slice_update(self.packed, new, self._idx, axes=(2,))
         self.keys, self.values = mx.split(self.packed, 2, axis=1)
         self._idx = self._idx + 1
         self.offset = self.offset + 1
