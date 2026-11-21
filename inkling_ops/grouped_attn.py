@@ -7,10 +7,11 @@ _partial = mx.fast.metal_kernel(
     name="inkling_interleaved_attention",
     input_names=["q","k","v","tail","fresh","rel","w","slot","end","sinks","scale"],output_names=["partials","stats"],
     source="""
-        uint lane = thread_index_in_simdgroup, head = threadgroup_position_in_grid.y;
+        uint lane = thread_index_in_simdgroup;
+        uint head = threadgroup_position_in_grid.y * TEAM + simdgroup_index_in_threadgroup;
         int newest = slot[0] - (PRE_UPDATE ? 0 : 1);
         int valid = end[0] + (PRE_UPDATE ? 1 : 0);
-        uint tile = thread_position_in_grid.x / 32;
+        uint tile = threadgroup_position_in_grid.x;
         uint kv = head / GQA, d = lane*4;
         uint addr = (head*128+tile);
         float4 query;
@@ -146,12 +147,14 @@ def attend(layer,q,k,v,rel,sinks,cache,gate):
         slot, end = mx.array(slot,mx.int32).reshape(1), mx.array(end,mx.int32).reshape(1)
     fresh = getattr(cache,"fresh",None)
     adjacent=getattr(cache,"interleaved_prefix",None)
+    queries_per_key = heads // k.shape[1]
+    team = queries_per_key if queries_per_key <= 16 else 1
     parts,stats = _partial(
         inputs=[q,k if adjacent is None else adjacent,v if adjacent is None else adjacent,tail,q if fresh is None else fresh,rel,w,slot,end,
                 sinks.astype(q.dtype),scalar(layer.scaling)],
-        template=[("T",q.dtype),("S",length),("PRE_UPDATE",before is not None),("PAGED",paged),("ADJACENT",adjacent is not None),("FRESH",fresh is not None),("NKV",k.shape[1]),("GQA",heads//k.shape[1]),("WIDTH",width),("SWIZZLED",swizzled),
+        template=[("T",q.dtype),("S",length),("PRE_UPDATE",before is not None),("PAGED",paged),("ADJACENT",adjacent is not None),("FRESH",fresh is not None),("NKV",k.shape[1]),("GQA",queries_per_key),("TEAM",team),("WIDTH",width),("SWIZZLED",swizzled),
                   ("R",extent),("WINDOW",layer.sliding_window)],
-        grid=(128*32,heads,1),threadgroup=(128,1,1),
+        grid=(128*32*team,heads//team,1),threadgroup=(32*team,1,1),
         output_shapes=[(heads,128,128),(heads,128,2)],output_dtypes=[q.dtype,mx.float32])
     return _merge(inputs=[parts,stats,gate],template=[("T",q.dtype)],
                   grid=(32*32,heads,1),threadgroup=(128,1,1),
