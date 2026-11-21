@@ -2,7 +2,6 @@
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.inkling2 import layers
-from . import packed_rows
 
 _project = mx.fast.metal_kernel(
     name="inkling_project_filtered_kv",
@@ -42,54 +41,6 @@ _project = mx.fast.metal_kernel(
 )
 
 
-_post = """
-            if (!lane) {
-                uint c=(group*4+r)%1024;
-                auto hist=bank ? vh : kh;
-                auto conv=bank ? vc : kc;
-                auto window=bank ? next_v : next_k;
-                auto output=bank ? value : key;
-                float x=float(bfloat16_t(dot)),sum=0;
-                for (uint t=0;t<3;++t) {
-                    float old=hist[t*1024+c];
-                    window[t*1024+c]=old;
-                    sum=fma(float(W(old)),float(conv[c*4+t]),sum);
-                }
-                window[3*1024+c]=x;
-                sum=fma(float(W(x)),float(conv[c*4+3]),sum);
-                output[c]=bfloat16_t((float(W(sum))+x)*0.4472135954999579f);
-            }
-"""
-_paired_source=packed_rows.four_row_dot.replace("        uchar4 base=",
-    "        uint bank=group/256; auto x=bank ? vx : kx;\n        uchar4 base=",1).replace(
-    "if (!lane) out[group*4+r]=bfloat16_t(dot);",_post)
-_paired=mx.fast.metal_kernel(name="inkling_four_row_filtered_kv",
-    input_names=["kx","vx","payload","bases","flags","kc","vc","kh","vh"],
-    output_names=["key","value","next_k","next_v"],source=_paired_source)
-
-
-def prepare(model):
-    for index in model.args.loop_core:
-        layer=model.layers[index].self_attn
-        if not isinstance(layer,layers.SlidingAttention):
-            continue
-        mods=(layer.k_proj,layer.v_proj)
-        if any(type(m) is not nn.Linear or "bias" in m or m.weight.shape!=(1024,2304)
-               or m.weight.dtype!=mx.bfloat16 for m in mods):
-            continue
-        kw,vw=(m.weight for m in mods)
-        joint=getattr(layer,"_all_qkv",None)
-        tiles=getattr(layer,"_all_qkv_tiles",None)
-        if (joint is not None and tiles is not None and tiles[0] is joint[1]
-                and joint[0][-2] is kw and joint[0][-1] is vw):
-            start=joint[1].shape[0]-2048
-            if start%16==0:
-                data,bases,flags=tiles[1]
-                selected=(data[start//4*18:],bases[start:],flags[start//4:])
-                mx.eval(selected)
-                object.__setattr__(layer,"_filtered_tiles",(kw,vw,selected))
-
-
 def apply(layer,k,v,histories,mask):
     if (mask is not None or k.shape != (1,1,2304) or v.shape != k.shape or k.dtype != v.dtype or k.dtype != mx.bfloat16
             or any(type(p) is not nn.Linear or "bias" in p or p.weight.shape != (1024,2304)
@@ -101,12 +52,6 @@ def apply(layer,k,v,histories,mask):
     kc,vc=layer.k_sconv.conv1d.weight,layer.v_sconv.conv1d.weight
     if kc.dtype != vc.dtype:
         return None
-    saved=getattr(layer,"_filtered_tiles",None)
-    if saved is not None and saved[0] is layer.k_proj.weight and saved[1] is layer.v_proj.weight:
-        return _paired(inputs=[k,v,*saved[2],kc,vc,*histories[:2]],
-                       template=[("W",kc.dtype)],grid=(2048*8,1,1),threadgroup=(128,1,1),
-                       output_shapes=[(1,1,1024)]*2+[(1,4,1024)]*2,
-                       output_dtypes=[k.dtype]*2+[mx.float32]*2)
     return _project(inputs=[k,v,layer.k_proj.weight,layer.v_proj.weight,kc,vc,*histories[:2]],
                     template=[("W",kc.dtype)],grid=(256*32,2,1),threadgroup=(128,1,1),
                     output_shapes=[(1,1,1024)]*2+[(1,4,1024)]*2,
