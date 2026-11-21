@@ -67,7 +67,7 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
     parts = mx.split(projected,boundaries,axis=-1)
     query, relative, gate = parts[:3]
     sinks = layer.sink_proj(hidden_states)
-    filtered = (None if same else
+    filtered = (None if full or same else
                 filtered_kv.apply(layer,key_hidden_states,value_hidden_states,conv_states,conv_mask))
     if filtered is not None:
         key,value,conv_states[0],conv_states[1] = filtered
@@ -83,7 +83,7 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
                           for c in (layer.k_sconv, layer.v_sconv))
                   and layer.k_sconv.conv1d.weight.dtype == layer.v_sconv.conv1d.weight.dtype
                   and all(h is not None and h.shape == (1,3,key.shape[-1]) for h in conv_states[:2]))
-    if full and filtered is None:
+    if full:
         key, conv_states[0] = layer.k_sconv(key, key_hidden_states, conv_states[0], conv_mask)
         value, conv_states[1] = layer.v_sconv(value, value_hidden_states, conv_states[1], conv_mask)
     elif filtered is None and not fused_norm:
