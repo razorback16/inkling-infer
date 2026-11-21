@@ -86,7 +86,7 @@ def encode(w):
     return tiles,overflow,formats,offsets
 
 
-def project(x,weight,encoded):
+def project(x,weight,encoded,threads=128):
     rows=weight.shape[0]
-    return _dot(inputs=[x,*encoded], grid=(rows*32,1,1), threadgroup=(128,1,1),
+    return _dot(inputs=[x,*encoded], grid=(rows*32,1,1), threadgroup=(threads,1,1),
                 output_shapes=[(1,1,rows)], output_dtypes=[x.dtype])[0]
