@@ -8,9 +8,11 @@ _kernel = mx.fast.metal_kernel(
     input_names=["x", "ids", "packed", "scales", "amax"],
     output_names=["out"],
     header="""
-        constant float levels[16] = {
-            0, .5, 1, 1.5, 2, 3, 4, 6, -0., -.5, -1, -1.5, -2, -3, -4, -6
-        };
+        inline float4 decode_four(uint word) {
+            ushort4 nibble = ushort4(word, word >> 4, word >> 8, word >> 12);
+            ushort4 raw = ((nibble & ushort(7)) << 9) | ((nibble & ushort(8)) << 12);
+            return float4(as_type<half4>(raw)) * 16384.f;
+        }
         inline float fp8_scale(uchar bits) {
             ushort mag = bits & 127;
             ushort raw = (mag << 7) | (((mag + 1) >> 7) << 14) | ((bits & 128) << 8);
@@ -29,11 +31,8 @@ _kernel = mx.fast.metal_kernel(
             for (uint r = 0; r < 4; ++r) {
                 uint row = expert * 2304 + first + r;
                 uint bits = packed[row * 288 + word];
-                float partial = 0.f;
-                for (uint i = 0; i < 8; ++i) {
-                    partial += v[i] * levels[bits & 15];
-                    bits >>= 4;
-                }
+                float partial = dot(float4(v[0], v[1], v[2], v[3]), decode_four(bits))
+                              + dot(float4(v[4], v[5], v[6], v[7]), decode_four(bits >> 16));
                 sums[r] += partial * fp8_scale(scales[row * 144 + word / 2]);
             }
         }
