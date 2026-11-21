@@ -30,11 +30,10 @@ _down_mix = mx.fast.metal_kernel(
     input_names=["hidden", "indices", "routing", "packed", "scales", "amax"],
     output_names=["out"],
     header="""
-        inline float4 decode_four(uint word) {
-            ushort4 nibble = ushort4(word, word >> 4, word >> 8, word >> 12);
-            ushort4 raw = ((nibble & ushort(7)) << 9) | ((nibble & ushort(8)) << 12);
-            return float4(as_type<half4>(raw)) * 16384.f;
-        }
+        constant float fp4_values[16] = {
+            0, .5, 1, 1.5, 2, 3, 4, 6, -0., -.5, -1, -1.5, -2, -3, -4, -6
+        };
+
         inline float decode_scale(uchar bits) {
             ushort magnitude = bits & 127;
             ushort raw = (magnitude << 7) | (((magnitude + 1) >> 7) << 14)
@@ -57,8 +56,14 @@ _down_mix = mx.fast.metal_kernel(
             for (uint r = 0; r < 4; ++r) {
                 uint row = first_row + r;
                 uint q = packed[row * 144 + word];
-                float chunk = dot(float4(x[0], x[1], x[2], x[3]), decode_four(q))
-                            + dot(float4(x[4], x[5], x[6], x[7]), decode_four(q >> 16));
+                float chunk = 0;
+                for (uint k = 0; k < 8; k += 4) {
+                    chunk += x[k] * fp4_values[q & 15]
+                           + x[k+1] * fp4_values[(q >> 4) & 15]
+                           + x[k+2] * fp4_values[(q >> 8) & 15]
+                           + x[k+3] * fp4_values[(q >> 12) & 15];
+                    q >>= 16;
+                }
                 accum[r] += decode_scale(scales[row * 72 + word / 2]) * chunk;
             }
         }
