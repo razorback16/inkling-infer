@@ -31,6 +31,9 @@ def attend(layer, q, k, v, rel, sinks, cache):
         template=[("T", q.dtype), ("WIDTH", w.shape[0]), ("R", w.shape[1]), ("WINDOW", layer.sliding_window)],
         grid=(length, q.shape[1], 1), threadgroup=(min(length, 128), 1, 1),
         output_shapes=[(1, q.shape[1], 1, length)], output_dtypes=[q.dtype])[0]
+    if layer.sliding_window and q.shape[-1] == 128 and q.shape[1] % k.shape[1] == 0:
+        from . import split_attn
+        return split_attn.attend(q, k, v, mask, sinks, layer.scaling)
     return mx.fast.scaled_dot_product_attention(
         q, k, v, scale=layer.scaling, mask=mask, sinks=sinks[0, 0].astype(q.dtype)
     ).transpose(0, 2, 1, 3)
