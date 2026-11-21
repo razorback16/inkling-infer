@@ -5,11 +5,7 @@ import mlx.core as mx
 from mlx_lm.models.inkling2 import layers
 
 _reference = layers.Experts.__call__
-_kernel = mx.fast.metal_kernel(
-    name="inkling_stock_order_gate_up_fp4",
-    input_names=["x", "ids", "packed", "scales", "amax", "gate_lut", "up_lut"],
-    output_names=["out"],
-    header="""
+_header = """
         constant float levels[16] = {
             0, .5, 1, 1.5, 2, 3, 4, 6, -0., -.5, -1, -1.5, -2, -3, -4, -6
         };
@@ -18,8 +14,8 @@ _kernel = mx.fast.metal_kernel(
             ushort raw = (mag << 7) | (((mag + 1) >> 7) << 14) | ((bits & 128) << 8);
             return float(as_type<half>(raw)) * 256.f;
         }
-    """,
-    source="""
+    """
+_source = """
         #pragma clang fp contract(off)
         uint lane = thread_index_in_simdgroup;
         uint slot = threadgroup_position_in_grid.y;
@@ -49,8 +45,48 @@ _kernel = mx.fast.metal_kernel(
             ushort u = as_type<ushort>(bfloat16_t(sums[lane*2+1]*scale));
             out[slot*1152+first/2+lane] = bfloat16_t(gate_lut[g]*up_lut[u]);
         }
-    """,
-)
+    """
+
+
+def make_kernel(interleaved):
+    inputs = ["x", "ids", "packed", "amax", "gate_lut", "up_lut"]
+    source = _source
+    if interleaved:
+        # A tile holds 128 FP4 words followed by sixteen packed scale words.
+        source = source.replace("uint bits = packed[row * 288 + word];",
+            "uint tile = ((row/4)*9 + word/32)*144; "
+            "uint bits = packed[tile + r*32 + lane];").replace(
+            "scales[row * 144 + word / 2]",
+            "uchar(packed[tile+128+r*4+lane/8] >> (((lane/2)%4)*8))")
+    else:
+        inputs.insert(3, "scales")
+    return mx.fast.metal_kernel(
+        name="inkling_interleaved_gate" if interleaved else "inkling_stock_order_gate_up_fp4",
+        input_names=inputs, output_names=["out"], header=_header, source=source)
+
+
+_kernel = make_kernel(False)
+_interleaved = make_kernel(True)
+
+
+def prepare(model):
+    for layer in model.layers:
+        proj = layer.mlp.experts.gate_up_proj
+        if (getattr(proj,"mode",None) != "nvfp4" or proj.group_size != 16 or proj.bits != 4
+                or proj.weight.shape[1:] != (2304,288) or proj.scales.dtype != mx.uint8
+                or proj.weight.dtype != mx.uint32 or proj.scales.shape != (proj.weight.shape[0],2304,144)):
+            continue
+        weight, scales = proj.weight, proj.scales
+        saved = getattr(proj,"_weight_scale_tiles",None)
+        if saved is not None and saved[0] is weight and saved[1] is scales:
+            continue
+        groups = weight.shape[0]*576
+        words = weight.reshape(groups,4,9,32).transpose(0,2,1,3).reshape(groups,9,128)
+        scale_words = scales.view(mx.uint32).reshape(groups,4,9,4).transpose(0,2,1,3).reshape(groups,9,16)
+        tiles = mx.concatenate([words,scale_words],axis=-1)
+        mx.eval(tiles)
+        object.__setattr__(proj,"_weight_scale_tiles",(weight,scales,tiles))
+
 
 
 @lru_cache(maxsize=1)
@@ -71,8 +107,12 @@ def gated_activation(layer, x, indices):
             or layer.act_fn.gate_softcap != 4 or layer.act_fn.up_softcap != 25):
         pair = proj(x[..., None, None, :], indices)
         return layer.act_fn(pair[..., 0::2], pair[..., 1::2])
-    active = _kernel(
-        inputs=[x, indices, proj.weight, proj.scales, proj.global_scale, *activation_tables()],
+    saved = getattr(proj,"_weight_scale_tiles",None)
+    use_tiles = saved is not None and saved[0] is proj.weight and saved[1] is proj.scales
+    kernel = _interleaved if use_tiles else _kernel
+    data = [saved[2]] if use_tiles else [proj.weight, proj.scales]
+    active = kernel(
+        inputs=[x, indices, *data, proj.global_scale, *activation_tables()],
         grid=(144 * 128, 8, 1), threadgroup=(128, 1, 1),
         output_shapes=[(1, 1, 8, 1, 1152)], output_dtypes=[x.dtype],
     )[0]
