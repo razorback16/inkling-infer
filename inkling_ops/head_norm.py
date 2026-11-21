@@ -100,47 +100,6 @@ _dynamic = mx.fast.metal_kernel(
 )
 
 
-_coefficient_source = """
-        threadgroup float partial[8][4], coefficient[4];
-        uint tid=thread_position_in_threadgroup.x;
-        uint sg=simdgroup_index_in_threadgroup;
-        if (key || val) {
-            auto input=key ? kstate : vstate;
-            auto matrix=key ? kd : vd;
-            float dot[4]={};
-            for (uint col=tid*4;col<2304;col+=1024) {
-                for (uint j=0;j<4;++j) {
-                    float x=float(input[col+j]);
-                    for (uint r=0;r<4;++r)
-                        dot[r]=fma(x,float(matrix[(local_head*4+r)*2304+col+j]),dot[r]);
-                }
-            }
-            for (uint r=0;r<4;++r) {
-                float x=dot[r];
-                for (ushort step=16;step;step>>=1) x+=simd_shuffle_down(x,step);
-                if (!lane) partial[sg][r]=x;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (tid<4) {
-                float x=partial[0][tid];
-                for (uint j=1;j<8;++j) x+=partial[j][tid];
-                coefficient[tid]=float(T(x));
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-        if (sg) return;
-"""
-_computed_filter=_dynamic_filter.replace("auto coefs=key ? kd : vd;","").replace(
-    "float(coefs[local_head*4+lag])","coefficient[lag]")
-_computed_dynamic=mx.fast.metal_kernel(
-    name="inkling_dynamic_coefficients_head_norm",
-    input_names=_inputs+["kh","vh","kw","vw","kd","vd","kstate","vstate"],
-    output_names=_outputs+["k_window","v_window"],
-    source=_source.replace("        float states",_coefficient_source+"        float states",1)
-                  .replace("            states[d",_computed_filter+"            states[d",1),
-)
-
-
 def normalize(layer, query, key, value, relative, return_pair=False, filters=None):
     heads, kv, dim = layer.num_heads, layer.num_key_value_heads, layer.head_dim
     rel = relative.shape[-1] // heads
@@ -150,21 +109,17 @@ def normalize(layer, query, key, value, relative, return_pair=False, filters=Non
     types = [query.dtype] * 3
     template = [("T", query.dtype), ("H", heads), ("KV", kv), ("D", dim), ("R", rel)]
     kernel = _kernel
-    threads = 32
     if filters is not None:
         inputs.extend(filters)
         shapes.extend([(1,4,kv*dim)] * 2)
         types.extend([mx.float32] * 2)
-        if len(filters)==8:
-            kernel=_computed_dynamic
-            threads=256
-        elif len(filters)==6:
+        if len(filters)==6:
             kernel=_dynamic
         else:
             template.append(("W", filters[2].dtype))
             kernel=_filtered
     q, pair, r, *windows = kernel(
-        inputs=inputs, template=template, grid=(threads*(2*heads+2*kv),1,1), threadgroup=(threads,1,1),
+        inputs=inputs, template=template, grid=(32*(2*heads+2*kv),1,1), threadgroup=(32,1,1),
         output_shapes=shapes, output_dtypes=types)
     if filters is not None:
         return q, pair, r, windows
