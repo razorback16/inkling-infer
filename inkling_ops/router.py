@@ -187,12 +187,16 @@ _rank_pairs = mx.fast.metal_kernel(
                 }
             }
         } else {
+            #pragma clang loop unroll(full)
             for (uint i=0;i<4;++i) {
                 uint e=warp+32*i;
                 float query=simd_shuffle(other[i],warp);
                 uint ahead=0;
-                for (uint j=0;j<4;++j)
-                    ahead+=uint(other[j]>query || (other[j]==query && lane+32*j<e));
+                #pragma clang loop unroll(full)
+                for (uint j=0;j<4;++j) {
+                    bool earlier = j<i || (j==i && lane<warp);
+                    ahead += earlier ? uint(other[j]>=query) : uint(other[j]>query);
+                }
                 uint rank=simd_sum(ahead);
                 float score=simd_shuffle(scores[i],warp);
                 if (!lane && rank<8) {inds[rank]=e; selected[rank]=score;}
