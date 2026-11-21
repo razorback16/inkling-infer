@@ -1,4 +1,6 @@
 """Single-token weighted mixture of eight Inkling expert outputs."""
+import os
+
 import mlx.core as mx
 from mlx_lm.models.inkling2 import layers
 
@@ -107,6 +109,10 @@ def single_token_moe(self, x):
 
 
 def install():
+    if mx.device_info().get("device_name") == "Apple M3 Ultra":
+        # These MLX limits apply when the decode stream opens command buffers.
+        os.environ.setdefault("MLX_MAX_OPS_PER_BUFFER", "256")
+        os.environ.setdefault("MLX_MAX_MB_PER_BUFFER", "512")
     from inkling_ops import attention_mask, compiled_ring, dynamic_conv, message_gate, projections, short_conv, triplet
     from inkling_ops import expert_gate
     expert_gate.install()
