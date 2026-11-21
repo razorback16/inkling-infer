@@ -62,8 +62,8 @@ def prepare_query_weights(model):
                     weights=tuple(p.weight for p in modules)
                     w=joint[1][:rows]
                     boundaries=joint[2][:len(modules)-1]
-                    data,bases,flags=tiles[1]
-                    subset=(data[:rows//4*18],bases[:rows],flags[:rows//4])
+                    data,=tiles[1]
+                    subset=(data[:rows//16],)
                     object.__setattr__(layer,name,(weights,w,boundaries))
                     object.__setattr__(layer,name+"_tiles",(w,subset))
                     arrays.extend(subset)
