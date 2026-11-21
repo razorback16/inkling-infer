@@ -142,6 +142,8 @@ def single_token_moe(self, x):
 
 
 def install():
+    from inkling_ops.prefill_depth import evaluate
+    layers.depth_attention=evaluate
     from inkling_ops.grouped_attn import gate_probabilities
     gate_probabilities()
     from inkling_ops import packed_vocab
