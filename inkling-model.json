@@ -1,0 +1,21 @@
+{
+  "models": [
+    {
+      "slug": "inkling",
+      "display_name": "Inkling-2-Mini",
+      "description": "Local Inkling coding model",
+      "context_window": 262144,
+      "effective_context_window_percent": 100,
+      "input_modalities": ["text"],
+      "supported_reasoning_levels": [],
+      "shell_type": "unified_exec",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 1,
+      "support_verbosity": false,
+      "truncation_policy": {"mode": "tokens", "limit": 10000},
+      "experimental_supported_tools": [],
+      "base_instructions": "You are Codex, a coding assistant working with the user in their workspace."
+    }
+  ]
+}

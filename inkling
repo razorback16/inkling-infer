@@ -12,4 +12,27 @@ case "${1-}" in
 esac
 shift
 directory=$(dirname "$(realpath "$0")")
-exec "$directory/$client-inkling" "$@"
+catalog="$directory/inkling-model.json"
+context_window=$(jq -er '.models[0].context_window' "$catalog")
+proxy_key=$(cat "$directory/.proxy-key")
+proxy_url=http://127.0.0.1:4010
+
+case "$client" in
+    claude)
+        export ANTHROPIC_BASE_URL="$proxy_url" ANTHROPIC_AUTH_TOKEN="$proxy_key"
+        export ENABLE_CLAUDEAI_MCP_SERVERS=false CLAUDE_CODE_MAX_CONTEXT_TOKENS="$context_window"
+        export ANTHROPIC_DEFAULT_HAIKU_MODEL=inkling ANTHROPIC_DEFAULT_SONNET_MODEL=inkling ANTHROPIC_DEFAULT_OPUS_MODEL=inkling
+        exec claude --model inkling "$@"
+        ;;
+    codex)
+        export INKLING_KEY="$proxy_key"
+        exec codex -m inkling --disable apps \
+            -c "model_catalog_json=$catalog" \
+            -c "model_context_window=$context_window" \
+            -c 'model_provider="inkling"' \
+            -c 'model_providers.inkling.name="Local Inkling"' \
+            -c 'model_providers.inkling.env_key="INKLING_KEY"' \
+            -c "model_providers.inkling.base_url=$proxy_url/v1" \
+            -c 'model_providers.inkling.wire_api="responses"' "$@"
+        ;;
+esac
