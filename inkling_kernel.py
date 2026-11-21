@@ -93,15 +93,14 @@ def _make_down(finish):
         threadgroup float projected[8][4];
         for (uint r = 0; r < 4; ++r) {
             float dot = simd_sum(accum[r]);
-            if (lane == 0)
-                projected[slot][r] = float(T(dot * (amax[expert] / 2688.f)));
+            if (lane == r)
+                projected[slot][r] = float(T(dot * (amax[expert] / 2688.f))) * float(routing[slot]);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (slot == 0 && lane < 4) {
             float value = 0;
             for (uint e = 0; e < 8; ++e) {
-                float term = projected[e][lane] * float(routing[e]);
-                value = value + term;
+                value += projected[e][lane];
             }
             STORE
         }
