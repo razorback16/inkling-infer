@@ -117,7 +117,7 @@ def gated_activation(layer, x, indices):
             and proj.global_scale is None and "bias" not in proj and type(layer.act_fn) is layers.SoftcappedSwiGLU
             and layer.act_fn.gate_softcap == 4 and layer.act_fn.up_softcap == 25):
         return _mx_gate(inputs=[x,indices,proj.weight,proj.scales,mx_codes(),activation_tables()],
-                        grid=(576*32,8,1),threadgroup=(128,1,1),
+                        grid=(576*32,8,1),threadgroup=(64,1,1),
                         output_shapes=[(1,1,8,1,1152)],output_dtypes=[x.dtype])[0]
     if (x.shape != (1, 1, 2304) or x.dtype != mx.bfloat16 or indices.shape != (1, 1, 8)
             or getattr(proj, "mode", None) != "nvfp4" or proj.group_size != 16
