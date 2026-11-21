@@ -24,14 +24,17 @@ def decode(layer, hidden_states, block_states, *, cache=None, conv_mask=None, me
     else:
         inputs, normed = depth_norm.evaluate(layer.attention_input, block_states, hidden_states)
     attention = layer._self_attention(hidden_states,inputs,cache,history,None,messages)
-    filtered, history[2] = layer.post_attention_convolution(attention,history[2],None)
-    residual = filtered.astype(mx.float32)
     if layer.is_block_boundary:
         block = normed[None]
         block_states = block if block_states is None else mx.concatenate((block_states, block))
+    if type(layer.post_attention_convolution) is layers.ShortConvolution and layer.post_attention_convolution.kernel_size == 4:
+        mixed, residual, history[2] = depth_norm.post_attention(layer, block_states, attention, history[2], hidden_states)
     else:
-        residual = hidden_states.astype(mx.float32) + residual
-    mixed, _ = depth_norm.evaluate(layer.mlp_input, block_states, residual)
+        filtered, history[2] = layer.post_attention_convolution(attention,history[2],None)
+        residual = filtered.astype(mx.float32)
+        if not layer.is_block_boundary:
+            residual = hidden_states.astype(mx.float32) + residual
+        mixed, _ = depth_norm.evaluate(layer.mlp_input, block_states, residual)
     x = mixed[...,0,:]
     if messages is not None:
         x = layer.mlp_message_gate(x,messages[...,3,:])
