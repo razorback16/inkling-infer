@@ -7,34 +7,19 @@ from .packed_rows import _dot_source
 
 
 _epilogue = """
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        uint segment=threadgroup_position_in_grid.x;
-        uint tid=thread_position_in_threadgroup.x;
-        if (segment>=27 && segment<51) {
-            if (tid<128) gate[(segment-27)*128+tid]=raw[tid];
+        uint bank=threadgroup_position_in_grid.x;
+        bool query=bank<24, relative=bank>=24 && bank<27;
+        bool key=bank>=51 && bank<59;
+        uint col=sg*4+lane;
+        if (bank>=27 && bank<51) {
+            if (lane<4) gate[(bank-27)*128+col]=bfloat16_t(value);
             return;
         }
-        if (segment>=24 && segment<27) {
-            if (sg>=8 || lane>=16) return;
-            uint head=(segment-24)*8+sg, base=head*16;
-            float sum=0;
-            for (uint j=0;j<16;++j) {
-                float x=float(raw[sg*16+j])*float(rs[base+j]);
-                sum+=x*x;
-            }
-            float a=min(1.f,rt/(precise::sqrt(sum)+1e-6f));
-            rel[base+lane]=bfloat16_t((float(raw[sg*16+lane])*float(rs[base+lane]))*a);
-            return;
-        }
-        if (sg) return;
-        bool query=segment<24, key=segment>=51 && segment<59;
-        uint head=query ? segment : key ? segment-51 : segment-59;
-        float4 state;
-        float sum=0;
-        for (uint j=0;j<4;++j) {
-            uint col=lane*4+j,d=head*128+col;
-            float value=float(raw[col]);
-            if (query) value*=float(qs[d]);
+        uint head=query ? bank : relative ? bank-24 : key ? bank-51 : bank-59;
+        uint d=head*128+col;
+        if (lane<4) {
+            if (relative) value*=float(rs[d]);
+            else if (query) value*=float(qs[d]);
             else {
                 auto hist=key ? kh : vh;
                 auto weight=key ? kw : vw;
@@ -49,25 +34,43 @@ _epilogue = """
                 total=fma(float(W(value)),float(weight[d*4+3]),total);
                 value=float(bfloat16_t((float(W(total))+value)*0.4472135954999579f));
             }
-            state[j]=value;
-            sum+=value*value;
+            if (relative) values[col]=value;
         }
-        sum=simd_sum(sum);
-        float a=query || key ? min(1.f,qt/(precise::sqrt(sum)+1e-6f)) : precise::rsqrt(sum/128.f+eps);
-        for (uint j=0;j<4;++j) {
-            uint d=head*128+lane*4+j;
-            bfloat16_t value=bfloat16_t(state[j]*a);
-            if (query) { q[d]=value;scaled[d]=attention_scale*float(value); }
-            else pair[(key ? 0 : 1024)+d]=value;
+        if (relative) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lane<4) {
+                float sum=0;
+                for (uint j=0;j<16;++j) {
+                    float x=values[(col/16)*16+j];
+                    sum+=x*x;
+                }
+                rel[d]=bfloat16_t(value*min(1.f,rt/(precise::sqrt(sum)+1e-6f)));
+            }
+            return;
+        }
+        float squares=0;
+        for (ushort j=0;j<4;++j) {
+            float x=simd_shuffle(value,j);
+            squares+=x*x;
+        }
+        if (!lane) values[sg]=squares;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float sum=simd_sum(values[lane]);
+        float scale=(query || key) ? min(1.f,qt/(precise::sqrt(sum)+1e-6f)) : precise::rsqrt(sum/128.f+eps);
+        if (lane<4) {
+            bfloat16_t normal=bfloat16_t(value*scale);
+            if (query) { q[d]=normal; scaled[d]=attention_scale*float(normal); }
+            else pair[(key ? 0 : 1024)+d]=normal;
         }
 """
 def _make_kernel(distinct):
     inputs=["x","payload","qs","rs","qt","rt","eps","attention_scale","kh","vh","kw","vw"]
-    prefix="#pragma clang fp contract(off)\nthreadgroup bfloat16_t raw[128]; uint sg=simdgroup_index_in_threadgroup;\n"
-    projection=_dot_source.replace("out[group*4+r]=bfloat16_t(dot);","raw[sg*4+r]=bfloat16_t(dot);")
+    prefix="#pragma clang fp contract(off)\nthreadgroup float values[128]; float value=0; uint sg=simdgroup_index_in_threadgroup;\n"
+    projection=_dot_source.replace("if (!lane) out[group*4+r]=bfloat16_t(dot);",
+        "float projected=simd_broadcast_first(dot); if (lane==r) value=float(bfloat16_t(projected));")
     if distinct:
         inputs+=["kx","vx"]
-        prefix+="uint bank=threadgroup_position_in_grid.x; auto input=bank<51 ? x : bank<59 ? kx : vx;\n"
+        prefix+="uint region=threadgroup_position_in_grid.x; auto input=region<51 ? x : region<59 ? kx : vx;\n"
         projection=projection.replace("(x+d)","(input+d)")
     return mx.fast.metal_kernel(
         name="inkling_project_recurrent_heads" if distinct else "inkling_project_complete_heads",input_names=inputs,
