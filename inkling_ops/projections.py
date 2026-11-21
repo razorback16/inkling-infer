@@ -61,7 +61,7 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
     name = "_all_qkv" if same else "_common_q"
     packed, boundaries = projection(layer,modules,name)
     tiles = getattr(layer,name+"_tiles",None)
-    projected = (packed_rows.project(hidden_states,packed,tiles[1],threads=256 if packed.shape[0]%32==0 else 128)
+    projected = (packed_rows.project(hidden_states,packed,tiles[1])
                  if tiles is not None and tiles[0] is packed and hidden_states.dtype==mx.bfloat16
                  else hidden_states @ packed.T)
     parts = mx.split(projected,boundaries,axis=-1)

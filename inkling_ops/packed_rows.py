@@ -86,7 +86,7 @@ def encode(weight):
     return payload,bases
 
 
-def project(x,weight,encoded,threads=128):
+def project(x,weight,encoded):
     rows=weight.shape[0]
-    return _dot(inputs=[x,weight,*encoded],grid=(rows*8,1,1),threadgroup=(threads,1,1),
+    return _dot(inputs=[x,weight,*encoded],grid=(rows*8,1,1),threadgroup=(128,1,1),
                 output_shapes=[(1,1,rows)],output_dtypes=[x.dtype])[0]
