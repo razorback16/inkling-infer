@@ -29,7 +29,7 @@ def _project(hidden, message, down, paired, normalized=None):
     return (1 - forget) * hidden + gain * message
 
 
-def project(layer, hidden_states, message, normalized=None):
+def project(layer, hidden_states, message, normalized=None, reduced=None):
     if hidden_states.shape[:2] != (1, 1) or any(
         type(p) is not nn.Linear or "bias" in p
         for p in (layer.down_proj, layer.forget_gate_proj, layer.message_gate_proj)
@@ -41,6 +41,8 @@ def project(layer, hidden_states, message, normalized=None):
     if cached is None or cached[0] is not forget or cached[1] is not gain:
         cached = (forget, gain, mx.concatenate((native(layer.forget_gate_proj), native(layer.message_gate_proj)), axis=0))
         object.__setattr__(layer, "_paired_weights", cached)
+    if reduced is not None and cached[2].shape==(4608,64) and cached[2].dtype in (mx.bfloat16,mx.float32):
+        return apply(reduced,cached[2],hidden_states,message)
     return _project(hidden_states, message, layer.down_proj.weight, cached[2], normalized)
 
 
