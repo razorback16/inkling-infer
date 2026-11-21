@@ -25,10 +25,9 @@ _partial = mx.fast.metal_kernel(
             if (lane < 8) {
                 uint dist = uint(newest-int(tile+128*lane)) & 1023u;
                 if (dist<R) {
-                    if (TABLE) bias=float(w[head*R+dist]);
-                    else { for (uint j=0; j<WIDTH; ++j)
+                    for (uint j=0; j<WIDTH; ++j)
                         bias = fma(float(rel[head*WIDTH+j]),float(w[SWIZZLED ? ((dist%128)*WIDTH+j)*(R/128)+dist/128 : j*R+dist]),bias);
-                    bias = float(T(bias)); }
+                    bias = float(T(bias));
                 }
             }
             float scores[8];
@@ -60,10 +59,9 @@ _partial = mx.fast.metal_kernel(
                 float bias = 0;
                 if (pos >= S || dist >= valid || (WINDOW && dist >= WINDOW)) bias = -INFINITY;
                 else if (dist < R) {
-                    if (TABLE) bias=float(w[head*R+dist]);
-                    else { for (uint j=0; j<WIDTH; ++j)
+                    for (uint j=0; j<WIDTH; ++j)
                         bias = fma(float(rel[head*WIDTH+j]), float(w[SWIZZLED ? ((dist%128)*WIDTH+j)*(R/128)+dist/128 : j*R+dist]), bias);
-                    bias = float(T(bias)); }
+                    bias = float(T(bias));
                 }
                 for (uint i=0; i<32 && chunk+tile+i*128<S; ++i) {
                     float pb = simd_shuffle(bias,i);
@@ -161,10 +159,7 @@ def attend(layer,q,k,v,rel,sinks,cache,gate,scaled_query=None):
     w = layer.rel_logits_proj.proj.astype(rel.dtype)
     width, extent = w.shape
     swizzled = extent % 128 == 0
-    table=width==16 and rel.dtype==mx.bfloat16 and True
-    if table:
-        w=rel.reshape(heads,width) @ w
-    elif swizzled:
+    if swizzled:
         weight = layer.rel_logits_proj.proj
         saved = getattr(layer, "_relative_tiles", None)
         if saved is None or saved[0] is not weight or saved[1] != rel.dtype:
@@ -185,7 +180,7 @@ def attend(layer,q,k,v,rel,sinks,cache,gate,scaled_query=None):
     parts,stats = _partial(
         inputs=[q if scaled_query is None else scaled_query,k if adjacent is None else adjacent,v if adjacent is None else adjacent,tail,q if fresh is None else fresh,rel,w,slot,end,
                 sinks.astype(q.dtype),scalar(layer.scaling)],
-        template=[("TABLE",table),("SCALED",scaled_query is not None),("T",q.dtype),("S",length),("PRE_UPDATE",before is not None),("PAGED",paged),("ADJACENT",adjacent is not None),("FRESH",fresh is not None),("NKV",k.shape[1]),("GQA",heads//k.shape[1]),("WIDTH",width),("SWIZZLED",swizzled),
+        template=[("SCALED",scaled_query is not None),("T",q.dtype),("S",length),("PRE_UPDATE",before is not None),("PAGED",paged),("ADJACENT",adjacent is not None),("FRESH",fresh is not None),("NKV",k.shape[1]),("GQA",heads//k.shape[1]),("WIDTH",width),("SWIZZLED",swizzled),
                   ("R",extent),("WINDOW",layer.sliding_window)],
         grid=(128*32,heads,1),threadgroup=(threads,1,1),
         output_shapes=[(heads,128,128),(heads,128,2)],output_dtypes=[q.dtype,mx.float32])
