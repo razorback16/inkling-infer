@@ -69,24 +69,21 @@ def kernel():
             uint count=tiles[3*tile+2];
             if (!count) return;
             uint column=threadgroup_position_in_grid.x*64, tid=thread_position_in_threadgroup.x;
-            uint xr=tid/4, xc=(tid%4)*8, wr=tid/2, wc=(tid%2)*16;
-            uint input_row=row+xr;
-            if (GATHER && xr<count) input_row=token_rows[input_row];
-            uint weight_row=expert*N+column+wr;
-            threadgroup bfloat16_t Xs[32*40];
             mlx::steel::BlockMMA<bfloat16_t,bfloat16_t,32,64,32,2,2,false,true,40,40>
                 mma(simdgroup_index_in_threadgroup,thread_index_in_simdgroup);
+            uint input_rows[2];
+            uint fn=((thread_index_in_simdgroup/4)&2)*2+(thread_index_in_simdgroup%2)*2;
+            for (uint i=0;i<2;++i) {
+                uint at=row+min(uint(mma.sm)+i*16,count-1);
+                input_rows[i]=GATHER ? token_rows[at] : at;
+            }
             for (uint k=0;k<K;k+=32) {
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                for (ushort j=0;j<8;j+=4) {
-                    bfloat4 v=0;
-                    if (xr<count) v=*(device const bfloat4*)(x+input_row*K+k+xc+j);
-                    *(threadgroup bfloat4*)(Xs+xr*40+xc+j)=v;
-                }
                 uint tile=((expert*(N/64)+column/64)*(K/32)+k/32);
-                threadgroup_barrier(mem_flags::mem_threadgroup);
                 for (short frag=0;frag<4;++frag) {
-                    mma.Atile.template load<bfloat16_t,2,1,40,1>(Xs+mma.As_offset+frag*8);
+                    for (short i=0;i<2;++i) {
+                        uint addr=input_rows[i]*K+k+frag*8+fn;
+                        mma.Atile.frag_at(i,0)=float2(*(device const bfloat2*)(x+addr));
+                    }
                     for (short j=0;j<4;++j) {
                         uint nfrag=simdgroup_index_in_threadgroup%2+2*j;
                         uint at=((tile*32+frag*8+nfrag)*32+thread_index_in_simdgroup);
