@@ -55,7 +55,9 @@ _pack = mx.fast.metal_kernel(
 
     """,
 )
-_dot_source = """
+_dot = mx.fast.metal_kernel(
+    name="inkling_four_row_gemv", input_names=["x","payload","bases","flags"],output_names=["out"],
+    source="""
         uint lane=thread_index_in_simdgroup, group=thread_position_in_grid.x/32;
         uchar4 base=*(device const uchar4*)(bases+group*4);
         uint raw_tiles=flags[group];
@@ -88,53 +90,8 @@ _dot_source = """
             for (ushort step=16;step;step>>=1) dot+=simd_shuffle_down(dot,step);
             if (!lane) out[group*4+r]=bfloat16_t(dot);
         }
-    """
-
-_dot_inputs=["x","payload","bases","flags"]
-_dot=mx.fast.metal_kernel(name="inkling_four_row_gemv",input_names=_dot_inputs,
-                          output_names=["out"],source=_dot_source)
-
-_sink_source="""
-        uint work=threadgroup_position_in_grid.x;
-        if (work>=ROWS/16) {
-            uint first=(work-ROWS/16)*4;
-            uint tid=thread_position_in_threadgroup.x, sg=simdgroup_index_in_threadgroup;
-            uint lane=thread_index_in_simdgroup;
-            threadgroup float partial[8][4];
-            for (uint part=0;part<2;++part) {
-                float sums[4]={};
-                for (uint d=(tid+part*128)*4;d<2304;d+=1024) {
-                    float4 v=float4(*(device const bfloat4*)(x+d));
-                    for (uint r=0;r<4;++r) {
-                        float4 w=float4(*(device const bfloat4*)(sw+(first+r)*2304+d));
-                        for (uint j=0;j<4;++j) sums[r]=fma(v[j],w[j],sums[r]);
-                    }
-                }
-                for (uint r=0;r<4;++r) {
-                    float dot=sums[r];
-                    for (ushort step=16;step;step>>=1) dot+=simd_shuffle_down(dot,step);
-                    if (!lane) partial[part*4+sg][r]=dot;
-                }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (tid<4) {
-                float dot=partial[0][tid];
-                for (uint i=1;i<8;++i) dot+=partial[i][tid];
-                sinks[first+tid]=bfloat16_t(dot);
-            }
-            return;
-        }
-"""
-_with_sinks=mx.fast.metal_kernel(name="inkling_four_row_gemv_sinks",input_names=_dot_inputs+["sw"],
-    output_names=["out","sinks"],source=_sink_source+_dot_source)
-
-
-def project_with_sinks(x, weight, encoded, sinks):
-    rows=weight.shape[0]
-    return _with_sinks(inputs=[x,*encoded,sinks],template=[("ROWS",rows)],
-                       grid=((rows//16+6)*128,1,1),threadgroup=(128,1,1),
-                       output_shapes=[(1,1,rows),(1,1,24)],output_dtypes=[x.dtype]*2)
-
+    """,
+)
 
 
 def encode(weight):
