@@ -186,7 +186,12 @@ def make_projected(normalize):
     source = normalized_source() if normalize else _source.replace("FILTER","")
     source = source.replace("sum += v*v;", "").replace("sum = simd_sum(sum);","sum = simd_sum(squares[tid]);",1)
     source = source.replace("if (!query) normalized[d] = norm[d];","")
-    inputs = ["x","blocks","queries","squares"]
+    source=source.replace("for (uint i=group; i<=K; i+=2)",
+                          "for (uint i=(CACHED ? K+group : group); i<=K; i+=2)")
+    source=source.replace("for (uint j=0; j<9; ++j) dot+=scores[lane][j];",
+                          "if (CACHED && lane<K) dot=closed[lane*STRIDE+COLUMN]; "
+                          "else for (uint j=0; j<9; ++j) dot+=scores[lane][j];")
+    inputs = ["x","blocks","queries","squares","closed"]
     if normalize:
         inputs.extend(["weights","eps"])
     return mx.fast.metal_kernel(name="inkling_projected_depth_norm" if normalize else "inkling_projected_depth",
@@ -197,11 +202,13 @@ _projected = (make_projected(False),make_projected(True))
 
 
 def from_projection(layer, blocks, residual, squares, normalize):
-    inputs = [residual,blocks,layer.mlp_input.query,squares]
+    from . import block_lookahead
+    closed,config=block_lookahead.lookup(layer,blocks)
+    inputs = [residual,blocks,layer.mlp_input.query,squares,closed]
     if normalize:
         norm=layer.post_attention_layernorm
         inputs.extend([norm.weight,scalar(norm.eps)])
-    return _projected[normalize](inputs=inputs,template=[("K",blocks.shape[0])],
+    return _projected[normalize](inputs=inputs,template=[("K",blocks.shape[0]),*config],
                                  grid=(576,1,1),threadgroup=(576,1,1),
                                  output_shapes=[(1,1,1,2304)],
                                  output_dtypes=[mx.bfloat16 if normalize else mx.float32])[0]

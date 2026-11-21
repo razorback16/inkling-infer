@@ -7,12 +7,13 @@ from mlx_lm.models.cache import ArraysCache, CacheList, KVCache, RotatingKVCache
 from mlx_lm.models.inkling2.model import TextModel
 
 from .compiled_ring import _DeviceRing
-from . import prepared_bank
+from . import prepared_bank, block_lookahead
 
 _reference = TextModel._run_loop
 
 
 def _compile(model):
+    groups=block_lookahead.prepare(model)
     owner = weakref.ref(model)
 
     @mx.compile
@@ -28,7 +29,7 @@ def _compile(model):
             conv = ArraysCache(4)
             conv.cache = list(history)
             caches.append(CacheList(ring, conv))
-        result = prepared_bank.run(_reference, owner(), x, caches)
+        result = block_lookahead.run(groups,prepared_bank.run,_reference,owner(),x,caches)
         return result, [
             (c[0].page_tail, tuple(c[1].cache)) if hasattr(c[0], "page_tail")
             else (c[0].packed, c[0].keys, c[0].values, tuple(c[1].cache)) for c in caches
