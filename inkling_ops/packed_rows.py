@@ -41,8 +41,9 @@ _pack = mx.fast.metal_kernel(
         }
         bool any_raw=simd_any(raw);
         if (!lane) flags[tile]=uint(any_raw)<<block;
-        *(device uint4*)(payload+tile*192+lane*4)=low;
-        *(device ushort4*)(payload+tile*192+128+lane*2)=high;
+        uint physical=((group/4)*18+block)*4+group%4;
+        *(device uint4*)(payload+physical*192+lane*4)=low;
+        *(device ushort4*)(payload+physical*192+128+lane*2)=high;
 
     """,
 )
@@ -54,7 +55,7 @@ _dot = mx.fast.metal_kernel(
         uint raw_tiles=flags[group];
         float sums[4]={};
         for (uint block=0;block<18;++block) {
-            uint tile=group*18+block;
+            uint tile=((group/4)*18+block)*4+group%4;
             uint d=block*128+lane*4;
             float4 v=float4(*(device const bfloat4*)(x+d));
             if (raw_tiles & (1u<<block)) {
