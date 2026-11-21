@@ -29,11 +29,7 @@ def prepare_query_weights(model):
     for index, block in enumerate(model.layers):
         layer = block.self_attn
         common = (layer.q_proj,layer.r_proj,layer.gate_proj)
-        variants = []
-        if isinstance(layer,layers.SlidingAttention):
-            variants.append(("_all_qkv",common+(layer.k_proj,layer.v_proj)))
-        if isinstance(layer,layers.FullAttention) or index in model.args.loop_core:
-            variants.append(("_common_q",common))
+        variants = [("_all_qkv",common+(layer.k_proj,layer.v_proj))]
         for name, modules in variants:
             if any(type(p) is not nn.Linear or "bias" in p or p.weight.dtype!=mx.bfloat16
                    or p.weight.shape[1]!=2304 for p in modules):
@@ -58,25 +54,41 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
         reference = _full if full else _sliding
         return reference(layer, hidden_states, key_hidden_states, value_hidden_states,
                           cache=cache, conv_states=conv_states, conv_mask=conv_mask)
-    name = "_all_qkv" if same else "_common_q"
+    distinct=False
+    if not same and hidden_states.dtype==key_hidden_states.dtype==value_hidden_states.dtype==mx.bfloat16:
+        extra=(layer.k_proj,layer.v_proj)
+        saved=getattr(layer,"_all_qkv",None)
+        tiles=getattr(layer,"_all_qkv_tiles",None)
+        weights=tuple(m.weight for m in common+extra)
+        if (saved is not None and tiles is not None and tiles[0] is saved[1]
+                and all(type(m) is nn.Linear and "bias" not in m for m in extra)
+                and all(a is b for a,b in zip(saved[0],weights))
+                and all(start%4==0 for start in saved[2][-2:])):
+            modules=common+extra
+            distinct=True
+    name = "_all_qkv" if same or distinct else "_common_q"
     packed, boundaries = projection(layer,modules,name)
-    tiles = getattr(layer,name+"_tiles",None)
-    projected = (packed_rows.project(hidden_states,packed,tiles[1])
-                 if tiles is not None and tiles[0] is packed and hidden_states.dtype==mx.bfloat16
-                 else hidden_states @ packed.T)
+    tiles=getattr(layer,name+"_tiles",None)
+    if distinct:
+        projected=packed_rows.project_three(hidden_states,key_hidden_states,value_hidden_states,
+                                           packed,tiles[1],boundaries)
+    elif tiles is not None and tiles[0] is packed and hidden_states.dtype==mx.bfloat16:
+        projected=packed_rows.project(hidden_states,packed,tiles[1])
+    else:
+        projected=hidden_states @ packed.T
     parts = mx.split(projected,boundaries,axis=-1)
     query, relative, gate = parts[:3]
     sinks = layer.sink_proj(hidden_states)
-    filtered = (None if full or same else
+    filtered = (None if full or same or distinct else
                 filtered_kv.apply(layer,key_hidden_states,value_hidden_states,conv_states,conv_mask))
     if filtered is not None:
         key,value,conv_states[0],conv_states[1] = filtered
-    elif same:
+    elif same or distinct:
         key, value = parts[3:]
     else:
         key = layer.k_proj(key_hidden_states)
         value = layer.v_proj(value_hidden_states)
-    fused_norm = (same and not full and conv_mask is None and conv_states is not None and layer.head_dim == 128
+    fused_norm = ((same or distinct) and not full and conv_mask is None and conv_states is not None and layer.head_dim == 128
                   and relative.shape[-1] // layer.num_heads <= 128
                   and key.dtype == value.dtype == query.dtype
                   and all(type(c) is layers.ShortConvolution and c.kernel_size == 4
