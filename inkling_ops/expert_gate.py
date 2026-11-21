@@ -43,14 +43,15 @@ _kernel = mx.fast.metal_kernel(
             }
         }
         for (uint i = 0; i < 4; ++i) sums[i] = simd_sum(sums[i]);
-        if (lane < 2) {
-            float scale = amax[expert] / 2688.f;
-            ushort g = as_type<ushort>(bfloat16_t(sums[lane*2]*scale));
-            ushort u = as_type<ushort>(bfloat16_t(sums[lane*2+1]*scale));
-            uint gi=((uint(g)&32767)<<2)|((g>>15)<<1);
-            uint ui=((uint(u)&32767)<<2)|((u>>15)<<1);
-            out[slot*1152+first/2+lane]=bfloat16_t(activation[gi]*activation[ui+1]);
+        float entry=0;
+        if (lane<4) {
+            ushort bits=as_type<ushort>(bfloat16_t(sums[lane]*(amax[expert]/2688.f)));
+            uint idx=((uint(bits)&32767)<<2)|((bits>>15)<<1)|(lane&1);
+            entry=activation[idx];
         }
+        float up=simd_shuffle_xor(entry,1);
+        if (lane<4 && !(lane&1)) out[slot*1152+first/2+lane/2]=bfloat16_t(entry*up);
+
     """,
 )
 
@@ -77,13 +78,15 @@ _mx_gate = mx.fast.metal_kernel(
             }
         }
         for (uint r = 0; r < 4; ++r) dots[r] = simd_sum(dots[r]);
-        if (lane < 2) {
-            ushort g = as_type<ushort>(bfloat16_t(dots[lane*2]));
-            ushort u = as_type<ushort>(bfloat16_t(dots[lane*2+1]));
-            uint gi=((uint(g)&32767)<<2)|((g>>15)<<1);
-            uint ui=((uint(u)&32767)<<2)|((u>>15)<<1);
-            out[slot*1152+first/2+lane] = bfloat16_t(activation[gi]*activation[ui+1]);
+        float entry=0;
+        if (lane<4) {
+            ushort bits=as_type<ushort>(bfloat16_t(dots[lane]));
+            uint idx=((uint(bits)&32767)<<2)|((bits>>15)<<1)|(lane&1);
+            entry=activation[idx];
         }
+        float up=simd_shuffle_xor(entry,1);
+        if (lane<4 && !(lane&1)) out[slot*1152+first/2+lane/2]=bfloat16_t(entry*up);
+
     """,
 )
 
