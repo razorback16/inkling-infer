@@ -3,14 +3,19 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.inkling2 import layers
 
+from . import paired_norm
+
 _reference = layers.MessageGate.__call__
 
 
 @mx.compile
 def _project(hidden, message, down, paired):
-    joined = mx.concatenate(
-        (layers.unweighted_rms_norm(hidden), layers.unweighted_rms_norm(message)), axis=-1
-    )
+    if hidden.shape[-1] == 2304 and hidden.dtype == message.dtype == mx.float32:
+        joined = paired_norm.join(hidden, message, down.dtype)
+    else:
+        joined = mx.concatenate(
+            (layers.unweighted_rms_norm(hidden), layers.unweighted_rms_norm(message)), axis=-1
+        )
     reduced = joined.astype(down.dtype) @ down.T
     gates = mx.tanh(reduced.astype(mx.float32) @ paired.T)
     forget, gain = mx.split(gates, 2, axis=-1)
