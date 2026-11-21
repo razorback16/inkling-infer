@@ -94,6 +94,44 @@ _dot = mx.fast.metal_kernel(
     name="inkling_four_row_gemv", input_names=["x","payload"],output_names=["out"],
     source=_dot_source,
 )
+_read_query = "float4 v=float4(*(device const bfloat4*)(x+d));"
+_sink_dot_source = _dot_source.replace("float sums[4]={};", """
+        float sums[4]={}, sink_parts[2]={};
+        uint sg=simdgroup_index_in_threadgroup, head=threadgroup_position_in_grid.x;
+    """).replace(_read_query, _read_query + """
+        if ((block%4)==sg) {
+            float4 sw=float4(*(device const bfloat4*)(sink_weight+head*2304+d));
+            uint part=block/4%2;
+            for (uint j=0;j<4;++j) sink_parts[part]=fma(v[j],sw[j],sink_parts[part]);
+        }
+    """) + """
+        threadgroup float parts[8];
+        for (uint r=0;r<2;++r) {
+            float dot=sink_parts[r];
+            for (ushort n=16;n;n>>=1) dot+=simd_shuffle_down(dot,n);
+            if (!lane) parts[r*4+sg]=dot;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (!sg && !lane) {
+            float dot=parts[0];
+            for (uint r=1;r<8;++r) dot+=parts[r];
+            sinks[head]=bfloat16_t(dot);
+        }
+    """
+_with_sinks=mx.fast.metal_kernel(
+    name="inkling_share_query_sink_reads",input_names=["x","payload","sink_weight"],
+    output_names=["out","sinks"],source="if (threadgroup_position_in_grid.x >= HEADS) {"+_dot_source+
+    " return; }" + _sink_dot_source,
+)
+
+
+def project_sinks(x,weight,encoded,sink_weight):
+    rows=weight.shape[0]
+    heads=sink_weight.shape[0]
+    return _with_sinks(inputs=[x,*encoded,sink_weight],template=[("HEADS",heads)],grid=(rows*8,1,1),
+                       threadgroup=(128,1,1),output_shapes=[(1,1,rows),(1,1,heads)],output_dtypes=[x.dtype]*2)
+
+
 _pair = mx.fast.metal_kernel(
     name="inkling_four_row_global_kv",input_names=["kx","vx","payload"],output_names=["out"],
     source=_dot_source.replace("group=thread_position_in_grid.x/32",
