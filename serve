@@ -20,7 +20,16 @@ case "$#:${1-}" in
     esac ;;
   *) usage >&2; exit 2 ;;
 esac
-export LITELLM_MASTER_KEY="$(cat .proxy-key)"
+if [[ ! -s .proxy-key ]]; then
+  echo 'Create .proxy-key using the setup command in README.md, then run serve again.' >&2
+  exit 1
+fi
+LITELLM_MASTER_KEY=$(cat .proxy-key)
+if [[ -z "$LITELLM_MASTER_KEY" ]]; then
+  echo '.proxy-key must contain a proxy key.' >&2
+  exit 1
+fi
+export LITELLM_MASTER_KEY
 .venv/bin/python backend.py --chat-template-args '{"reasoning_effort":"low"}' --model thinkingmachines/Inkling-2-Mini --prefill-step-size 2048 --host 127.0.0.1 --port 8089 &
 backend=$!
 trap 'kill "$backend" 2>/dev/null || true' EXIT
