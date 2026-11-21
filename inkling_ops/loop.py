@@ -17,20 +17,38 @@ def _compile(model):
     owner = weakref.ref(model)
 
     @mx.compile
-    def run(x, states, offset, slots):
+    def run(x, states, offset, slots, slab):
         caches = []
+        grouped = []
         for (packed, history), slot in zip(states, slots):
+            shared = packed is None
+            if shared:
+                row = len(grouped)
+                packed = slab[row:row+1]
             pages = packed if isinstance(packed, tuple) else None
             storage = mx.concatenate(pages, axis=2) if pages is not None else packed
             keys, values = mx.split(storage, 2, axis=1)
             ring = _DeviceRing(keys, values, offset, slot, packed=storage)
+            if shared:
+                grouped.append(ring)
+                ring.grouped = True
             if pages is not None:
                 ring.page_prefix, ring.page_tail = pages
             conv = ArraysCache(4)
             conv.cache = list(history)
             caches.append(CacheList(ring, conv))
         result = block_lookahead.run(groups,prepared_bank.run,_reference,owner(),x,caches)
-        return result, [
+        if grouped:
+            updates = []
+            for ring in grouped:
+                value = getattr(ring, "fresh", None)
+                if value is None:
+                    value = mx.take(ring.packed,ring.write_coordinates[0],axis=2)
+                updates.append(value)
+            slab = mx.slice_update(slab, mx.concatenate(updates,axis=0),
+                                   grouped[0].write_coordinates[0], axes=(2,))
+        return result, slab, [
+            (tuple(c[1].cache),) if getattr(c[0],"grouped",False) else
             (c[0].page_tail, tuple(c[1].cache)) if hasattr(c[0], "page_tail")
             else (c[0].packed, c[0].keys, c[0].values, tuple(c[1].cache)) for c in caches
         ]
@@ -82,10 +100,29 @@ def loop(model, x, cache, conv_mask):
         guard.capture(model)
         return result
     params = {slot: mx.array([slot], mx.int32) for slot in set(slots + [offset])}
-    result, updated = saved[1](x, states, params[offset], [params[i] for i in slots])
+    rows = [i for i,c in enumerate(cache) if type(c[0]) is RotatingKVCache
+            and states[i][0].shape == (1,16,1024,128) and states[i][0].dtype == mx.bfloat16]
+    slab = None
+    incoming = list(states)
+    if rows and all(slots[i] == slots[rows[0]] for i in rows):
+        tensors = tuple(states[i][0] for i in rows)
+        old = getattr(cache[rows[0]][0], "_shared_rings", None)
+        reusable = old is not None and len(tensors)==len(old[1]) and all(
+            a is b for a,b in zip(tensors,old[1]))
+        slab = old[0] if reusable else mx.concatenate(tensors,axis=0)
+        for i in rows:
+            incoming[i] = (None,states[i][1])
+    result, slab, updated = saved[1](x, incoming, params[offset], [params[i] for i in slots], slab)
+    views = []
     for c, slot, previous, update in zip(cache, slots, states, updated):
         k, conv = c[0], c[1]
-        if len(update) == 2:
+        if len(update) == 1:
+            history = update[0]
+            row = len(views)
+            packed = slab[row:row+1]
+            views.append(packed)
+            keys, values = mx.split(packed,2,axis=1)
+        elif len(update) == 2:
             tail, history = update
             pages = (previous[0][0], tail)
             packed = mx.concatenate(pages, axis=2)
@@ -99,6 +136,8 @@ def loop(model, x, cache, conv_mask):
         if type(k) is RotatingKVCache:
             k._idx = slot + 1
         conv.cache = list(history)
+    if views:
+        cache[rows[0]][0]._shared_rings = (slab, tuple(views))
     return result
 
 

@@ -81,6 +81,9 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
         rel = (rel.astype(mx.float32) * tau[..., None, None]).astype(rel.dtype)
     q, k, v = (x.transpose(0, 2, 1, 3) for x in (query, key, value))
     if pair is not None and getattr(kv, "packed", None) is not None and hasattr(kv, "update_packed"):
+        kv.defer_update = (getattr(kv,"grouped",False) and layer.sliding_window==1024
+                           and q.shape[-1]==128 and type(layer.rel_logits_proj) is layers.RelativeLogits
+                           and rel.dtype==q.dtype==mx.bfloat16)
         k, v = kv.update_packed(pair.transpose(0,2,1,3))
     elif kv is not None:
         k, v = kv.update_and_fetch(k, v)

@@ -29,6 +29,11 @@ class _DeviceRing(RotatingKVCache):
 
     def update_packed(self, new):
         self.write_coordinates = (self._idx, self.offset)
+        if getattr(self, "defer_update", False):
+            self.fresh = new
+            self._idx = self._idx + 1
+            self.offset = self.offset + 1
+            return self.keys, self.values
         if hasattr(self, "page_tail"):
             slot = self._idx - self.page_prefix.shape[2]
             self.page_tail = mx.slice_update(self.page_tail, new, slot, axes=(2,))
