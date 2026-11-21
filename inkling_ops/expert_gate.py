@@ -1,11 +1,13 @@
 """Decode interleaved NVFP4 projections and activate each routed expert."""
+from functools import lru_cache
+
 import mlx.core as mx
 from mlx_lm.models.inkling2 import layers
 
 _reference = layers.Experts.__call__
 _kernel = mx.fast.metal_kernel(
     name="inkling_stock_order_gate_up_fp4",
-    input_names=["x", "ids", "packed", "scales", "amax"],
+    input_names=["x", "ids", "packed", "scales", "amax", "gate_lut", "up_lut"],
     output_names=["out"],
     header="""
         constant float levels[16] = {
@@ -43,15 +45,21 @@ _kernel = mx.fast.metal_kernel(
         for (uint i = 0; i < 4; ++i) sums[i] = simd_sum(sums[i]);
         if (lane < 2) {
             float scale = amax[expert] / 2688.f;
-            float g = float(bfloat16_t(sums[lane * 2] * scale));
-            float u = float(bfloat16_t(sums[lane * 2 + 1] * scale));
-            float prob = 1.f / (1.f + precise::exp(abs(g)));
-            float sigmoid = g < 0 ? prob : 1.f - prob;
-            out[slot * 1152 + first / 2 + lane] = bfloat16_t(
-                (precise::tanh(g / 4.f) * 4.f) * sigmoid * (precise::tanh(u / 25.f) * 25.f));
+            ushort g = as_type<ushort>(bfloat16_t(sums[lane*2]*scale));
+            ushort u = as_type<ushort>(bfloat16_t(sums[lane*2+1]*scale));
+            out[slot*1152+first/2+lane] = bfloat16_t(gate_lut[g]*up_lut[u]);
         }
     """,
 )
+
+
+@lru_cache(maxsize=1)
+def activation_tables():
+    values = mx.arange(65536, dtype=mx.uint32).astype(mx.uint16).view(mx.bfloat16).astype(mx.float32)
+    gates = (mx.tanh(values / 4)*4) * mx.sigmoid(values)
+    ups = mx.tanh(values / 25)*25
+    mx.eval(gates, ups)
+    return gates, ups
 
 
 def gated_activation(layer, x, indices):
@@ -64,7 +72,7 @@ def gated_activation(layer, x, indices):
         pair = proj(x[..., None, None, :], indices)
         return layer.act_fn(pair[..., 0::2], pair[..., 1::2])
     active = _kernel(
-        inputs=[x, indices, proj.weight, proj.scales, proj.global_scale],
+        inputs=[x, indices, proj.weight, proj.scales, proj.global_scale, *activation_tables()],
         grid=(144 * 128, 8, 1), threadgroup=(128, 1, 1),
         output_shapes=[(1, 1, 8, 1, 1152)], output_dtypes=[x.dtype],
     )[0]
@@ -78,4 +86,5 @@ def experts(layer, x, indices):
 
 
 def install():
+    activation_tables()
     layers.Experts.__call__ = experts
