@@ -158,32 +158,17 @@ _rank_pairs = mx.fast.metal_kernel(
         uint tid=thread_position_in_threadgroup.x, lane=thread_index_in_simdgroup;
         uint warp=simdgroup_index_in_threadgroup;
         threadgroup float selected[8];
-        threadgroup float2 shortlist[64];
-        threadgroup uint ids[64], special[8];
-        uint e=warp*16+(lane&15);
-        float2 own=((device const float2*)logits)[e];
-        bool bad=simd_any(!isfinite(own.y));
-        if (!lane) special[warp]=bad;
-        if (!bad) {
-            uint rank=0;
-            for (uint j=0;j<16;++j) {
-                float rival=simd_shuffle(own.y,j);
-                rank += uint(rival>own.y || (rival==own.y && j<(lane&15)));
-            }
-            if (lane<16 && rank<8) {
-                uint dst=warp*8+rank;
-                shortlist[dst]=own; ids[dst]=e;
-            }
+        float scores[4], other[4];
+        bool special=false;
+        for (uint j=0;j<4;++j) {
+            float2 pair=((device const float2*)logits)[lane+32*j];
+            scores[j]=pair.x; other[j]=pair.y;
+            special |= !isfinite(pair.y);
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (special[0] || special[1] || special[2] || special[3] ||
-            special[4] || special[5] || special[6] || special[7]) {
+        if (simd_any(special)) {
             if (!warp) {
-                float b[4], scores[4];
-                for (uint j=0;j<4;++j) {
-                    float2 pair=((device const float2*)logits)[lane+32*j];
-                    b[j]=pair.y; scores[j]=pair.x;
-                }
+                float b[4];
+                for (uint j=0;j<4;++j) b[j]=other[j];
                 for (uint k=0;k<8;++k) {
                     float best=-INFINITY;
                     uint which=128;
@@ -202,15 +187,15 @@ _rank_pairs = mx.fast.metal_kernel(
                 }
             }
         } else {
-            float lo=shortlist[lane].y, hi=shortlist[32+lane].y;
-            uint left=ids[lane],right=ids[32+lane];
-            for (uint i=0;i<8;++i) {
-                uint idx=warp+8*i, expert=ids[idx];
-                float2 candidate=shortlist[idx];
-                uint ahead=uint(lo>candidate.y || (lo==candidate.y && left<expert))
-                          +uint(hi>candidate.y || (hi==candidate.y && right<expert));
+            for (uint i=0;i<4;++i) {
+                uint e=warp+32*i;
+                float query=simd_shuffle(other[i],warp);
+                uint ahead=0;
+                for (uint j=0;j<4;++j)
+                    ahead+=uint(other[j]>query || (other[j]==query && lane+32*j<e));
                 uint rank=simd_sum(ahead);
-                if (!lane && rank<8) { inds[rank]=expert; selected[rank]=candidate.x; }
+                float score=simd_shuffle(scores[i],warp);
+                if (!lane && rank<8) {inds[rank]=e; selected[rank]=score;}
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -244,7 +229,7 @@ def route(layer, x, dtype, normalized=False, logits=None, squares=None):
         kernel = _rank_pairs if paired else _select
         args = [logits] if paired else [logits,gate.e_score_correction_bias]
         args.extend([scalar(layers._ROUTER_SCORE_EPS),scalar(gate.routed_scaling_factor)])
-        indices, weights = kernel(inputs=args, grid=(256 if paired else 1024,1,1),threadgroup=(256 if paired else 1024,1,1),
+        indices, weights = kernel(inputs=args, grid=(1024,1,1),threadgroup=(1024,1,1),
             output_shapes=[(1,1,8)]*2, output_dtypes=[mx.uint32,mx.float32])
     else:
         indices, weights = layers.expert_routing(
