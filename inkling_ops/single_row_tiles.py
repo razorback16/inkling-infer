@@ -60,3 +60,17 @@ def encode(w):
     return _pack_rows(inputs=[w],template=[("COLS",cols)],
                       grid=(rows*32,1,1),threadgroup=(128,1,1),
                       output_shapes=[(rows,cols//128,64),(rows,)],output_dtypes=[mx.uint32,mx.uint32])
+
+
+_matvec=mx.fast.metal_kernel(name="inkling_single_tile_matvec",input_names=["x","payload","formats"],
+    output_names=["out"],source="""
+        uint lane=thread_index_in_simdgroup,row=thread_position_in_grid.x/32;
+    """ + DOT + """
+        if (!lane) out[row]=bfloat16_t(dot);
+    """)
+
+
+def project(x,weight,encoded):
+    rows,cols=weight.shape
+    return _matvec(inputs=[x,*encoded],template=[("COLS",cols)],grid=(rows*32,1,1),threadgroup=(256,1,1),
+                   output_shapes=[(1,1,rows)],output_dtypes=[x.dtype])[0]
