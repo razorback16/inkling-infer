@@ -52,12 +52,6 @@ _kernel = mx.fast.metal_kernel(
 
 def gated_activation(layer, x, indices):
     proj = layer.gate_up_proj
-    if (x.shape == (1, 1, 2304) and x.dtype == mx.bfloat16 and indices.shape == (1, 1, 8)
-            and getattr(proj, "mode", None) == "mxfp8" and proj.group_size == 32
-            and proj.bits == 8 and proj.weight.shape[1:] == (2304, 576) and "bias" not in proj
-            and proj.global_scale is None and layer.act_fn.gate_softcap == 4 and layer.act_fn.up_softcap == 25):
-        from .gate8 import activate
-        return activate(x, indices, proj)
     if (x.shape != (1, 1, 2304) or x.dtype != mx.bfloat16 or indices.shape != (1, 1, 8)
             or getattr(proj, "mode", None) != "nvfp4" or proj.group_size != 16
             or proj.bits != 4 or proj.weight.shape[1:] != (2304, 288) or "bias" in proj
