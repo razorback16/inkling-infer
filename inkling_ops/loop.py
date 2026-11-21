@@ -15,8 +15,6 @@ _reference = TextModel._run_loop
 def _compile(model):
     from . import filtered_output
     filtered_output.prepare(model)
-    from inkling_kernel import prepare_down_stripes
-    prepare_down_stripes(model)
     from .projections import prepare_query_weights
     prepare_query_weights(model)
     groups=block_lookahead.prepare(model)

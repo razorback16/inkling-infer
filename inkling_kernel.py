@@ -26,7 +26,7 @@ def mix(states, weights, dtype):
                 output_shapes=[(1, 1, 2304)], output_dtypes=[dtype])[0]
 
 
-def _make_down(finish, striped=False):
+def _make_down(finish):
     inputs = ["hidden", "indices", "routing", "packed", "scales", "amax"]
     outputs = ["out"]
     store = "out[channel + lane] = T(value);"
@@ -48,7 +48,7 @@ def _make_down(finish, striped=False):
             out[c] = T(residual[c] + filtered);
         """
     return mx.fast.metal_kernel(
-        name="inkling_striped_down" if striped else "inkling_finish_nvfp4_layer" if finish else "inkling_nvfp4_down_mix",
+        name="inkling_finish_nvfp4_layer" if finish else "inkling_nvfp4_down_mix",
         input_names=inputs, output_names=outputs,
     header="""
         constant float fp4_values[16] = {
@@ -105,30 +105,12 @@ def _make_down(finish, striped=False):
             }
             STORE
         }
-    """.replace("STORE", store).replace("expert * 2304 + channel",
-            "((channel / 16) * EXPERTS + expert) * 16 + channel % 16" if striped else "expert * 2304 + channel"),
+    """.replace("STORE", store),
     )
 
 
 _down_mix = _make_down(False)
 _finish_mix = _make_down(True)
-_striped_finish = _make_down(True, striped=True)
-
-
-def prepare_down_stripes(model):
-    for layer in model.layers:
-        down=layer.mlp.experts.down_proj
-        if (getattr(down,"mode",None)!="nvfp4" or down.weight.shape[1:]!=(2304,144)
-                or down.scales.shape!=(down.weight.shape[0],2304,72) or down.group_size!=16):
-            continue
-        w,scales=down.weight,down.scales
-        saved=getattr(down,"_channel_stripes",None)
-        if saved is not None and saved[0] is w and saved[1] is scales:
-            continue
-        experts=w.shape[0]
-        rows=[mx.contiguous(a.reshape(experts,144,16,-1).transpose(1,0,2,3)) for a in (w,scales)]
-        mx.eval(rows)
-        object.__setattr__(down,"_channel_stripes",(w,scales,*rows))
 
 
 def can_fuse_down(down, x):
