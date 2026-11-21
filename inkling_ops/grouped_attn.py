@@ -137,9 +137,12 @@ def attend(layer,q,k,v,rel,sinks,cache,gate):
     tail = cache.page_tail if paged else q
     if paged:
         k, v = mx.split(cache.page_prefix, 2, axis=1)
+    # A compiled ring already carries one-element int32 graph inputs.
+    if before is None:
+        slot, end = mx.array(slot,mx.int32).reshape(1), mx.array(end,mx.int32).reshape(1)
     fresh = getattr(cache,"fresh",None)
     parts,stats = _partial(
-        inputs=[q,k,v,tail,q if fresh is None else fresh,rel,w,mx.array(slot,mx.int32).reshape(1),mx.array(end,mx.int32).reshape(1),
+        inputs=[q,k,v,tail,q if fresh is None else fresh,rel,w,slot,end,
                 sinks.astype(q.dtype),scalar(layer.scaling)],
         template=[("T",q.dtype),("S",length),("PRE_UPDATE",before is not None),("PAGED",paged),("FRESH",fresh is not None),("NKV",k.shape[1]),("GQA",heads//k.shape[1]),("WIDTH",width),("SWIZZLED",swizzled),
                   ("R",extent),("WINDOW",layer.sliding_window)],

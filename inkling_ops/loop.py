@@ -17,11 +17,13 @@ def _compile(model):
     owner = weakref.ref(model)
 
     @mx.compile
-    def run(x, states, offset, slots, slab):
+    def run(x, states, offset, slots, slab, ring_slot):
         caches = []
         grouped = []
         for (packed, history), slot in zip(states, slots):
             shared = packed is None
+            if slot is None:
+                slot = ring_slot if shared else offset
             if shared:
                 row = len(grouped)
                 packed = slab[row:row+1]
@@ -112,7 +114,10 @@ def loop(model, x, cache, conv_mask):
         slab = old[0] if reusable else mx.concatenate(tensors,axis=0)
         for i in rows:
             incoming[i] = (None,states[i][1])
-    result, slab, updated = saved[1](x, incoming, params[offset], [params[i] for i in slots], slab)
+    ring_slot = None if slab is None else params[slots[rows[0]]]
+    positions = [None if state[0] is None or type(c[0]) is KVCache else params[slot]
+                 for state,c,slot in zip(incoming,cache,slots)]
+    result, slab, updated = saved[1](x, incoming, params[offset], positions, slab, ring_slot)
     views = []
     for c, slot, previous, update in zip(cache, slots, states, updated):
         k, conv = c[0], c[1]
