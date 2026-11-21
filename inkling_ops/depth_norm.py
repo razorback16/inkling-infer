@@ -198,12 +198,15 @@ def post_attention(layer, blocks, attention, history, hidden, normalize=False):
         output_dtypes=[attention.dtype if normalize else mx.float32]+[mx.float32]*3)
     return mixed, residual, window
 
-def make_projected(normalize,routes=False,bottleneck=False):
+def make_projected(normalize,routes=False,bottleneck=False,attention=False):
     source = normalized_source() if normalize else _source.replace("FILTER","")
-    source = source.replace("sum += v*v;", "").replace("sum = simd_sum(sum);","sum = simd_sum(squares[tid]);",1)
-    source = source.replace("if (!query) normalized[d] = norm[d];","")
+    if attention:
+        source=source.replace("if (!query) normalized[d]", "if (!threadgroup_position_in_grid.y && !threadgroup_position_in_grid.x) normalized[d]")
+    else:
+        source = source.replace("sum += v*v;", "").replace("sum = simd_sum(sum);","sum = simd_sum(squares[tid]);",1)
+        source = source.replace("if (!query) normalized[d] = norm[d];","")
     source = cached_source(source)
-    inputs = ["x","blocks","queries","squares","closed"]
+    inputs = ["x","blocks","queries","closed"] if attention else ["x","blocks","queries","squares","closed"]
     if normalize:
         inputs.extend(["weights","eps"])
     if routes:
@@ -258,6 +261,15 @@ def make_projected(normalize,routes=False,bottleneck=False):
                 "norm[col+j],float(gate[(first+r)*2304+col+j])",
                 "(col<2304 ? norm[col+j] : float(bfloat16_t(message[col+j-2304]))),"
                 "float(gate[(first+r)*4608+col+j])")
+        if attention:
+            source=source.replace("query = 0", "query = SHARED ? 0 : threadgroup_position_in_grid.y").replace(
+                "if (!threadgroup_position_in_grid.x) mixed[d]",
+                "if (!threadgroup_position_in_grid.x && query==threadgroup_position_in_grid.y) mixed[query*2304+d]")
+            tail=tail.replace("message[col+j-2304]","message[threadgroup_position_in_grid.y*2304+col+j-2304]").replace(
+                "gate[(first+r)*4608+col+j]","gate[(threadgroup_position_in_grid.y*64+first+r)*4608+col+j]").replace(
+                "logits[threadgroup_position_in_grid.x*8+tid]", "logits[threadgroup_position_in_grid.y*64+threadgroup_position_in_grid.x*8+tid]")
+            return mx.fast.metal_kernel(name="inkling_attention_depth_bottlenecks",input_names=inputs,
+                                        output_names=["mixed","logits","normalized"],source=source+tail)
         source+=tail
         return mx.fast.metal_kernel(name="inkling_depth_message_reduce" if bottleneck else "inkling_depth_router_scores",input_names=inputs,
                                     output_names=["mixed","logits"],source=source)
@@ -268,6 +280,28 @@ def make_projected(normalize,routes=False,bottleneck=False):
 _projected = (make_projected(False),make_projected(True))
 _projected_routes = make_projected(True,True)
 _projected_message = make_projected(False,bottleneck=True)
+
+
+_attention_message = make_projected(False,bottleneck=True,attention=True)
+
+
+def attention_messages(layer,blocks,x,prepared):
+    from . import triplet, input_heads
+    if (prepared is None or prepared.dtype!=mx.float32 or layer.attention_input is None
+            or layer.attention_input.query.size not in (2304,6912) or x.dtype!=mx.bfloat16
+            or getattr(layer._self_attention,"__func__",None) is not input_heads.attention
+            or getattr(layer._mix_messages,"__func__",None) is not triplet.mix_messages):
+        return None
+    saved=triplet.projection_weights(layer)
+    if saved is None or saved[1].shape!=(3,64,4608) or saved[1].dtype!=mx.bfloat16:
+        return None
+    q=layer.attention_input.query.size//2304
+    closed,config=block_lookahead.lookup(layer.attention_input,blocks)
+    return _attention_message(inputs=[x,blocks,layer.attention_input.query,closed,saved[1],prepared],
+                              template=[("K",blocks.shape[0]),("SHARED",q==1),*config],
+                              grid=(8*576,3,1),threadgroup=(576,1,1),
+                              output_shapes=[(1,1,q,2304),(3,1,64),x.shape],
+                              output_dtypes=[mx.float32,mx.bfloat16,mx.float32])
 
 
 def from_projection(layer, blocks, residual, squares, normalize, gate=None, message=None):

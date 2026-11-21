@@ -34,12 +34,16 @@ def decode(layer, hidden_states, block_states, *, cache=None, conv_mask=None, me
         states, normed = normalized_inputs
         attention = layer.self_attn(*states, cache=cache, conv_states=history, conv_mask=None)
     else:
-        if layer.attention_input is None:
+        packed_messages = depth_norm.attention_messages(layer,block_states,hidden_states,normalized_messages)
+        payload = (messages, normalized_messages) if normalized_messages is not None else messages
+        if packed_messages is not None:
+            inputs,reduced,normed = packed_messages
+            payload=(messages,normalized_messages,reduced)
+        elif layer.attention_input is None:
             normed = layers.unweighted_rms_norm(hidden_states.astype(mx.float32))
             inputs = None
         else:
             inputs, normed = depth_norm.evaluate(layer.attention_input, block_states, hidden_states)
-        payload = (messages, normalized_messages) if normalized_messages is not None else messages
         attention = layer._self_attention(hidden_states,inputs,cache,history,None,payload)
     if layer.is_block_boundary:
         block = normed[None]
