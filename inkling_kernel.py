@@ -94,7 +94,7 @@ def _make_down(finish):
         for (uint r = 0; r < 4; ++r) {
             float dot = simd_sum(accum[r]);
             if (lane == 0)
-                projected[slot][r] = float(T(dot * (amax[expert] / 2688.f)));
+                projected[slot][r] = float(T(dot * amax[expert]));
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (slot == 0 && lane < 4) {
@@ -127,10 +127,10 @@ def single_token_moe(self, x):
     experts, weights = self.gate(x)
     down = self.experts.down_proj
     if can_fuse_down(down, x):
-        from inkling_ops.expert_gate import gated_activation
+        from inkling_ops.expert_gate import gated_activation, normalized_scale
         hidden = gated_activation(self.experts, x, experts)
         return _down_mix(
-            inputs=[hidden, experts, weights, down.weight, down.scales, down.global_scale],
+            inputs=[hidden, experts, weights, down.weight, down.scales, normalized_scale(down)],
             template=[("T", x.dtype)], grid=(576 * 256, 1, 1),
             threadgroup=(256, 1, 1), output_shapes=[x.shape], output_dtypes=[x.dtype],
         )[0]

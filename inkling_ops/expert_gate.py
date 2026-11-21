@@ -44,7 +44,7 @@ _kernel = mx.fast.metal_kernel(
         }
         for (uint i = 0; i < 4; ++i) sums[i] = simd_sum(sums[i]);
         if (lane < 2) {
-            float scale = amax[expert] / 2688.f;
+            float scale = amax[expert];
             ushort g = as_type<ushort>(bfloat16_t(sums[lane*2]*scale));
             ushort u = as_type<ushort>(bfloat16_t(sums[lane*2+1]*scale));
             uint gi=((uint(g)&32767)<<2)|((g>>15)<<1);
@@ -53,6 +53,36 @@ _kernel = mx.fast.metal_kernel(
         }
     """,
 )
+
+
+_normalize_scale = mx.fast.metal_kernel(
+    name="inkling_normalized_expert_scale", input_names=["amax"], output_names=["scale"],
+    source="""
+        uint expert = thread_position_in_grid.x;
+        scale[expert] = float(amax[expert]) / 2688.f;
+    """,
+)
+
+
+def normalized_scale(projection):
+    raw = projection.global_scale
+    saved = getattr(projection, "_normalized_expert_scale", None)
+    if saved is not None and saved[0] is raw:
+        return saved[1]
+    return _normalize_scale(inputs=[raw], grid=(raw.size, 1, 1), threadgroup=(32, 1, 1),
+                            output_shapes=[raw.shape], output_dtypes=[mx.float32])[0]
+
+
+def prepare_scales(model):
+    scales = []
+    for layer in model.layers:
+        experts = layer.mlp.experts
+        for projection in (experts.gate_up_proj, experts.down_proj):
+            if getattr(projection, "mode", None) == "nvfp4" and projection.global_scale is not None:
+                scale = normalized_scale(projection)
+                object.__setattr__(projection, "_normalized_expert_scale", (projection.global_scale, scale))
+                scales.append(scale)
+    mx.eval(scales)
 
 
 @lru_cache(maxsize=1)
@@ -75,7 +105,7 @@ def gated_activation(layer, x, indices):
         pair = proj(x[..., None, None, :], indices)
         return layer.act_fn(pair[..., 0::2], pair[..., 1::2])
     active = _kernel(
-        inputs=[x, indices, proj.weight, proj.scales, proj.global_scale, activation_tables()],
+        inputs=[x, indices, proj.weight, proj.scales, normalized_scale(proj), activation_tables()],
         grid=(144 * 128, 8, 1), threadgroup=(128, 1, 1),
         output_shapes=[(1, 1, 8, 1, 1152)], output_dtypes=[x.dtype],
     )[0]
