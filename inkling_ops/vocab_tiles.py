@@ -49,14 +49,14 @@ _dot = mx.fast.metal_kernel(
     name="inkling_vocab_twelve_bit_dot", input_names=["x","tiles","overflow"],
     output_names=["out"], source="""
         uint lane=thread_index_in_simdgroup, row=thread_position_in_grid.x/32;
-        device const uint* group=tiles+(row/4)*3552;
+        device const uint* group=tiles+(row/4)*3488;
         uint2 descriptor=((device const uint2*)group)[row%4];
         uint fmt=descriptor.x, mask=fmt&0x3ffffu;
         ushort base=ushort(fmt>>24);
         float dot=0;
         #pragma clang loop unroll_count(3)
         for (uint t=0;t<18;++t) {
-            uint addr=96+(t*4+row%4)*48;
+            uint addr=32+(t*4+row%4)*48;
             ushort h=((device const ushort*)(group+addr+32))[lane];
             ushort4 codes=ushort4(h,h>>4,h>>8,h>>12);
             ushort4 n=codes&7;
@@ -86,7 +86,7 @@ def encode(w):
     tiles,overflow=_pack(inputs=[w,formats,offsets], grid=(rows*18*32,1,1), threadgroup=(128,1,1),
                          output_shapes=[(rows,18,48),(n_overflow,16)], output_dtypes=[mx.uint32]*2)
     descriptors=mx.stack((formats,offsets),axis=1).reshape(-1,8)
-    headers=mx.pad(descriptors,[(0,0),(0,88)])
+    headers=mx.pad(descriptors,[(0,0),(0,24)])
     return mx.concatenate((headers,tiles.reshape(-1,3456)),axis=1),overflow
 
 
