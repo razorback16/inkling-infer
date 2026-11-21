@@ -46,7 +46,6 @@ def decode(layer, hidden_states, block_states, *, cache=None, conv_mask=None, me
         block_states = block if block_states is None else mx.concatenate((block_states, block))
     prenormalized = False
     logits = None
-    reduced_message = None
     if isinstance(attention,tuple):
         residual,history[2],squares = attention
         prenormalized = messages is None and type(layer.post_attention_layernorm) is nn.RMSNorm
@@ -55,15 +54,6 @@ def decode(layer, hidden_states, block_states, *, cache=None, conv_mask=None, me
                 and gate.weight.shape==(128,2304) and layer.mlp_input.query.size==2304):
             from .exact_sources import native
             mixed,logits=depth_norm.from_projection(layer,block_states,residual,squares,True,native(gate))
-        elif (normalized_messages is not None and normalized_messages.dtype==mx.float32
-              and type(layer.mlp_message_gate) is layers.MessageGate and layer.mlp_input.query.size==2304
-              and type(layer.mlp_message_gate.down_proj) is nn.Linear
-              and "bias" not in layer.mlp_message_gate.down_proj
-              and layer.mlp_message_gate.down_proj.weight.shape==(64,4608)
-              and layer.mlp_message_gate.down_proj.weight.dtype==mx.bfloat16):
-            mixed,reduced_message=depth_norm.from_projection(
-                layer,block_states,residual,squares,False,layer.mlp_message_gate.down_proj.weight,
-                normalized_messages[...,3,:])
         else:
             mixed=depth_norm.from_projection(layer,block_states,residual,squares,prenormalized)
     elif type(layer.post_attention_convolution) is layers.ShortConvolution and layer.post_attention_convolution.kernel_size == 4:
@@ -79,7 +69,7 @@ def decode(layer, hidden_states, block_states, *, cache=None, conv_mask=None, me
     x = mixed[...,0,:]
     if normalized_messages is not None and type(layer.mlp_message_gate) is layers.MessageGate:
         from . import message_gate
-        x = message_gate.project(layer.mlp_message_gate,x,messages[...,3,:],normalized_messages[...,3,:],reduced_message)
+        x = message_gate.project(layer.mlp_message_gate,x,messages[...,3,:],normalized_messages[...,3,:])
     elif messages is not None:
         x = layer.mlp_message_gate(x,messages[...,3,:])
     x, selected, routing = router.route(layer, x, hidden_states.dtype, normalized=prenormalized, logits=logits)

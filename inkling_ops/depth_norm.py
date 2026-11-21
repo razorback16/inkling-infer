@@ -198,7 +198,7 @@ def post_attention(layer, blocks, attention, history, hidden, normalize=False):
         output_dtypes=[attention.dtype if normalize else mx.float32]+[mx.float32]*3)
     return mixed, residual, window
 
-def make_projected(normalize,routes=False,bottleneck=False):
+def make_projected(normalize,routes=False):
     source = normalized_source() if normalize else _source.replace("FILTER","")
     source = source.replace("sum += v*v;", "").replace("sum = simd_sum(sum);","sum = simd_sum(squares[tid]);",1)
     source = source.replace("if (!query) normalized[d] = norm[d];","")
@@ -212,23 +212,7 @@ def make_projected(normalize,routes=False,bottleneck=False):
             "mixed[col]=bfloat16_t((values[j]*inv)*float(weights[col]));",
             "bfloat16_t value=bfloat16_t((values[j]*inv)*float(weights[col])); "
             "norm[col]=float(value); if (!threadgroup_position_in_grid.x) mixed[col]=value;")
-    if bottleneck:
-        inputs.extend(["gate","message"])
-        source=source.replace("query = threadgroup_position_in_grid.x", "query = 0").replace(
-            "mixed[query*2304+d] = v + norm[d]*coeff[K];",
-            "values[j]=v+norm[d]*coeff[K]; "
-            "if (!threadgroup_position_in_grid.x) mixed[d]=values[j];")
         source += """
-            float norm2=0;
-            for (uint j=0;j<4;++j) norm2+=values[j]*values[j];
-            norm2=simd_sum(norm2);
-            if (!lane) sums[sg]=norm2;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            float inv=precise::rsqrt(simd_sum(lane<18 ? sums[lane] : 0.f)/2304.f+1.e-6f);
-            for (uint j=0;j<4;++j) norm[tid*4+j]=float(bfloat16_t(values[j]*inv));
-        """
-    if routes or bottleneck:
-        tail = """
             threadgroup_barrier(mem_flags::mem_threadgroup);
             threadgroup float partial[16][4];
             uint first=threadgroup_position_in_grid.x*8+(sg/8)*4;
@@ -252,13 +236,7 @@ def make_projected(normalize,routes=False,bottleneck=False):
                 logits[threadgroup_position_in_grid.x*8+tid]=sum;
             }
         """
-        if bottleneck:
-            tail=tail.replace("col<2304", "col<4608").replace(
-                "norm[col+j],float(gate[(first+r)*2304+col+j])",
-                "(col<2304 ? norm[col+j] : float(bfloat16_t(message[col+j-2304]))),"
-                "float(gate[(first+r)*4608+col+j])")
-        source+=tail
-        return mx.fast.metal_kernel(name="inkling_depth_message_reduce" if bottleneck else "inkling_depth_router_scores",input_names=inputs,
+        return mx.fast.metal_kernel(name="inkling_depth_router_scores",input_names=inputs,
                                     output_names=["mixed","logits"],source=source)
     return mx.fast.metal_kernel(name="inkling_projected_depth_norm" if normalize else "inkling_projected_depth",
                                 input_names=inputs,output_names=["mixed"],source=source)
@@ -266,19 +244,14 @@ def make_projected(normalize,routes=False,bottleneck=False):
 
 _projected = (make_projected(False),make_projected(True))
 _projected_routes = make_projected(True,True)
-_projected_message = make_projected(False,bottleneck=True)
 
 
-def from_projection(layer, blocks, residual, squares, normalize, gate=None, message=None):
+def from_projection(layer, blocks, residual, squares, normalize, gate=None):
     closed,config=block_lookahead.lookup(layer.mlp_input,blocks)
     inputs = [residual,blocks,layer.mlp_input.query,squares,closed]
     if normalize:
         norm=layer.post_attention_layernorm
         inputs.extend([norm.weight,scalar(norm.eps)])
-    if message is not None:
-        return _projected_message(inputs=[*inputs,gate,message],template=[("K",blocks.shape[0]),*config],
-                                  grid=(8*576,1,1),threadgroup=(576,1,1),
-                                  output_shapes=[(1,1,1,2304),(1,1,64)],output_dtypes=[mx.float32,mx.bfloat16])
     if gate is not None:
         return _projected_routes(inputs=[*inputs,gate],template=[("K",blocks.shape[0]),*config],
                                  grid=(16*576,1,1),threadgroup=(576,1,1),
