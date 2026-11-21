@@ -76,12 +76,10 @@ def loop(model, x, cache, conv_mask):
                 or any(h is None for h in conv.cache)):
             return _reference(model, x, cache, conv_mask)
         capacity = k.keys.shape[2]
-        trim = type(k) is RotatingKVCache and capacity > k.max_size
         if type(k) is RotatingKVCache:
-            if (k.keep or capacity < k.max_size or offset < k.max_size
-                    or (trim and k._idx != capacity)):
+            if k.keep or k.max_size != capacity or offset < capacity:
                 return _reference(model, x, cache, conv_mask)
-            slot = 0 if trim else k._idx % capacity
+            slot = k._idx % capacity
         else:
             if offset > capacity or (offset == capacity and not
                     (k.step == 256 and 1024 <= capacity <= 7936 and capacity % 256 == 0)):
@@ -89,12 +87,8 @@ def loop(model, x, cache, conv_mask):
             slot = offset
         slots.append(slot)
         joined = getattr(k, "_joint_decode_state", None)
-        if trim:
-            packed = mx.concatenate((k.keys[:,:,-k.max_size:,:],k.values[:,:,-k.max_size:,:]),axis=1)
-        elif joined is not None and joined[1] is k.keys and joined[2] is k.values:
-            packed = joined[0]
-        else:
-            packed = mx.concatenate((k.keys,k.values),axis=1)
+        packed = (joined[0] if joined is not None and joined[1] is k.keys and joined[2] is k.values
+                  else mx.concatenate((k.keys, k.values), axis=1))
         if type(k) is KVCache and offset == capacity:
             shape = (*packed.shape[:2], k.step, packed.shape[3])
             packed = (packed, mx.zeros(shape, dtype=packed.dtype))
