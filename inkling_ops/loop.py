@@ -23,19 +23,13 @@ def _compile(model):
             keys, values = mx.split(storage, 2, axis=1)
             ring = _DeviceRing(keys, values, offset, slot, packed=storage)
             if pages is not None:
-                if len(pages) == 4:
-                    ring.circle_pages = pages
-                    ring.packed = ring.circle_view()
-                    ring.keys, ring.values = mx.split(ring.packed, 2, axis=1)
-                else:
-                    ring.page_prefix, ring.page_tail = pages
+                ring.page_prefix, ring.page_tail = pages
             conv = ArraysCache(4)
             conv.cache = list(history)
             caches.append(CacheList(ring, conv))
         result = _reference(owner(), x, caches, None)
         return result, [
-            (c[0].circle_pages[0], tuple(c[1].cache)) if hasattr(c[0], "circle_pages")
-            else (c[0].page_tail, tuple(c[1].cache)) if hasattr(c[0], "page_tail")
+            (c[0].page_tail, tuple(c[1].cache)) if hasattr(c[0], "page_tail")
             else (c[0].packed, c[0].keys, c[0].values, tuple(c[1].cache)) for c in caches
         ]
 
@@ -75,14 +69,6 @@ def loop(model, x, cache, conv_mask):
                 packed = saved_pages[2]
             else:
                 packed = tuple(mx.contiguous(t) for t in mx.split(packed, [capacity-256], axis=2))
-        elif type(k) is RotatingKVCache and capacity == 1024:
-            saved = getattr(k, "_decode_circle", None)
-            if saved is not None and saved[0] is k.keys and saved[1] is k.values:
-                pages = saved[2]
-            else:
-                pages = tuple(mx.contiguous(t) for t in mx.split(packed, 4, axis=2))
-            active = slot // 256
-            packed = pages[active:] + pages[:active]
         states.append((packed, tuple(conv.cache)))
     saved = getattr(model, "_decode_loop", None)
     if saved is None or not saved[0].matches(model):
@@ -99,18 +85,10 @@ def loop(model, x, cache, conv_mask):
         k, conv = c[0], c[1]
         if len(update) == 2:
             tail, history = update
-            if len(previous[0]) == 4:
-                active = slot // 256
-                rotated = (tail, *previous[0][1:])
-                pages = rotated[-active:] + rotated[:-active] if active else rotated
-            else:
-                pages = (previous[0][0], tail)
+            pages = (previous[0][0], tail)
             packed = mx.concatenate(pages, axis=2)
             keys, values = mx.split(packed, 2, axis=1)
-            if len(pages) == 4:
-                k._decode_circle = (keys, values, pages)
-            else:
-                k._decode_pages = (keys, values, pages)
+            k._decode_pages = (keys, values, pages)
         else:
             packed, keys, values, history = update
         k.keys, k.values = keys, values

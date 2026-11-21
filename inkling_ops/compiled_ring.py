@@ -26,17 +26,8 @@ class _DeviceRing(RotatingKVCache):
         self.offset = self.offset + 1
         return self.keys, self.values
 
-    def circle_view(self):
-        rotated = mx.concatenate(self.circle_pages, axis=2)
-        base = self._idx - self._idx % 256
-        return mx.take(rotated, (mx.arange(1024) - base) % 1024, axis=2)
-
     def update_packed(self, new):
-        if hasattr(self, "circle_pages"):
-            page = mx.slice_update(self.circle_pages[0], new, self._idx % 256, axes=(2,))
-            self.circle_pages = (page, *self.circle_pages[1:])
-            self.packed = self.circle_view()
-        elif hasattr(self, "page_tail"):
+        if hasattr(self, "page_tail"):
             slot = self._idx - self.page_prefix.shape[2]
             self.page_tail = mx.slice_update(self.page_tail, new, slot, axes=(2,))
             self.packed = mx.concatenate((self.page_prefix, self.page_tail), axis=2)

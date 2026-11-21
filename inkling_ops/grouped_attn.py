@@ -5,7 +5,7 @@ from mlx_lm.models.cache import BatchRotatingKVCache, RotatingKVCache
 
 _partial = mx.fast.metal_kernel(
     name="inkling_interleaved_attention",
-    input_names=["q","k","v","tail","p1","p2","p3","rel","w","slot","end","sinks","scale"],output_names=["partials","stats"],
+    input_names=["q","k","v","tail","rel","w","slot","end","sinks","scale"],output_names=["partials","stats"],
     source="""
         uint lane = thread_index_in_simdgroup, head = threadgroup_position_in_grid.y;
         uint tile = thread_position_in_grid.x / 32;
@@ -30,14 +30,7 @@ _partial = mx.fast.metal_kernel(
             #pragma clang loop unroll(full)
             for (uint pos=0; pos<8; ++pos) {
                 uint at=((kv*1024+tile+pos*128)*128)+d;
-                auto source=k+at;
-                if (CIRCLE) {
-                    uint physical=tile+pos*128;
-                    uint page=(physical/256-uint(slot[0]-1)/256)&3u;
-                    auto storage=page==0 ? tail : page==1 ? p1 : page==2 ? p2 : p3;
-                    source=storage+(kv*256+(physical&255))*128+d;
-                }
-                float4 key=float4(*(device const bfloat4*)source);
+                float4 key=float4(*(device const bfloat4*)(k+at));
                 float score=0;
                 for (uint j=0; j<4; ++j) score += query[j]*key[j];
                 scores[pos]=simd_sum(score)+simd_shuffle(bias,pos);
@@ -45,14 +38,7 @@ _partial = mx.fast.metal_kernel(
             #pragma clang loop unroll(full)
             for (uint pos=0; pos<8; ++pos) {
                 uint at=((kv*1024+tile+pos*128)*128)+d;
-                auto source=v+at;
-                if (CIRCLE) {
-                    uint physical=tile+pos*128;
-                    uint page=(physical/256-uint(slot[0]-1)/256)&3u;
-                    auto storage=page==0 ? tail : page==1 ? p1 : page==2 ? p2 : p3;
-                    source=storage+((kv+NKV)*256+(physical&255))*128+d;
-                }
-                float4 value=float4(*(device const bfloat4*)source);
+                float4 value=float4(*(device const bfloat4*)(v+at));
                 float score=scores[pos], top=max(peak,score);
                 float a=fast::exp(peak-top), b=fast::exp(score-top);
                 total=total*a+b;
@@ -145,16 +131,10 @@ def attend(layer,q,k,v,rel,sinks,cache,gate):
     tail = cache.page_tail if paged else q
     if paged:
         k, v = mx.split(cache.page_prefix, 2, axis=1)
-    circle = hasattr(cache, "circle_pages") and layer.sliding_window == length == 1024
-    pages = cache.circle_pages if circle else (tail, q, q, q)
-    if circle:
-        # The specialized path reads only pages. Keep the unused dense arguments small.
-        k, v = cache.circle_pages[0], cache.circle_pages[0]
-    kv_heads = layer.num_key_value_heads
     parts,stats = _partial(
-        inputs=[q,k,v,*pages,rel,w,mx.array(slot,mx.int32).reshape(1),mx.array(cache.offset,mx.int32).reshape(1),
+        inputs=[q,k,v,tail,rel,w,mx.array(slot,mx.int32).reshape(1),mx.array(cache.offset,mx.int32).reshape(1),
                 sinks.astype(q.dtype),scalar(layer.scaling)],
-        template=[("T",q.dtype),("S",length),("PAGED",paged),("NKV",kv_heads),("CIRCLE",circle),("GQA",heads//kv_heads),("WIDTH",width),("SWIZZLED",swizzled),
+        template=[("T",q.dtype),("S",length),("PAGED",paged),("NKV",k.shape[1]),("GQA",heads//k.shape[1]),("WIDTH",width),("SWIZZLED",swizzled),
                   ("R",extent),("WINDOW",layer.sliding_window)],
         grid=(128*32,heads,1),threadgroup=(128,1,1),
         output_shapes=[(heads,128,128),(heads,128,2)],output_dtypes=[q.dtype,mx.float32])
