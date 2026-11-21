@@ -100,16 +100,12 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
     name = "_all_qkv" if same else "_common_q"
     packed, boundaries = projection(layer,modules,name)
     tiles = getattr(layer,name+"_tiles",None)
-    encoded=tiles is not None and tiles[0] is packed and hidden_states.dtype==mx.bfloat16
-    sink=layer.sink_proj
-    if (encoded and type(sink) is nn.Linear and "bias" not in sink and sink.weight.dtype==mx.bfloat16
-            and sink.weight.shape==(24,2304) and packed.shape[0]>=16*24):
-        projected,sinks=packed_rows.project_sinks(hidden_states,packed,tiles[1],sink.weight)
-    else:
-        projected=packed_rows.project(hidden_states,packed,tiles[1]) if encoded else hidden_states @ packed.T
-        sinks=sink(hidden_states)
+    projected = (packed_rows.project(hidden_states,packed,tiles[1])
+                 if tiles is not None and tiles[0] is packed and hidden_states.dtype==mx.bfloat16
+                 else hidden_states @ packed.T)
     parts = mx.split(projected,boundaries,axis=-1)
     query, relative, gate = parts[:3]
+    sinks = layer.sink_proj(hidden_states)
     filtered = (None if full or same else
                 filtered_kv.apply(layer,key_hidden_states,value_hidden_states,conv_states,conv_mask))
     if filtered is not None:
