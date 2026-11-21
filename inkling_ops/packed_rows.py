@@ -55,7 +55,9 @@ _pack = mx.fast.metal_kernel(
 
     """,
 )
-DOT="""
+_dot = mx.fast.metal_kernel(
+    name="inkling_four_row_gemv", input_names=["x","payload"],output_names=["out"],
+    source="""
         uint lane=thread_index_in_simdgroup, group=thread_position_in_grid.x/32;
         uint2 meta=*(device const uint2*)(payload+(group/4)*18688+(group%4)*2);
         uchar4 base=as_type<uchar4>(meta.x);
@@ -89,10 +91,8 @@ DOT="""
             for (ushort step=16;step;step>>=1) dot+=simd_shuffle_down(dot,step);
             if (!lane) out[group*4+r]=bfloat16_t(dot);
         }
-    """
-
-_dot=mx.fast.metal_kernel(name="inkling_four_row_gemv",input_names=["x","payload"],output_names=["out"],source=DOT)
-
+    """,
+)
 
 
 def encode(weight):

@@ -91,19 +91,13 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
     name = "_all_qkv" if same else "_common_q"
     packed, boundaries = projection(layer,modules,name)
     tiles = getattr(layer,name+"_tiles",None)
-    compact=tiles is not None and tiles[0] is packed and hidden_states.dtype==mx.bfloat16
-    paired=(filtered_kv.paired(layer,hidden_states,key_hidden_states,value_hidden_states,conv_states,
-                               conv_mask,packed.shape[0],tiles[1]) if compact and not full and not same else None)
-    if paired is not None:
-        projected=paired[0]
-    elif compact:
-        projected=packed_rows.project(hidden_states,packed,tiles[1])
-    else:
-        projected=hidden_states @ packed.T
+    projected = (packed_rows.project(hidden_states,packed,tiles[1])
+                 if tiles is not None and tiles[0] is packed and hidden_states.dtype==mx.bfloat16
+                 else hidden_states @ packed.T)
     parts = mx.split(projected,boundaries,axis=-1)
     query, relative, gate = parts[:3]
     sinks = layer.sink_proj(hidden_states)
-    filtered = (paired[1:] if paired is not None else None if full or same else
+    filtered = (None if full or same else
                 filtered_kv.apply(layer,key_hidden_states,value_hidden_states,conv_states,conv_mask))
     if filtered is not None:
         key,value,conv_states[0],conv_states[1] = filtered
