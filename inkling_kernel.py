@@ -9,9 +9,11 @@ _mix = mx.fast.metal_kernel(
     output_names=["out"],
     source="""
         uint c = thread_position_in_grid.x;
-        float value = 0;
-        for (uint e = 0; e < 8; ++e)
-            value += float(states[e * 2304 + c]) * float(weights[e]);
+        volatile float value = 0;
+        for (uint e = 0; e < 8; ++e) {
+            volatile float term = float(states[e * 2304 + c]) * float(weights[e]);
+            value = value + term;
+        }
         out[c] = static_cast<T>(value);
     """,
 )
