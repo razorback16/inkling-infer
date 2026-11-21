@@ -153,10 +153,11 @@ _select = mx.fast.metal_kernel(
 
 
 _rank_pairs = mx.fast.metal_kernel(
-    name="inkling_rank_probability_pairs",input_names=["logits"],
+    name="inkling_rank_probability_pairs",input_names=["logits","eps","scale"],
     output_names=["inds","weights"],source="""
-        uint lane=thread_index_in_simdgroup;
-        uint warp=thread_position_in_grid.x/32;
+        uint tid=thread_position_in_threadgroup.x, lane=thread_index_in_simdgroup;
+        uint warp=simdgroup_index_in_threadgroup;
+        threadgroup float selected[8];
         float scores[4], other[4];
         bool special=false;
         for (uint j=0;j<4;++j) {
@@ -182,7 +183,7 @@ _rank_pairs = mx.fast.metal_kernel(
                         keep=scores[j]; b[j]=-INFINITY;
                     }
                     float w=simd_sum(keep);
-                    if (!lane) {inds[k]=winner; weights[k]=w;}
+                    if (!lane) {inds[k]=winner; selected[k]=w;}
                 }
             }
         } else {
@@ -194,19 +195,15 @@ _rank_pairs = mx.fast.metal_kernel(
                     ahead+=uint(other[j]>query || (other[j]==query && lane+32*j<e));
                 uint rank=simd_sum(ahead);
                 float score=simd_shuffle(scores[i],warp);
-                if (!lane && rank<8) {inds[rank]=e; weights[rank]=score;}
+                if (!lane && rank<8) {inds[rank]=e; selected[rank]=score;}
             }
         }
-    """,
-)
-
-_normalize_winners = mx.fast.metal_kernel(
-    name="inkling_normalize_eight_routes",input_names=["selected","eps","scale"],output_names=["weights"],
-    source="""
-        uint i=thread_position_in_grid.x;
-        float total=0;
-        for (uint j=0;j<8;++j) total=selected[j]+total;
-        weights[i]=selected[i]/(total+eps)*scale;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid<8) {
+            float total=0;
+            for (uint i=0;i<8;++i) total=selected[i]+total;
+            weights[tid]=selected[tid]/(total+eps)*scale;
+        }
     """,
 )
 
@@ -229,16 +226,11 @@ def route(layer, x, dtype, normalized=False, logits=None, squares=None):
                             output_shapes=[x.shape,(1,1,128,2) if paired else (1,1,128)],output_dtypes=[dtype,mx.float32])
     if gate.top_k == 8:
         paired = logits.shape==(1,1,128,2)
-        constants = [scalar(layers._ROUTER_SCORE_EPS),scalar(gate.routed_scaling_factor)]
-        if paired:
-            indices,raw = _rank_pairs(inputs=[logits],grid=(1024,1,1),threadgroup=(64,1,1),
-                                      output_shapes=[(1,1,8)]*2,output_dtypes=[mx.uint32,mx.float32])
-            weights, = _normalize_winners(inputs=[raw,*constants],grid=(8,1,1),threadgroup=(8,1,1),
-                                          output_shapes=[(1,1,8)],output_dtypes=[mx.float32])
-        else:
-            indices,weights = _select(inputs=[logits,gate.e_score_correction_bias,*constants],
-                                      grid=(1024,1,1),threadgroup=(1024,1,1),
-                                      output_shapes=[(1,1,8)]*2,output_dtypes=[mx.uint32,mx.float32])
+        kernel = _rank_pairs if paired else _select
+        args = [logits] if paired else [logits,gate.e_score_correction_bias]
+        args.extend([scalar(layers._ROUTER_SCORE_EPS),scalar(gate.routed_scaling_factor)])
+        indices, weights = kernel(inputs=args, grid=(1024,1,1),threadgroup=(1024,1,1),
+            output_shapes=[(1,1,8)]*2, output_dtypes=[mx.uint32,mx.float32])
     else:
         indices, weights = layers.expert_routing(
             logits, gate.e_score_correction_bias, top_k=gate.top_k, multiplier=1.,
