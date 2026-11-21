@@ -3,13 +3,13 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.inkling2 import layers
 
-from . import postmix, depth_norm, expert_gate, router
+from . import block_lookahead, postmix, depth_norm, expert_gate, router
 
 _reference = layers.DecoderLayer.__call__
 
 
 def decode(layer, hidden_states, block_states, *, cache=None, conv_mask=None, messages=None):
-    from inkling_kernel import _finish_mix, can_fuse_down
+    from inkling_kernel import _finish_mix, _finish_squares, can_fuse_down
     from .compiled_ring import _DeviceRing
     normalized_messages = None
     if isinstance(messages,tuple):
@@ -95,11 +95,18 @@ def decode(layer, hidden_states, block_states, *, cache=None, conv_mask=None, me
     active = expert_gate.gated_activation(moe.experts,x,selected)
     w = post.conv1d.weight
     if fused_down:
-        out, next_history = _finish_mix(
+        cache_partials = block_lookahead.partials_cache()
+        capture = cache_partials is not None
+        kernel = _finish_squares if capture else _finish_mix
+        result = kernel(
             inputs=[active, selected, routing, down.weight, down.scales, down.global_scale,
                     history[3], w, residual],
             template=[("T", x.dtype), ("W",w.dtype)], grid=(576*256,1,1), threadgroup=(256,1,1),
-            output_shapes=[x.shape, (1,3,2304)], output_dtypes=[x.dtype,mx.float32])
+            output_shapes=[x.shape, (1,3,2304)]+([(576,)] if capture else []),
+            output_dtypes=[x.dtype,mx.float32]+([mx.float32] if capture else []))
+        out,next_history = result[:2]
+        if capture:
+            cache_partials[id(out)]=(out,result[2])
     else:
         out, next_history = postmix.project_and_finish(down, active, selected, routing, history[3], w, residual)
     cache[1].cache = [layers._conv_state(h,None,3) for h in history[:3]] + [next_history]

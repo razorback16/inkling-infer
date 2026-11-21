@@ -48,7 +48,7 @@ def prepare(model):
 
 
 def run(grouped,func,*args):
-    token=_active.set((grouped,{}))
+    token=_active.set((grouped,{},{ }))
     try:
         return func(*args)
     finally:
@@ -66,3 +66,13 @@ def lookup(module,blocks):
                        output_shapes=[(k,n)],output_dtypes=[mx.float32])[0]
         ctx[1][key]=(blocks,scores)
     return ctx[1][key][1],[("CACHED",True),("STRIDE",n),("COLUMN",col)]
+
+def partials_cache():
+    ctx = _active.get()
+    return None if ctx is None else ctx[2]
+
+
+def previous_partials(x):
+    cache = partials_cache()
+    saved = None if cache is None else cache.get(id(x))
+    return (x, False) if saved is None or saved[0] is not x else (saved[1], True)
