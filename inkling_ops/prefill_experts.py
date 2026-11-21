@@ -1,7 +1,17 @@
 """Gather the eight sorted expert outputs directly into the prompt mixture."""
 import mlx.core as mx
-from mlx_lm.layers.moe import _gather_sort
 from mlx_lm.models.inkling2 import layers
+
+
+_permutation = mx.fast.metal_kernel(
+    name="inkling_prompt_expert_permutation",input_names=["ids","order"],
+    output_names=["rows","sorted_ids","inverse"],source="""
+        uint sorted=thread_position_in_grid.x, original=order[sorted];
+        rows[sorted]=original/8;
+        sorted_ids[sorted]=ids[original];
+        inverse[original]=sorted;
+    """,
+)
 
 
 _mix_sorted = mx.fast.metal_kernel(
@@ -23,7 +33,13 @@ _mix_sorted = mx.fast.metal_kernel(
 
 def mix(layer, x):
     indices, weights = layer.gate(x)
-    hidden, sorted_ids, inverse = _gather_sort(mx.expand_dims(x, (-2, -3)), indices)
+    ids=indices.reshape(-1)
+    order=mx.argsort(ids)
+    rows, sorted_ids, inverse=_permutation(
+        inputs=[ids,order],grid=(ids.size,1,1),threadgroup=(min(ids.size,256),1,1),
+        output_shapes=[ids.shape]*3,output_dtypes=[mx.uint32,ids.dtype,mx.uint32],
+    )
+    hidden=x.reshape(-1,1,x.shape[-1])[rows]
     experts = layer.experts
     gated = experts.gate_up_proj(hidden, sorted_ids, sorted_indices=True)
     active = experts.act_fn(gated[..., 0::2], gated[..., 1::2])
