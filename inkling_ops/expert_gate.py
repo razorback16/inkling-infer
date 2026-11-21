@@ -55,6 +55,49 @@ _kernel = mx.fast.metal_kernel(
 )
 
 
+_mx_gate = mx.fast.metal_kernel(
+    name="inkling_mxfp8_gate_pairs", input_names=["x","ids","w","scales","codes","activation"],
+    output_names=["out"], source="""
+        #pragma clang fp contract(off)
+        uint lane = thread_index_in_simdgroup, slot = threadgroup_position_in_grid.y;
+        uint first = thread_position_in_grid.x / 32 * 4;
+        uint row = ids[slot] * 2304 + first;
+        float dots[4] = {};
+        for (uint block = lane; block < 288; block += 32) {
+            uint4 inputs = ((device const uint4*)x)[block];
+            float4 a = float4(as_type<bfloat4>(inputs.xy));
+            float4 b = float4(as_type<bfloat4>(inputs.zw));
+            for (uint r = 0; r < 4; ++r) {
+                uint2 packed = ((device const uint2*)w)[(row+r)*288 + block];
+                uchar4 lo = as_type<uchar4>(packed.x), hi = as_type<uchar4>(packed.y);
+                float sum = 0;
+                for (uint j = 0; j < 4; ++j) sum += a[j] * codes[lo[j]];
+                for (uint j = 0; j < 4; ++j) sum += b[j] * codes[hi[j]];
+                dots[r] += sum * codes[256 + uint(scales[(row+r)*72 + block/4])];
+            }
+        }
+        for (uint r = 0; r < 4; ++r) dots[r] = simd_sum(dots[r]);
+        if (lane < 2) {
+            ushort g = as_type<ushort>(bfloat16_t(dots[lane*2]));
+            ushort u = as_type<ushort>(bfloat16_t(dots[lane*2+1]));
+            uint gi=((uint(g)&32767)<<2)|((g>>15)<<1);
+            uint ui=((uint(u)&32767)<<2)|((u>>15)<<1);
+            out[slot*1152+first/2+lane] = bfloat16_t(activation[gi]*activation[ui+1]);
+        }
+    """,
+)
+
+
+@lru_cache(maxsize=1)
+def mx_codes():
+    bits = mx.arange(256, dtype=mx.int32).astype(mx.uint8)
+    unit = mx.full((256,8), 0x38383838, mx.uint32)
+    scale = mx.dequantize(unit, bits[:,None], group_size=32, bits=8, mode="mxfp8", dtype=mx.float32)
+    codes = mx.concatenate((mx.from_fp8(bits,mx.float32),scale[:,0]))
+    mx.eval(codes)
+    return codes
+
+
 @lru_cache(maxsize=1)
 def activation_tables():
     values = mx.arange(65536, dtype=mx.uint32).astype(mx.uint16).view(mx.bfloat16).astype(mx.float32)
@@ -67,6 +110,15 @@ def activation_tables():
 
 def gated_activation(layer, x, indices):
     proj = layer.gate_up_proj
+    if (x.shape == (1,1,2304) and x.dtype == mx.bfloat16 and indices.shape == (1,1,8)
+            and getattr(proj, "mode", None) == "mxfp8" and proj.group_size == 32 and proj.bits == 8
+            and proj.weight.shape[1:] == (2304,576) and proj.scales.shape[1:] == (2304,72)
+            and proj.weight.dtype == mx.uint32 and proj.scales.dtype == mx.uint8
+            and proj.global_scale is None and "bias" not in proj and type(layer.act_fn) is layers.SoftcappedSwiGLU
+            and layer.act_fn.gate_softcap == 4 and layer.act_fn.up_softcap == 25):
+        return _mx_gate(inputs=[x,indices,proj.weight,proj.scales,mx_codes(),activation_tables()],
+                        grid=(576*32,8,1),threadgroup=(128,1,1),
+                        output_shapes=[(1,1,8,1,1152)],output_dtypes=[x.dtype])[0]
     if (x.shape != (1, 1, 2304) or x.dtype != mx.bfloat16 or indices.shape != (1, 1, 8)
             or getattr(proj, "mode", None) != "nvfp4" or proj.group_size != 16
             or proj.bits != 4 or proj.weight.shape[1:] != (2304, 288) or "bias" in proj
@@ -90,4 +142,5 @@ def experts(layer, x, indices):
 
 def install():
     activation_tables()
+    mx_codes()
     layers.Experts.__call__ = experts
