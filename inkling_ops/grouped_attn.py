@@ -5,44 +5,9 @@ import mlx.core as mx
 from mlx_lm.kernels.common import scalar
 from mlx_lm.models.cache import BatchRotatingKVCache, RotatingKVCache
 
-_pack_prefix = mx.fast.metal_kernel(
-    name="inkling_lossless_global_prefix", input_names=["prefix"], output_names=["packed"],
-    source="""
-        uint lane=thread_index_in_simdgroup, row=thread_position_in_grid.x/32;
-        uint pos=row%LENGTH, bank=row/LENGTH, head=bank%HEADS;
-        ushort4 bits=((device const ushort4*)prefix)[row*32+lane];
-        ushort4 exponent=(bits>>7)&255;
-        ushort lo=simd_min(min(min(exponent.x,exponent.y),min(exponent.z,exponent.w)));
-        ushort4 delta=exponent-lo;
-        bool raw=simd_any(any(delta>15));
-        uint i=(head*LENGTH+pos)*100+(bank/HEADS)*50;
-        if (!lane) packed[i+48]=raw ? 256u : uint(lo);
-        packed[i+lane]=as_type<uint>(uchar4((bits<<1)|(bits>>15)));
-        ((device ushort*)(packed+i+32))[lane]=delta.x|(delta.y<<4)|(delta.z<<8)|(delta.w<<12);
-    """,
-)
-
-
-def pack_prefix(prefix):
-    _, banks, length, _ = prefix.shape
-    return _pack_prefix(inputs=[prefix], template=[("HEADS",banks//2),("LENGTH",length)],
-                        grid=(banks*length*32,1,1),threadgroup=(128,1,1),
-                        output_shapes=[(banks//2,length,100)],output_dtypes=[mx.uint32])[0]
-
-
 _partial = mx.fast.metal_kernel(
     name="inkling_interleaved_attention",
-    input_names=["q","k","v","tail","fresh","rel","w","slot","end","sinks","scale","compact"],output_names=["partials","stats"],
-    header="""
-        inline float4 read_prefix(device const uint *packed, device const bfloat16_t *raw, uint lane) {
-            uint base=packed[48];
-            if (base==256) return float4(((device const bfloat4*)raw)[lane]);
-            ushort h=((device const ushort*)(packed+32))[lane];
-            ushort4 e=ushort4(h,h>>4,h>>8,h>>12)&15;
-            ushort4 rot=((e+ushort(base))<<8)|ushort4(as_type<uchar4>(packed[lane]));
-            return float4(as_type<bfloat4>((rot>>1)|(rot<<15)));
-        }
-    """,
+    input_names=["q","k","v","tail","fresh","rel","w","slot","end","sinks","scale"],output_names=["partials","stats"],
     source="""
         uint lane = thread_index_in_simdgroup, head = threadgroup_position_in_grid.y;
         int newest = slot[0] - (PRE_UPDATE ? 0 : 1);
@@ -112,23 +77,13 @@ _partial = mx.fast.metal_kernel(
                         p=(kv*length+pos)*256+d;
                         keys=k; values=k+128;
                     }
-                    float4 key, value;
-                    if (COMPACT && !in_tail) {
-                        uint row=kv*length+pos;
-                        device const uint *pair=((device const uint*)compact)+row*100;
-                        key=read_prefix(pair,(device const bfloat16_t*)k+row*128,lane);
-                        value=read_prefix(pair+50,(device const bfloat16_t*)v+row*128,lane);
-                    } else {
-                        key=float4(*(device const bfloat4*)(keys+p));
-                        value=float4(*(device const bfloat4*)(values+p));
-                    }
                     float score = 0;
-                    for (uint j=0; j<4; ++j) score += query[j]*key[j];
+                    for (uint j=0; j<4; ++j) score += query[j]*float(keys[p+j]);
                     score = simd_sum(score)+pb;
                     float top = max(peak,score);
                     float a = fast::exp(peak-top), b = fast::exp(score-top);
                     total = total*a+b;
-                    for (uint j=0; j<4; ++j) accum[j] = accum[j]*a+b*value[j];
+                    for (uint j=0; j<4; ++j) accum[j] = accum[j]*a+b*float(values[p+j]);
                     peak = top;
                 }
             }
@@ -221,12 +176,11 @@ def attend(layer,q,k,v,rel,sinks,cache,gate,scaled_query=None):
         slot, end = mx.array(slot,mx.int32).reshape(1), mx.array(end,mx.int32).reshape(1)
     fresh = getattr(cache,"fresh",None)
     adjacent=getattr(cache,"interleaved_prefix",None)
-    compact=getattr(cache,"compact_prefix",None)
     threads = 64 if length==1024 and layer.sliding_window==1024 else 256 if paged else 128
     parts,stats = _partial(
         inputs=[q if scaled_query is None else scaled_query,k if adjacent is None else adjacent,v if adjacent is None else adjacent,tail,q if fresh is None else fresh,rel,w,slot,end,
-                sinks.astype(q.dtype),scalar(layer.scaling),q if compact is None else compact],
-        template=[("COMPACT",compact is not None),("SCALED",scaled_query is not None),("T",q.dtype),("S",length),("PRE_UPDATE",before is not None),("PAGED",paged),("ADJACENT",adjacent is not None),("FRESH",fresh is not None),("NKV",k.shape[1]),("GQA",heads//k.shape[1]),("WIDTH",width),("SWIZZLED",swizzled),
+                sinks.astype(q.dtype),scalar(layer.scaling)],
+        template=[("SCALED",scaled_query is not None),("T",q.dtype),("S",length),("PRE_UPDATE",before is not None),("PAGED",paged),("ADJACENT",adjacent is not None),("FRESH",fresh is not None),("NKV",k.shape[1]),("GQA",heads//k.shape[1]),("WIDTH",width),("SWIZZLED",swizzled),
                   ("R",extent),("WINDOW",layer.sliding_window)],
         grid=(128*32,heads,1),threadgroup=(threads,1,1),
         output_shapes=[(heads,128,128),(heads,128,2)],output_dtypes=[q.dtype,mx.float32])
