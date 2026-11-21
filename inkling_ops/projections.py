@@ -33,6 +33,9 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
         reference = _full if full else _sliding
         return reference(layer, hidden_states, key_hidden_states, value_hidden_states,
                           cache=cache, conv_states=conv_states, conv_mask=conv_mask)
+    packed, boundaries = projection(layer, modules, "_all_qkv" if same else "_common_q")
+    parts = mx.split(hidden_states @ packed.T, boundaries, axis=-1)
+    query, relative, gate, sinks = parts[:4]
     paired = (full and not same and conv_mask is None
               and all(type(c) is layers.DynamicShortConvolution and c.kernel_size == 4
                       and type(c.weight_proj) is nn.Linear and "bias" not in c.weight_proj
@@ -40,34 +43,16 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
               and all(type(p) is nn.Linear and "bias" not in p for p in (layer.k_proj, layer.v_proj))
               and all(h is not None and h.shape == (1, 3, layer.num_key_value_heads * layer.head_dim)
                       for h in conv_states[:2]))
-    kmods = (layer.k_proj, layer.k_sconv.weight_proj) if paired else (layer.k_proj,)
-    vmods = (layer.v_proj, layer.v_sconv.weight_proj) if paired else (layer.v_proj,)
-    tiled = (not same and all(s.dtype == mx.bfloat16 and s.shape == (1,1,2304) for s in
-                              (hidden_states,key_hidden_states,value_hidden_states))
-             and all(type(m) is nn.Linear and "bias" not in m and m.weight.dtype == mx.bfloat16
-                     and m.weight.shape[0] % 2 == 0 for m in (*common,*kmods,*vmods)))
-    if tiled:
-        from . import tiled_inputs
-        parts = tiled_inputs.project(layer,hidden_states,key_hidden_states,value_hidden_states,common,kmods,vmods)
-        query, relative, gate, sinks = parts[:4]
-        if paired:
-            key, kd, value, vd = parts[4:]
-        else:
-            key, value = parts[4:]
+    if same:
+        key, value = parts[4:]
+    elif paired:
+        kp, kb = projection(layer, (layer.k_proj, layer.k_sconv.weight_proj), "_key_filter")
+        vp, vb = projection(layer, (layer.v_proj, layer.v_sconv.weight_proj), "_value_filter")
+        key, kd = mx.split(key_hidden_states @ kp.T, kb, axis=-1)
+        value, vd = mx.split(value_hidden_states @ vp.T, vb, axis=-1)
     else:
-        packed, boundaries = projection(layer, modules, "_all_qkv" if same else "_common_q")
-        parts = mx.split(hidden_states @ packed.T, boundaries, axis=-1)
-        query, relative, gate, sinks = parts[:4]
-        if same:
-            key, value = parts[4:]
-        elif paired:
-            kp, kb = projection(layer, (layer.k_proj, layer.k_sconv.weight_proj), "_key_filter")
-            vp, vb = projection(layer, (layer.v_proj, layer.v_sconv.weight_proj), "_value_filter")
-            key, kd = mx.split(key_hidden_states @ kp.T, kb, axis=-1)
-            value, vd = mx.split(value_hidden_states @ vp.T, vb, axis=-1)
-        else:
-            key = layer.k_proj(key_hidden_states)
-            value = layer.v_proj(value_hidden_states)
+        key = layer.k_proj(key_hidden_states)
+        value = layer.v_proj(value_hidden_states)
     if full:
         if paired:
             key, conv_states[0] = dynamic_conv.filtered(layer.k_sconv, key, conv_states[0], kd)
