@@ -78,7 +78,16 @@ _partial = mx.fast.metal_kernel(
                 }
             }
         }
-        for (uint j=0; j<4; ++j) partials[addr*128+d+j] = T(accum[j]);
+        // Adjacent warps produce adjacent tiles. Transpose their BF16 vectors
+        // together so the second pass can read 32 consecutive tiles at once.
+        uint warp=simdgroup_index_in_threadgroup;
+        threadgroup bfloat4 tile_vector[8][32];
+        tile_vector[warp][lane]=bfloat4(accum);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint source_tile=lane%8, vector=warp*4+lane/8;
+        uint first_tile=tile-warp;
+        uint dest=(head*32+vector)*128+first_tile+source_tile;
+        ((device bfloat4*)partials)[dest]=tile_vector[source_tile][vector];
         if (!lane) { stats[addr*2] = peak; stats[addr*2+1] = total; }
     """,
 )
@@ -97,7 +106,7 @@ _merge = mx.fast.metal_kernel(
         for (uint n=0; n<128; n+=32) {
             float a = fast::exp(stats[(i+n)*2] - peak);
             z += a*stats[(i+n)*2+1];
-            for (uint j=0; j<4; ++j) acc[j] += a*float(partial[(i+n)*128+d+j]);
+            for (uint j=0; j<4; ++j) acc[j] += a*float(partial[((head*32+d/4)*128+lane+n)*4+j]);
         }
         z = simd_sum(z);
         for (uint j=0; j<4; ++j) {
@@ -136,7 +145,7 @@ def attend(layer,q,k,v,rel,sinks,cache,gate):
                 sinks.astype(q.dtype),scalar(layer.scaling)],
         template=[("T",q.dtype),("S",length),("PAGED",paged),("NKV",k.shape[1]),("GQA",heads//k.shape[1]),("WIDTH",width),("SWIZZLED",swizzled),
                   ("R",extent),("WINDOW",layer.sliding_window)],
-        grid=(128*32,heads,1),threadgroup=(128,1,1),
+        grid=(128*32,heads,1),threadgroup=(256,1,1),
         output_shapes=[(heads,128,128),(heads,128,2)],output_dtypes=[q.dtype,mx.float32])
     return _merge(inputs=[parts,stats,gate],template=[("T",q.dtype)],
                   grid=(32*32,heads,1),threadgroup=(128,1,1),
