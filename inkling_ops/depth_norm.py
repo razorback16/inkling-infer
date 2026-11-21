@@ -78,10 +78,15 @@ _source = """
             for (uint i = 0; i <= K; ++i) coeff[i] /= z;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        float4 blend = 0;
+        for (uint i = 0; i < K; ++i) {
+            uint d = i*2304 + tid*4;
+            float4 block = float4(blocks[d], blocks[d+1], blocks[d+2], blocks[d+3]);
+            blend += block * coeff[i];
+        }
         for (uint j = 0; j < 4; ++j) {
             uint d = tid*4+j;
-            float v = 0;
-            for (uint i = 0; i < K; ++i) v += blocks[i*2304+d]*coeff[i];
+            float v = blend[j];
             mixed[query*2304+d] = v + norm[d]*coeff[K];
         }
     """
