@@ -82,7 +82,8 @@ _partial = mx.fast.metal_kernel(
                 }
             }
         }
-        for (uint j=0; j<4; ++j) partials[addr*128+d+j] = T(accum[j]);
+        uint block = ((addr / 4) * 32 + d / 4) * 16;
+        *(device bfloat4*)(partials + block + (tile % 4) * 4) = bfloat4(accum);
         if (!lane) { stats[addr*2] = peak; stats[addr*2+1] = total; }
     """,
 )
@@ -101,7 +102,9 @@ _merge = mx.fast.metal_kernel(
         for (uint n=0; n<128; n+=32) {
             float a = fast::exp(stats[(i+n)*2] - peak);
             z += a*stats[(i+n)*2+1];
-            for (uint j=0; j<4; ++j) acc[j] += a*float(partial[(i+n)*128+d+j]);
+            uint block = (((i+n) / 4) * 32 + d / 4) * 16;
+            float4 values = float4(*(device const bfloat4*)(partial + block + (i % 4) * 4));
+            for (uint j=0; j<4; ++j) acc[j] += a*values[j];
         }
         z = simd_sum(z);
         for (uint j=0; j<4; ++j) {
