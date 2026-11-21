@@ -6,7 +6,7 @@ import mlx.nn as nn
 from mlx_lm.models.inkling2 import layers
 
 from .head_norm import normalize
-from . import rel_mask, filtered_kv, packed_rows
+from . import rel_mask, filtered_kv, packed_rows, single_row_tiles
 
 _sliding = layers.SlidingAttention.__call__
 _full = layers.FullAttention.__call__
@@ -71,8 +71,7 @@ def prepare_query_weights(model):
                     weights=tuple(p.weight for p in modules)
                     w=joint[1][:rows]
                     boundaries=joint[2][:len(modules)-1]
-                    data,=tiles[1]
-                    subset=(data[:rows//16],)
+                    subset=tuple(plane[:rows] for plane in tiles[1])
                     object.__setattr__(layer,name,(weights,w,boundaries))
                     object.__setattr__(layer,name+"_tiles",(w,subset))
                     arrays.extend(subset)
@@ -81,7 +80,7 @@ def prepare_query_weights(model):
             saved = getattr(layer,name+"_tiles",None)
             if weight.shape[0]%16 or (saved is not None and saved[0] is weight):
                 continue
-            encoded = packed_rows.encode(weight)
+            encoded = single_row_tiles.encode(weight)
             object.__setattr__(layer,name+"_tiles",(weight,encoded))
             arrays.extend(encoded)
     if arrays:
@@ -100,7 +99,7 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
     name = "_all_qkv" if same else "_common_q"
     packed, boundaries = projection(layer,modules,name)
     tiles = getattr(layer,name+"_tiles",None)
-    projected = (packed_rows.project(hidden_states,packed,tiles[1])
+    projected = (single_row_tiles.project(hidden_states,packed,tiles[1])
                  if tiles is not None and tiles[0] is packed and hidden_states.dtype==mx.bfloat16
                  else hidden_states @ packed.T)
     parts = mx.split(projected,boundaries,axis=-1)
