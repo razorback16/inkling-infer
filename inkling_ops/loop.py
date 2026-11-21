@@ -11,16 +11,15 @@ from .compiled_ring import _DeviceRing
 _reference = TextModel._run_loop
 
 
-def _compile(model, kinds):
+def _compile(model):
     owner = weakref.ref(model)
 
     @mx.compile
-    def run(x, states, offset, after_offset, slots, next_slots):
+    def run(x, states, offset, slots):
         caches = []
-        for (packed, history), position in zip(states, kinds):
-            slot = slots[position]
+        for (packed, history), slot in zip(states, slots):
             keys, values = mx.split(packed, 2, axis=1)
-            ring = _DeviceRing(keys, values, offset, slot, packed=packed, after=(after_offset,next_slots[position]))
+            ring = _DeviceRing(keys, values, offset, slot, packed=packed)
             conv = ArraysCache(4)
             conv.cache = list(history)
             caches.append(CacheList(ring, conv))
@@ -57,24 +56,17 @@ def loop(model, x, cache, conv_mask):
         packed = (joined[0] if joined is not None and joined[1] is k.keys and joined[2] is k.values
                   else mx.concatenate((k.keys, k.values), axis=1))
         states.append((packed, tuple(conv.cache)))
-    # Caches with matching write positions share one compiled graph parameter.
-    # Record the grouping rather than the positions themselves in the trace key.
-    unique = list(dict.fromkeys(slots))
-    indices = {slot:i for i,slot in enumerate(unique)}
-    kinds = tuple(indices[slot] for slot in slots)
     saved = getattr(model, "_decode_loop", None)
-    if saved is None or kinds != saved[2] or not saved[0].matches(model):
+    if saved is None or not saved[0].matches(model):
         if any(layer.mlp.sharding_group is not None for layer in model.layers):
             return _reference(model, x, cache, conv_mask)
         guard = CapturedParameters()
-        object.__setattr__(model, "_decode_loop", (guard, _compile(model,kinds),kinds))
+        object.__setattr__(model, "_decode_loop", (guard, _compile(model)))
         result = _reference(model, x, cache, conv_mask)
         guard.capture(model)
         return result
-    numbers = set(unique + [offset])
-    params = {n:mx.array([n],mx.int32) for n in numbers | {v+1 for v in numbers}}
-    result, updated = saved[1](x, states, params[offset], params[offset+1],
-                                [params[n] for n in unique], [params[n+1] for n in unique])
+    params = {slot: mx.array([slot], mx.int32) for slot in set(slots + [offset])}
+    result, updated = saved[1](x, states, params[offset], [params[i] for i in slots])
     for c, slot, (packed, keys, values, history) in zip(cache, slots, updated):
         k, conv = c[0], c[1]
         k.keys, k.values = keys, values
