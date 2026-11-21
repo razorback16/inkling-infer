@@ -134,17 +134,17 @@ _select = mx.fast.metal_kernel(
 )
 
 
-def route(layer, x, dtype, normalized=False):
+def route(layer, x, dtype, normalized=False, logits=None):
     norm, gate = layer.post_attention_layernorm, layer.mlp.gate
     if (type(norm) is not nn.RMSNorm or type(gate) is not layers.TopKRouter
             or x.dtype != (dtype if normalized else mx.float32) or dtype != mx.bfloat16 or gate.weight.shape != (128,2304)):
         x = x if normalized else norm(x).astype(dtype)
         indices, weights = gate(x)
         return x, indices, weights
-    if normalized:
+    if normalized and logits is None:
         logits = _dot_only(inputs=[x,native(gate)],grid=(32*256,1,1),threadgroup=(256,1,1),
                            output_shapes=[(1,1,128)],output_dtypes=[mx.float32])[0]
-    else:
+    elif not normalized:
         x, logits = _kernel(inputs=[x,norm.weight,native(gate),scalar(norm.eps)],
                             grid=(32*256,1,1),threadgroup=(256,1,1),
                             output_shapes=[x.shape,(1,1,128)],output_dtypes=[dtype,mx.float32])

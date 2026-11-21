@@ -198,7 +198,7 @@ def post_attention(layer, blocks, attention, history, hidden, normalize=False):
         output_dtypes=[attention.dtype if normalize else mx.float32]+[mx.float32]*3)
     return mixed, residual, window
 
-def make_projected(normalize):
+def make_projected(normalize,routes=False):
     source = normalized_source() if normalize else _source.replace("FILTER","")
     source = source.replace("sum += v*v;", "").replace("sum = simd_sum(sum);","sum = simd_sum(squares[tid]);",1)
     source = source.replace("if (!query) normalized[d] = norm[d];","")
@@ -206,19 +206,56 @@ def make_projected(normalize):
     inputs = ["x","blocks","queries","squares","closed"]
     if normalize:
         inputs.extend(["weights","eps"])
+    if routes:
+        inputs.append("gate")
+        source=source.replace("query = threadgroup_position_in_grid.x", "query = 0").replace(
+            "mixed[col]=bfloat16_t((values[j]*inv)*float(weights[col]));",
+            "bfloat16_t value=bfloat16_t((values[j]*inv)*float(weights[col])); "
+            "norm[col]=float(value); if (!threadgroup_position_in_grid.x) mixed[col]=value;")
+        source += """
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            threadgroup float partial[16][4];
+            uint first=threadgroup_position_in_grid.x*8+(sg/8)*4;
+            if (tid<512) {
+                float dots[4]={};
+                for (uint col=(tid%256)*4;col<2304;col+=1024)
+                    for (uint j=0;j<4;++j)
+                        for (uint r=0;r<4;++r)
+                            dots[r]=fma(norm[col+j],float(gate[(first+r)*2304+col+j]),dots[r]);
+                for (uint r=0;r<4;++r) {
+                    float sum=dots[r];
+                    for (ushort step=16;step;step>>=1) sum+=simd_shuffle_down(sum,step);
+                    if (!lane) partial[sg][r]=sum;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (tid<8) {
+                uint bank=(tid/4)*8, col=tid%4;
+                float sum=partial[bank][col];
+                for (uint i=1;i<8;++i) sum+=partial[bank+i][col];
+                logits[threadgroup_position_in_grid.x*8+tid]=sum;
+            }
+        """
+        return mx.fast.metal_kernel(name="inkling_depth_router_scores",input_names=inputs,
+                                    output_names=["mixed","logits"],source=source)
     return mx.fast.metal_kernel(name="inkling_projected_depth_norm" if normalize else "inkling_projected_depth",
                                 input_names=inputs,output_names=["mixed"],source=source)
 
 
 _projected = (make_projected(False),make_projected(True))
+_projected_routes = make_projected(True,True)
 
 
-def from_projection(layer, blocks, residual, squares, normalize):
+def from_projection(layer, blocks, residual, squares, normalize, gate=None):
     closed,config=block_lookahead.lookup(layer.mlp_input,blocks)
     inputs = [residual,blocks,layer.mlp_input.query,squares,closed]
     if normalize:
         norm=layer.post_attention_layernorm
         inputs.extend([norm.weight,scalar(norm.eps)])
+    if gate is not None:
+        return _projected_routes(inputs=[*inputs,gate],template=[("K",blocks.shape[0]),*config],
+                                 grid=(16*576,1,1),threadgroup=(576,1,1),
+                                 output_shapes=[(1,1,1,2304),(1,1,128)],output_dtypes=[mx.bfloat16,mx.float32])
     return _projected[normalize](inputs=inputs,template=[("K",blocks.shape[0]),*config],
                                  grid=(576,1,1),threadgroup=(576,1,1),
                                  output_shapes=[(1,1,1,2304)],
