@@ -81,7 +81,7 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
     q, k, v = (x.transpose(0, 2, 1, 3) for x in (query, key, value))
     if kv is not None:
         k, v = kv.update_and_fetch(k, v)
-    if (kv is not None and layer.sliding_window and k.shape[2] >= 1024 and q.shape[-1] == 128
+    if (kv is not None and 1024 <= k.shape[2] <= 8192 and q.shape[-1] == 128
             and type(layer.rel_logits_proj) is layers.RelativeLogits and rel.dtype == q.dtype == mx.bfloat16):
         from . import grouped_attn
         return layer.o_proj(grouped_attn.attend(layer,q,k,v,rel,sinks,kv,gate))
