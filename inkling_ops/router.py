@@ -41,19 +41,21 @@ _kernel = mx.fast.metal_kernel(
             threadgroup_barrier(mem_flags::mem_threadgroup);
             inv=precise::rsqrt(simd_sum(lane<18 ? sums[lane]:0.f)/2304.f+eps);
         }
-        float dots[ROWS]={};
-        for (uint d=tid*4;d<2304;d+=1024) {
-            for (uint j=0;j<4;++j) {
-                bfloat16_t value=bfloat16_t((float(x[d+j])*inv)*float(norm_w[d+j]));
-                if (!base) normalized[d+j]=value;
-                for (uint r=0;r<ROWS;++r)
-                    dots[r]=fma(float(value),float(route_w[(base+r)*2304+d+j]),dots[r]);
+        for (uint part=sg;part<8;part+=TEAMS) {
+            float dots[ROWS]={};
+            for (uint d=(part*32+lane)*4;d<2304;d+=1024) {
+                for (uint j=0;j<4;++j) {
+                    bfloat16_t value=bfloat16_t((float(x[d+j])*inv)*float(norm_w[d+j]));
+                    if (!base) normalized[d+j]=value;
+                    for (uint r=0;r<ROWS;++r)
+                        dots[r]=fma(float(value),float(route_w[(base+r)*2304+d+j]),dots[r]);
+                }
             }
-        }
-        for (uint r=0;r<ROWS;++r) {
-            float dot=dots[r];
-            for (ushort i=16;i;i>>=1) dot+=simd_shuffle_down(dot,i);
-            if (!lane) partial[sg][r]=dot;
+            for (uint r=0;r<ROWS;++r) {
+                float dot=dots[r];
+                for (ushort i=16;i;i>>=1) dot+=simd_shuffle_down(dot,i);
+                if (!lane) partial[part][r]=dot;
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (tid<ROWS) {
@@ -220,9 +222,10 @@ def route(layer, x, dtype, normalized=False, logits=None, squares=None):
                            output_shapes=[(1,1,128)],output_dtypes=[mx.float32])[0]
     elif not normalized:
         paired = gate.top_k==8
+        teams = 4 if squares is not None else 8
         x, logits = _kernel(inputs=[x,norm.weight,native(gate),scalar(norm.eps),x if squares is None else squares,gate.e_score_correction_bias],
-                            template=[("PAIRED",paired),("PRECOMPUTED",squares is not None),("ROWS",2 if squares is not None else 4)],
-                            grid=((64 if squares is not None else 32)*256,1,1),threadgroup=(256,1,1),
+                            template=[("TEAMS",teams),("PAIRED",paired),("PRECOMPUTED",squares is not None),("ROWS",2 if squares is not None else 4)],
+                            grid=((64 if squares is not None else 32)*teams*32,1,1),threadgroup=(teams*32,1,1),
                             output_shapes=[x.shape,(1,1,128,2) if paired else (1,1,128)],output_dtypes=[dtype,mx.float32])
     if gate.top_k == 8:
         paired = logits.shape==(1,1,128,2)
