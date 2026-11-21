@@ -7,11 +7,10 @@ _partial = mx.fast.metal_kernel(
     name="inkling_interleaved_attention",
     input_names=["q","k","v","tail","fresh","rel","w","slot","end","sinks","scale"],output_names=["partials","stats"],
     source="""
-        uint lane = thread_index_in_simdgroup, group = threadgroup_position_in_grid.x;
-        uint head = threadgroup_position_in_grid.y*GQA + group%GQA;
+        uint lane = thread_index_in_simdgroup, head = threadgroup_position_in_grid.y;
         int newest = slot[0] - (PRE_UPDATE ? 0 : 1);
         int valid = end[0] + (PRE_UPDATE ? 1 : 0);
-        uint tile = (group/GQA)*4 + simdgroup_index_in_threadgroup;
+        uint tile = thread_position_in_grid.x / 32;
         uint kv = head / GQA, d = lane*4;
         uint addr = (head*128+tile);
         float4 query;
@@ -147,7 +146,7 @@ def attend(layer,q,k,v,rel,sinks,cache,gate):
                 sinks.astype(q.dtype),scalar(layer.scaling)],
         template=[("T",q.dtype),("S",length),("PRE_UPDATE",before is not None),("PAGED",paged),("FRESH",fresh is not None),("NKV",k.shape[1]),("GQA",heads//k.shape[1]),("WIDTH",width),("SWIZZLED",swizzled),
                   ("R",extent),("WINDOW",layer.sliding_window)],
-        grid=(128*32*(heads//k.shape[1]),k.shape[1],1),threadgroup=(128,1,1),
+        grid=(128*32,heads,1),threadgroup=(128,1,1),
         output_shapes=[(heads,128,128),(heads,128,2)],output_dtypes=[q.dtype,mx.float32])
     return _merge(inputs=[parts,stats,gate],template=[("T",q.dtype)],
                   grid=(32*32,heads,1),threadgroup=(128,1,1),
