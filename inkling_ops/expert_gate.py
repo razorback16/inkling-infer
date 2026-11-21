@@ -5,7 +5,11 @@ import mlx.core as mx
 from mlx_lm.models.inkling2 import layers
 
 _reference = layers.Experts.__call__
-_header="""
+_kernel = mx.fast.metal_kernel(
+    name="inkling_stock_order_gate_up_fp4",
+    input_names=["x", "ids", "packed", "scales", "amax", "activation"],
+    output_names=["out"],
+    header="""
         constant float levels[16] = {
             0, .5, 1, 1.5, 2, 3, 4, 6, -0., -.5, -1, -1.5, -2, -3, -4, -6
         };
@@ -14,8 +18,8 @@ _header="""
             ushort raw = (mag << 7) | (((mag + 1) >> 7) << 14) | ((bits & 128) << 8);
             return float(as_type<half>(raw)) * 256.f;
         }
-    """
-_source="""
+    """,
+    source="""
         #pragma clang fp contract(off)
         uint lane = thread_index_in_simdgroup;
         uint slot = threadgroup_position_in_grid.y;
@@ -45,40 +49,8 @@ _source="""
             ushort u = as_type<ushort>(bfloat16_t(sums[lane*2+1]*scale));
             out[slot*1152+first/2+lane] = bfloat16_t(activation[uint(g)*2]*activation[uint(u)*2+1]);
         }
-    """
-_kernel=mx.fast.metal_kernel(name="inkling_stock_order_gate_up_fp4",
-    input_names=["x","ids","packed","scales","amax","activation"],output_names=["out"],
-    source=_source,header=_header)
-_joint_source=_source.replace("uint expert = ids[slot];","""
-        uint expert=ids[slot];
-        uint base=expert*(64+2304*324);
-        auto weights=packed+base+64;
-        auto scales=(device const uchar*)(weights+2304*288);
-        float global=as_type<float>(packed[base]);
-""").replace("expert * 2304 + first + r","first+r").replace(
-    "packed[row * 288 + word]","weights[row*288+word]").replace("amax[expert]","global")
-_joint=mx.fast.metal_kernel(name="inkling_one_buffer_expert_gate",
-    input_names=["x","ids","packed","activation"],output_names=["out"],source=_joint_source,header=_header)
-
-
-def prepare(model):
-    for layer in model.layers:
-        proj=layer.mlp.experts.gate_up_proj
-        if (getattr(proj,"mode",None)!="nvfp4" or proj.weight.dtype!=mx.uint32
-                or proj.weight.shape[1:]!=(2304,288) or proj.scales.dtype!=mx.uint8
-                or proj.scales.shape!=(proj.weight.shape[0],2304,144) or proj.global_scale is None
-                or proj.global_scale.dtype!=mx.float32 or proj.global_scale.shape!=(proj.weight.shape[0],)):
-            continue
-        w,s,g=proj.weight,proj.scales,proj.global_scale
-        saved=getattr(proj,"_native_expert_buffer",None)
-        if saved is not None and saved[0] is w and saved[1] is s and saved[2] is g:
-            continue
-        n=w.shape[0]
-        head=mx.pad(g.view(mx.uint32).reshape(n,1),[(0,0),(0,63)])
-        data=mx.concatenate((head,w.reshape(n,-1),s.view(mx.uint32).reshape(n,-1)),axis=1)
-        mx.eval(data)
-        object.__setattr__(proj,"_native_expert_buffer",(w,s,g,data))
-
+    """,
+)
 
 
 @lru_cache(maxsize=1)
@@ -100,11 +72,8 @@ def gated_activation(layer, x, indices):
             or layer.act_fn.gate_softcap != 4 or layer.act_fn.up_softcap != 25):
         pair = proj(x[..., None, None, :], indices)
         return layer.act_fn(pair[..., 0::2], pair[..., 1::2])
-    saved=getattr(proj,"_native_expert_buffer",None)
-    joint=saved is not None and saved[0] is proj.weight and saved[1] is proj.scales and saved[2] is proj.global_scale
-    op=_joint if joint else _kernel
-    data=[saved[3]] if joint else [proj.weight,proj.scales,proj.global_scale]
-    active = op(inputs=[x,indices,*data,activation_tables()],
+    active = _kernel(
+        inputs=[x, indices, proj.weight, proj.scales, proj.global_scale, activation_tables()],
         grid=(144 * 128, 8, 1), threadgroup=(128, 1, 1),
         output_shapes=[(1, 1, 8, 1, 1152)], output_dtypes=[x.dtype],
     )[0]
