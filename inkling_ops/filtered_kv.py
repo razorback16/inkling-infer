@@ -30,10 +30,10 @@ _project = mx.fast.metal_kernel(
                 float v=float(bfloat16_t(dot)), total=0;
                 for (uint j=0;j<3;++j) {
                     float old=hist[j*1024+c];
-                    window[j*1024+c]=old;
+                    if (!COMPACT || j) window[(j-uint(COMPACT))*1024+c]=old;
                     total=fma(float(W(old)),float(conv[c*4+j]),total);
                 }
-                window[3*1024+c]=v;
+                window[(3-uint(COMPACT))*1024+c]=v;
                 total=fma(float(W(v)),float(conv[c*4+3]),total);
                 output[c]=bfloat16_t((float(W(total))+v)*0.4472135954999579f);
             }
@@ -54,10 +54,10 @@ _compact=mx.fast.metal_kernel(
             auto window=bank ? next_v : next_k; auto output=bank ? value : key;
             float v=float(bfloat16_t(dot)),total=0;
             for (uint j=0;j<3;++j) {
-                float old=hist[j*1024+col]; window[j*1024+col]=old;
+                float old=hist[j*1024+col]; if (!COMPACT || j) window[(j-uint(COMPACT))*1024+col]=old;
                 total=fma(float(W(old)),float(conv[col*4+j]),total);
             }
-            window[3*1024+col]=v;
+            window[(3-uint(COMPACT))*1024+col]=v;
             total=fma(float(W(v)),float(conv[col*4+3]),total);
             output[col]=bfloat16_t((float(W(total))+v)*0.4472135954999579f);
         }
@@ -83,7 +83,7 @@ def prepare(model):
         mx.eval(arrays)
 
 
-def apply(layer,k,v,histories,mask):
+def apply(layer,k,v,histories,mask,compact_history=False):
     if (mask is not None or k.shape != (1,1,2304) or v.shape != k.shape or k.dtype != v.dtype or k.dtype != mx.bfloat16
             or any(type(p) is not nn.Linear or "bias" in p or p.weight.shape != (1024,2304)
                    or p.weight.dtype != k.dtype for p in (layer.k_proj,layer.v_proj))
@@ -97,9 +97,9 @@ def apply(layer,k,v,histories,mask):
     saved=getattr(layer,"_filter_tiles",None)
     if saved is not None and saved[0] is layer.k_proj.weight and saved[1] is layer.v_proj.weight:
         return _compact(inputs=[k,v,*saved[2],kc,vc,*histories[:2]],
-                        template=[("COLS",2304),("W",kc.dtype)],grid=(2048*32,1,1),threadgroup=(128,1,1),
-                        output_shapes=[(1,1,1024)]*2+[(1,4,1024)]*2,output_dtypes=[k.dtype]*2+[mx.float32]*2)
+                        template=[("COLS",2304),("W",kc.dtype),("COMPACT",compact_history)],grid=(2048*32,1,1),threadgroup=(128,1,1),
+                        output_shapes=[(1,1,1024)]*2+[(1,3 if compact_history else 4,1024)]*2,output_dtypes=[k.dtype]*2+[mx.float32]*2)
     return _project(inputs=[k,v,layer.k_proj.weight,layer.v_proj.weight,kc,vc,*histories[:2]],
-                    template=[("W",kc.dtype)],grid=(256*32,2,1),threadgroup=(128,1,1),
-                    output_shapes=[(1,1,1024)]*2+[(1,4,1024)]*2,
+                    template=[("W",kc.dtype),("COMPACT",compact_history)],grid=(256*32,2,1),threadgroup=(128,1,1),
+                    output_shapes=[(1,1,1024)]*2+[(1,3 if compact_history else 4,1024)]*2,
                     output_dtypes=[k.dtype]*2+[mx.float32]*2)
