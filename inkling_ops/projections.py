@@ -53,26 +53,27 @@ def prepare_query_weights(model):
             if any(type(p) is not nn.Linear or "bias" in p or p.weight.dtype!=mx.bfloat16
                    or p.weight.shape[1]!=2304 for p in modules):
                 continue
-            weights=tuple(p.weight for p in modules)
-            saved=getattr(layer,name+"_tiles",None)
-            if saved is not None and all(a is b for a,b in zip(weights,saved[0])):
+            if name=="_common_q" and isinstance(layer,layers.SlidingAttention):
+                joint=getattr(layer,"_all_qkv",None)
+                tiles=getattr(layer,"_all_qkv_tiles",None)
+                rows=sum(p.weight.shape[0] for p in modules)
+                if (rows%16==0 and joint is not None and tiles is not None
+                        and tiles[0] is joint[1] and all(p.weight is w for p,w in zip(modules,joint[0]))):
+                    weights=tuple(p.weight for p in modules)
+                    w=joint[1][:rows]
+                    boundaries=joint[2][:len(modules)-1]
+                    data,bases,flags=tiles[1]
+                    subset=(data[:rows//4*18],bases[:rows],flags[:rows//4])
+                    object.__setattr__(layer,name,(weights,w,boundaries))
+                    object.__setattr__(layer,name+"_tiles",(w,subset))
+                    arrays.extend(subset)
+                    continue
+            weight,_ = projection(layer,modules,name)
+            saved = getattr(layer,name+"_tiles",None)
+            if weight.shape[0]%16 or (saved is not None and saved[0] is weight):
                 continue
-            boundaries=[]
-            rows=0
-            for w in weights:
-                rows+=w.shape[0]
-                boundaries.append(rows)
-            if rows%16:
-                continue
-            joint=getattr(layer,"_all_qkv_tiles",None) if name=="_common_q" else None
-            if joint is not None and all(a is b for a,b in zip(weights,joint[0])):
-                data,bases,flags=joint[2]
-                encoded=(data[:rows//4*18],bases[:rows],flags[:rows//4])
-            else:
-                encoded=packed_rows.encode(mx.concatenate(weights))
-            object.__setattr__(layer,name+"_tiles",(weights,boundaries[:-1],encoded))
-            # Any later non-BF16 input can rebuild the native concatenation on demand.
-            object.__setattr__(layer,name,None)
+            encoded = packed_rows.encode(weight)
+            object.__setattr__(layer,name+"_tiles",(weight,encoded))
             arrays.extend(encoded)
     if arrays:
         mx.eval(arrays)
@@ -88,14 +89,11 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
         return reference(layer, hidden_states, key_hidden_states, value_hidden_states,
                           cache=cache, conv_states=conv_states, conv_mask=conv_mask)
     name = "_all_qkv" if same else "_common_q"
-    tiles=getattr(layer,name+"_tiles",None)
-    if (tiles is not None and hidden_states.dtype==mx.bfloat16
-            and all(p.weight is w for p,w in zip(modules,tiles[0]))):
-        boundaries=tiles[1]
-        projected=packed_rows.project_encoded(hidden_states,tiles[2])
-    else:
-        packed,boundaries=projection(layer,modules,name)
-        projected=hidden_states @ packed.T
+    packed, boundaries = projection(layer,modules,name)
+    tiles = getattr(layer,name+"_tiles",None)
+    projected = (packed_rows.project(hidden_states,packed,tiles[1])
+                 if tiles is not None and tiles[0] is packed and hidden_states.dtype==mx.bfloat16
+                 else hidden_states @ packed.T)
     parts = mx.split(projected,boundaries,axis=-1)
     query, relative, gate = parts[:3]
     sinks = layer.sink_proj(hidden_states)
