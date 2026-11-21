@@ -24,8 +24,10 @@ _pack_rows = mx.fast.metal_kernel(
                 raw_tiles|=1u<<tile;
                 *(device ushort4*)(payload+addr+lane*2)=bits;
             } else {
-                payload[addr+lane]=as_type<uint>(uchar4((bits<<1)|(bits>>15)));
-                ((device ushort*)(payload+addr+32))[lane]=delta.x|(delta.y<<4)|(delta.z<<8)|(delta.w<<12);
+                uchar4 low=uchar4((bits<<1)|(bits>>15));
+                ushort2 pair=ushort2(low.xy)|(delta.xy<<8)|(delta.zw<<12);
+                payload[addr+lane]=as_type<uint>(pair);
+                ((device ushort*)(payload+addr+32))[lane]=as_type<ushort>(low.zw);
             }
         }
         if (!lane) formats[row]=(uint(base)<<24)|raw_tiles;
@@ -42,9 +44,10 @@ DOT="""
             if (format&(1u<<tile)) {
                 bits=*(device const ushort4*)(payload+addr+lane*2);
             } else {
-                ushort h=((device const ushort*)(payload+addr+32))[lane];
-                ushort4 n=ushort4(h,h>>4,h>>8,h>>12)&15;
-                ushort4 code=(n<<8)|ushort4(as_type<uchar4>(payload[addr+lane]));
+                ushort2 pair=as_type<ushort2>(payload[addr+lane]);
+                ushort extra=((device const ushort*)(payload+addr+32))[lane];
+                ushort2 other=((pair>>12)<<8)|ushort2(as_type<uchar2>(extra));
+                ushort4 code=ushort4(pair&4095,other);
                 ushort4 rot=code+base;
                 bits=(rot>>1)|(rot<<15);
             }
