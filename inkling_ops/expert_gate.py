@@ -50,20 +50,27 @@ _kernel = mx.fast.metal_kernel(
 )
 
 
-def experts(layer, x, indices):
+def gated_activation(layer, x, indices):
     proj = layer.gate_up_proj
     if (x.shape != (1, 1, 2304) or x.dtype != mx.bfloat16 or indices.shape != (1, 1, 8)
             or getattr(proj, "mode", None) != "nvfp4" or proj.group_size != 16
             or proj.bits != 4 or proj.weight.shape[1:] != (2304, 288) or "bias" in proj
             or proj.global_scale is None or proj.global_scale.shape != (proj.weight.shape[0],)
             or layer.act_fn.gate_softcap != 4 or layer.act_fn.up_softcap != 25):
-        return _reference(layer, x, indices)
+        pair = proj(x[..., None, None, :], indices)
+        return layer.act_fn(pair[..., 0::2], pair[..., 1::2])
     active = _kernel(
         inputs=[x, indices, proj.weight, proj.scales, proj.global_scale],
         grid=(144 * 128, 8, 1), threadgroup=(128, 1, 1),
         output_shapes=[(1, 1, 8, 1, 1152)], output_dtypes=[x.dtype],
     )[0]
-    return layer.down_proj(active, indices).squeeze(-2)
+    return active
+
+
+def experts(layer, x, indices):
+    if x.shape != (1, 1, 2304) or indices.shape != (1, 1, 8):
+        return _reference(layer, x, indices)
+    return layer.down_proj(gated_activation(layer, x, indices), indices).squeeze(-2)
 
 
 def install():
