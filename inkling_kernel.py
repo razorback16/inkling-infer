@@ -72,18 +72,18 @@ def _make_down(finish):
         uint first_row = expert * 2304 + channel;
         float accum[4] = {};
         for (uint word = lane; word < 144; word += 32) {
-            uint4 raw_input = ((device const uint4*)hidden)[slot * 144 + word];
-            float4 x[2] = {float4(as_type<bfloat4>(raw_input.xy)),
-                           float4(as_type<bfloat4>(raw_input.zw))};
+            float x[8];
+            for (uint k = 0; k < 8; ++k)
+                x[k] = float(hidden[slot * 1152 + word * 8 + k]);
             for (uint r = 0; r < 4; ++r) {
                 uint row = first_row + r;
                 uint q = packed[row * 144 + word];
                 float chunk = 0;
                 for (uint k = 0; k < 8; k += 4) {
-                    chunk += x[k / 4][0] * fp4_values[q & 15]
-                           + x[k / 4][1] * fp4_values[(q >> 4) & 15]
-                           + x[k / 4][2] * fp4_values[(q >> 8) & 15]
-                           + x[k / 4][3] * fp4_values[(q >> 12) & 15];
+                    chunk += x[k] * fp4_values[q & 15]
+                           + x[k+1] * fp4_values[(q >> 4) & 15]
+                           + x[k+2] * fp4_values[(q >> 8) & 15]
+                           + x[k+3] * fp4_values[(q >> 12) & 15];
                     q >>= 16;
                 }
                 float term = decode_scale(scales[row * 72 + word / 2]) * chunk;
