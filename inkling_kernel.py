@@ -122,6 +122,10 @@ def can_fuse_down(down, x):
 
 
 def single_token_moe(self, x):
+    if x.ndim == 3 and x.shape[1] > 1:
+        from inkling_ops import prefill_experts
+        if prefill_experts.applicable(self, x):
+            return prefill_experts.mix(self, x)
     if x.shape != (1, 1, 2304) or self.gate.top_k != 8 or self.sharding_group is not None:
         return _reference(self, x)
     experts, weights = self.gate(x)
