@@ -4,7 +4,7 @@ import mlx.nn as nn
 from mlx_lm.models.inkling2 import layers
 
 from .head_norm import normalize
-from . import rel_mask
+from . import rel_mask, filtered_kv
 
 _sliding = layers.SlidingAttention.__call__
 _full = layers.FullAttention.__call__
@@ -37,7 +37,11 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
     parts = mx.split(hidden_states @ packed.T, boundaries, axis=-1)
     query, relative, gate = parts[:3]
     sinks = layer.sink_proj(hidden_states)
-    if same:
+    filtered = (None if full or same else
+                filtered_kv.apply(layer,key_hidden_states,value_hidden_states,conv_states,conv_mask))
+    if filtered is not None:
+        key,value,conv_states[0],conv_states[1] = filtered
+    elif same:
         key, value = parts[3:]
     else:
         key = layer.k_proj(key_hidden_states)
@@ -45,7 +49,7 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
     if full:
         key, conv_states[0] = layer.k_sconv(key, key_hidden_states, conv_states[0], conv_mask)
         value, conv_states[1] = layer.v_sconv(value, value_hidden_states, conv_states[1], conv_mask)
-    else:
+    elif filtered is None:
         key, conv_states[0] = layer.k_sconv(key, conv_states[0], conv_mask)
         value, conv_states[1] = layer.v_sconv(value, conv_states[1], conv_mask)
     pair = None
