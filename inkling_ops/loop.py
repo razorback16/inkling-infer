@@ -17,6 +17,8 @@ def _compile(model):
     filtered_output.prepare(model)
     from .projections import prepare_query_weights
     prepare_query_weights(model)
+    from . import filtered_kv
+    filtered_kv.prepare(model)
     groups=block_lookahead.prepare(model)
     owner = weakref.ref(model)
 

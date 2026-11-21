@@ -55,9 +55,7 @@ _pack = mx.fast.metal_kernel(
 
     """,
 )
-_dot = mx.fast.metal_kernel(
-    name="inkling_four_row_gemv", input_names=["x","payload","bases","flags"],output_names=["out"],
-    source="""
+four_row_dot = """
         uint lane=thread_index_in_simdgroup, group=thread_position_in_grid.x/32;
         uchar4 base=*(device const uchar4*)(bases+group*4);
         uint raw_tiles=flags[group];
@@ -90,7 +88,10 @@ _dot = mx.fast.metal_kernel(
             for (ushort step=16;step;step>>=1) dot+=simd_shuffle_down(dot,step);
             if (!lane) out[group*4+r]=bfloat16_t(dot);
         }
-    """,
+    """
+_dot = mx.fast.metal_kernel(
+    name="inkling_four_row_gemv", input_names=["x","payload","bases","flags"],output_names=["out"],
+    source=four_row_dot,
 )
 
 
