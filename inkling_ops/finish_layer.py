@@ -92,7 +92,7 @@ def decode(layer, hidden_states, block_states, *, cache=None, conv_mask=None, me
             template=[("T", x.dtype), ("W",w.dtype)], grid=(576*256,1,1), threadgroup=(256,1,1),
             output_shapes=[x.shape, (1,3,2304)], output_dtypes=[x.dtype,mx.float32])
     else:
-        states = expert_gate.project_selected(down,active,selected).squeeze(-2)
+        states = down(active, selected).squeeze(-2)
         out, next_history = postmix.finish(states, routing, history[3], w, residual)
     cache[1].cache = [layers._conv_state(h,None,3) for h in history[:3]] + [next_history]
     return out, block_states

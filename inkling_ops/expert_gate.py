@@ -3,7 +3,6 @@ from functools import lru_cache
 
 import mlx.core as mx
 from mlx_lm.models.inkling2 import layers
-from mlx_lm.layers.moe import QuantizedSwitchLinear
 
 _reference = layers.Experts.__call__
 _kernel = mx.fast.metal_kernel(
@@ -63,25 +62,6 @@ def activation_tables():
     return gates, ups
 
 
-@lru_cache(maxsize=1)
-def gather_positions():
-    zero=mx.zeros((1,1,1),dtype=mx.uint32)
-    slots=mx.arange(8,dtype=mx.uint32).reshape(1,1,8)
-    mx.eval(zero,slots)
-    return zero,slots
-
-
-def project_selected(proj, x, ids):
-    if (type(proj) is not QuantizedSwitchLinear or proj.mode!="mxfp8" or "bias" in proj
-            or ids.shape!=(1,1,8) or x.shape[:-2] not in ((1,1,1),(1,1,8))):
-        return proj(x,ids)
-    zero,slots=gather_positions()
-    return mx.gather_qmm(x,proj.weight,proj.scales,proj.get("biases"),
-                         lhs_indices=zero if x.shape[2]==1 else slots,rhs_indices=ids,
-                         transpose=True,group_size=proj.group_size,bits=proj.bits,
-                         mode=proj.mode,global_scale=proj.global_scale)
-
-
 def gated_activation(layer, x, indices):
     proj = layer.gate_up_proj
     if (x.shape != (1, 1, 2304) or x.dtype != mx.bfloat16 or indices.shape != (1, 1, 8)
@@ -89,7 +69,7 @@ def gated_activation(layer, x, indices):
             or proj.bits != 4 or proj.weight.shape[1:] != (2304, 288) or "bias" in proj
             or proj.global_scale is None or proj.global_scale.shape != (proj.weight.shape[0],)
             or layer.act_fn.gate_softcap != 4 or layer.act_fn.up_softcap != 25):
-        pair = project_selected(proj,x[..., None, None, :],indices)
+        pair = proj(x[..., None, None, :], indices)
         return layer.act_fn(pair[..., 0::2], pair[..., 1::2])
     active = _kernel(
         inputs=[x, indices, proj.weight, proj.scales, proj.global_scale, *activation_tables()],
@@ -107,5 +87,4 @@ def experts(layer, x, indices):
 
 def install():
     activation_tables()
-    gather_positions()
     layers.Experts.__call__ = experts
