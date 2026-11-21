@@ -4,7 +4,7 @@ from mlx_lm.models.inkling2 import layers
 
 _reference = layers.Experts.__call__
 _kernel = mx.fast.metal_kernel(
-    name="inkling_gate_up_fp4",
+    name="gate_occupancy_4_1",
     input_names=["x", "ids", "packed", "scales", "amax"],
     output_names=["out"],
     header="""
@@ -21,7 +21,7 @@ _kernel = mx.fast.metal_kernel(
         uint lane = thread_index_in_simdgroup;
         uint slot = threadgroup_position_in_grid.y;
         uint expert = ids[slot];
-        uint first = threadgroup_position_in_grid.x * 16 + simdgroup_index_in_threadgroup * 4;
+        uint first = threadgroup_position_in_grid.x * 4 + simdgroup_index_in_threadgroup * 4;
         float sums[4] = {};
         for (uint word = lane; word < 288; word += 32) {
             float v[8];
@@ -61,7 +61,7 @@ def gated_activation(layer, x, indices):
         return layer.act_fn(pair[..., 0::2], pair[..., 1::2])
     active = _kernel(
         inputs=[x, indices, proj.weight, proj.scales, proj.global_scale],
-        grid=(144 * 128, 8, 1), threadgroup=(128, 1, 1),
+        grid=(576 * 32, 8, 1), threadgroup=(32, 1, 1),
         output_shapes=[(1, 1, 8, 1, 1152)], output_dtypes=[x.dtype],
     )[0]
     return active
