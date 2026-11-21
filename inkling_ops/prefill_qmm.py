@@ -73,7 +73,7 @@ def kernel():
             uint input_row=row+xr;
             if (GATHER && xr<count) input_row=token_rows[input_row];
             uint weight_row=expert*N+column+wr;
-            threadgroup bfloat16_t Xs[32*40], Ws[64*40];
+            threadgroup bfloat16_t Xs[32*40];
             mlx::steel::BlockMMA<bfloat16_t,bfloat16_t,32,64,32,2,2,false,true,40,40>
                 mma(simdgroup_index_in_threadgroup,thread_index_in_simdgroup);
             for (uint k=0;k<K;k+=32) {
@@ -84,11 +84,16 @@ def kernel():
                     *(threadgroup bfloat4*)(Xs+xr*40+xc+j)=v;
                 }
                 uint tile=((expert*(N/64)+column/64)*(K/32)+k/32);
-                auto weight=(device const bfloat4*)(w+tile*2048+wr*32+wc);
-                for (ushort j=0;j<4;++j)
-                    *(threadgroup bfloat4*)(Ws+wr*40+wc+j*4)=weight[j];
                 threadgroup_barrier(mem_flags::mem_threadgroup);
-                mma.mma(Xs,Ws);
+                for (short frag=0;frag<4;++frag) {
+                    mma.Atile.template load<bfloat16_t,2,1,40,1>(Xs+mma.As_offset+frag*8);
+                    for (short j=0;j<4;++j) {
+                        uint nfrag=simdgroup_index_in_threadgroup%2+2*j;
+                        uint at=((tile*32+frag*8+nfrag)*32+thread_index_in_simdgroup);
+                        mma.Btile.frag_at(0,j)=float2(((device const bfloat2*)w)[at]);
+                    }
+                    mlx::steel::tile_matmad(mma.Ctile,mma.Atile,mma.Btile,mma.Ctile);
+                }
             }
             if (GATED) {
                 for (short i=0;i<2;++i) {
@@ -132,14 +137,16 @@ def applicable(proj):
 _expand = mx.fast.metal_kernel(
     name="inkling_prompt_expand_expert_tiles",input_names=["weight","scales","table"],output_names=["data"],
     source="""
-        uint index=thread_position_in_grid.x;
-        uint tile=index/256, expert=tile/((N/64)*(K/32));
-        uint nb=(tile/(K/32))%(N/64), kb=tile%(K/32);
-        uint row=expert*N+nb*64+(index%256)/4, word=kb*4+index%4;
-        uint bits=weight[row*(K/8)+word];
-        uint scale=scales[row*(K/16)+word/2];
-        auto values=table+(expert*256+scale)*16;
-        for (uint i=0;i<8;++i) data[index*8+i]=values[(bits>>(i*4))&15];
+        uint index=thread_position_in_grid.x,tile=index/1024;
+        uint expert=tile/((N/64)*(K/32)), nb=(tile/(K/32))%(N/64), kb=tile%(K/32);
+        uint frag=(index/32)%32,lane=index%32;
+        uint fm=((lane/4)&4)+(lane/2)%4, fn=((lane/4)&2)*2+(lane%2)*2;
+        uint k=kb*32+(frag/8)*8+fm, row=expert*N+nb*64+(frag%8)*8+fn;
+        for (ushort j=0;j<2;++j) {
+            uint bits=weight[(row+j)*(K/8)+k/8];
+            uint scale=scales[(row+j)*(K/16)+k/16];
+            data[index*2+j]=table[(expert*256+scale)*16+((bits>>((k%8)*4))&15)];
+        }
     """,
 )
 
@@ -149,7 +156,7 @@ def expanded_tiles(proj,table):
     if saved is None or saved[0] is not proj.weight or saved[1] is not proj.scales or saved[2] is not table:
         e,n,k=proj.num_experts,proj.output_dims,proj.input_dims
         data,=_expand(inputs=[proj.weight,proj.scales,table],template=[("N",n),("K",k)],
-                      grid=(e*n*k//8,1,1),threadgroup=(128,1,1),
+                      grid=(e*n*k//2,1,1),threadgroup=(128,1,1),
                       output_shapes=[(e,n//64,k//32,64,32)],output_dtypes=[mx.bfloat16])
         mx.eval(data)
         saved=(proj.weight,proj.scales,table,data)
