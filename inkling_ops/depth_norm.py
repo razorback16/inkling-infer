@@ -230,9 +230,9 @@ def make_projected(normalize,routes=False,bottleneck=False):
     if routes or bottleneck:
         tail = """
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            threadgroup float partial[16][1];
-            uint first=threadgroup_position_in_grid.x*2+sg/8;
-            if (tid<512) {
+            threadgroup float partial[8][1];
+            uint first=threadgroup_position_in_grid.x;
+            if (tid<256) {
                 float dots[1]={};
                 for (uint col=(tid%256)*4;col<2304;col+=1024)
                     for (uint j=0;j<4;++j)
@@ -245,15 +245,15 @@ def make_projected(normalize,routes=False,bottleneck=False):
                 }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (tid<2) {
-                uint bank=tid*8, col=0;
+            if (!tid) {
+                uint bank=0, col=0;
                 float sum=partial[bank][col];
                 for (uint i=1;i<8;++i) sum+=partial[bank+i][col];
-                logits[threadgroup_position_in_grid.x*2+tid]=sum;
+                logits[threadgroup_position_in_grid.x+tid]=sum;
             }
         """
         if bottleneck:
-            tail=tail.replace("*2+tid]=sum;", "*2+tid]=bfloat16_t(sum);")
+            tail=tail.replace("+tid]=sum;", "+tid]=bfloat16_t(sum);")
             tail=tail.replace("col<2304", "col<4608").replace(
                 "norm[col+j],float(gate[(first+r)*2304+col+j])",
                 "(col<2304 ? norm[col+j] : float(bfloat16_t(message[col+j-2304]))),"
@@ -278,11 +278,11 @@ def from_projection(layer, blocks, residual, squares, normalize, gate=None, mess
         inputs.extend([norm.weight,scalar(norm.eps)])
     if message is not None:
         return _projected_message(inputs=[*inputs,gate,message],template=[("K",blocks.shape[0]),*config],
-                                  grid=(32*576,1,1),threadgroup=(576,1,1),
+                                  grid=(64*576,1,1),threadgroup=(576,1,1),
                                   output_shapes=[(1,1,1,2304),(1,1,64)],output_dtypes=[mx.float32,mx.bfloat16])
     if gate is not None:
         return _projected_routes(inputs=[*inputs,gate],template=[("K",blocks.shape[0]),*config],
-                                 grid=(64*576,1,1),threadgroup=(576,1,1),
+                                 grid=(128*576,1,1),threadgroup=(576,1,1),
                                  output_shapes=[(1,1,1,2304),(1,1,128)],output_dtypes=[mx.bfloat16,mx.float32])
     return _projected[normalize](inputs=inputs,template=[("K",blocks.shape[0]),*config],
                                  grid=(576,1,1),threadgroup=(576,1,1),
