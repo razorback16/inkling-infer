@@ -12,10 +12,24 @@ case "${1-}" in
 esac
 shift
 directory=$(dirname "$(realpath "$0")")
+proxy_url=http://127.0.0.1:4010
+
+case "${1-}" in
+    -h|--help|-v|-V|--version) ;;
+    *)
+        for endpoint in "$proxy_url/health/readiness" http://127.0.0.1:8089/health; do
+            if ! curl --noproxy '*' --fail --silent --max-time 2 "$endpoint" >/dev/null; then
+                printf 'Inkling is unavailable (%s).\nRun this in another terminal:\n  "%s/serve"\nThen retry inkling %s.\n' \
+                    "$endpoint" "$directory" "$client" >&2
+                exit 1
+            fi
+        done
+        ;;
+esac
+
 catalog="$directory/inkling-model.json"
 context_window=$(jq -er '.models[0].context_window' "$catalog")
 proxy_key=$(cat "$directory/.proxy-key")
-proxy_url=http://127.0.0.1:4010
 
 case "$client" in
     claude)
