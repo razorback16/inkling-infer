@@ -1,6 +1,4 @@
 """Lossless block exponent coding for batch-one BF16 vocabulary projection."""
-from functools import lru_cache
-
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.inkling2.model import Model
@@ -26,7 +24,7 @@ _pack = mx.fast.metal_kernel(
 )
 _dot = mx.fast.metal_kernel(
     name="inkling_lossless_vocab_gemv",
-    input_names=["x","weight","mantissas","deltas","bases","softcap"], output_names=["out"],
+    input_names=["x","weight","mantissas","deltas","bases"], output_names=["out"],
     source="""
         uint lane=thread_index_in_simdgroup;
         uint first=(thread_position_in_grid.x/32)*4;
@@ -53,21 +51,13 @@ _dot = mx.fast.metal_kernel(
         for (uint r=0; r<4; ++r) {
             float dot=acc[r];
             for (ushort s=16; s; s>>=1) dot+=simd_shuffle_down(dot,s);
-            if (!lane) out[first+r]=softcap[as_type<ushort>(bfloat16_t(dot))];
+            if (!lane) out[first+r]=bfloat16_t(dot);
         }
     """,
 )
 
 
-@lru_cache(maxsize=8)
-def softcap_table(cap):
-    bits = mx.arange(65536, dtype=mx.uint32).astype(mx.uint16)
-    table = mx.tanh(bits.view(mx.bfloat16).astype(mx.float32)/cap)*cap
-    mx.eval(table)
-    return table
-
-
-def project(x, head, cap):
+def project(x, head):
     w = head.weight
     n, k = w.shape
     saved = getattr(head, "_encoded_vocab", None)
@@ -77,8 +67,8 @@ def project(x, head, cap):
                        output_dtypes=[mx.uint8,mx.uint16,mx.uint8])
         saved = (w, packed)
         object.__setattr__(head, "_encoded_vocab", saved)
-    return _dot(inputs=[x,w,*saved[1],softcap_table(cap)], grid=(n*8,1,1), threadgroup=(128,1,1),
-                output_shapes=[(1,1,n)], output_dtypes=[mx.float32])[0]
+    return _dot(inputs=[x,w,*saved[1]], grid=(n*8,1,1), threadgroup=(128,1,1),
+                output_shapes=[(1,1,n)], output_dtypes=[x.dtype])[0]
 
 
 def call(model, inputs, cache=None, input_embeddings=None, pixel_values=None):
@@ -88,10 +78,9 @@ def call(model, inputs, cache=None, input_embeddings=None, pixel_values=None):
             or head.weight.shape[1] != 2304 or head.weight.shape[0] % 16):
         return _reference(model,inputs,cache=cache,input_embeddings=input_embeddings,pixel_values=pixel_values)
     h = model.model.language_model(inputs,cache=cache,input_embeddings=input_embeddings)
+    logits = project(h,head) if h.dtype == mx.bfloat16 else head(h)
     cap = model.args.text.final_logit_softcapping
-    logits = (project(h,head,cap) if h.dtype == mx.bfloat16
-              else mx.tanh(head(h).astype(mx.float32)/cap)*cap)
-    return logits[...,:model.args.text.unpadded_vocab_size]
+    return (mx.tanh(logits.astype(mx.float32)/cap)*cap)[...,:model.args.text.unpadded_vocab_size]
 
 
 def install():
