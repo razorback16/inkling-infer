@@ -97,20 +97,16 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
     parts = mx.split(projected,boundaries,axis=-1)
     query, relative, gate = parts[:3]
     sinks = layer.sink_proj(hidden_states)
-    raw=(filtered_kv.raw(layer,key_hidden_states,value_hidden_states)
-         if not full and not same and conv_mask is None and conv_states is not None else None)
-    filtered = (None if full or same or raw is not None else
+    filtered = (None if full or same else
                 filtered_kv.apply(layer,key_hidden_states,value_hidden_states,conv_states,conv_mask))
     if filtered is not None:
         key,value,conv_states[0],conv_states[1] = filtered
-    elif raw is not None:
-        key,value=raw
     elif same:
         key, value = parts[3:]
     else:
         key = layer.k_proj(key_hidden_states)
         value = layer.v_proj(value_hidden_states)
-    fused_norm = ((same or raw is not None) and not full and conv_mask is None and conv_states is not None and layer.head_dim == 128
+    fused_norm = (same and not full and conv_mask is None and conv_states is not None and layer.head_dim == 128
                   and relative.shape[-1] // layer.num_heads <= 128
                   and key.dtype == value.dtype == query.dtype
                   and all(type(c) is layers.ShortConvolution and c.kernel_size == 4
