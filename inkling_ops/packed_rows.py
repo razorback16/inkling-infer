@@ -49,16 +49,8 @@ _pack = mx.fast.metal_kernel(
                     *(device const uint2*)((device const ushort*)weight+i);
             }
         } else {
-            ushort4 paired[2];
-            for (uint pair=0;pair<2;++pair) {
-                uint r=pair*2;
-                ushort a=high[r],b=high[r+1];
-                ushort4 ea=ushort4(a,a>>4,a>>8,a>>12)&15;
-                ushort4 eb=ushort4(b,b>>4,b>>8,b>>12)&15;
-                paired[pair]=ushort4(as_type<uchar4>(low[r]))|(ea<<8)|(eb<<12);
-            }
-            *(device uint4*)(payload+physical*256+lane*4)=uint4(as_type<uint2>(paired[0]),as_type<uint2>(paired[1]));
-            *(device uint2*)(payload+physical*256+128+lane*2)=uint2(low.y,low.w);
+            *(device uint4*)(payload+physical*256+lane*4)=low;
+            *(device ushort4*)(payload+physical*256+128+lane*2)=high;
         }
 
     """,
@@ -82,11 +74,12 @@ _dot = mx.fast.metal_kernel(
                 }
                 continue;
             }
-            uint4 pair_words=*(device const uint4*)(payload+tile*256+lane*4);
-            uint2 low=*(device const uint2*)(payload+tile*256+128+lane*2);
+            uint4 low=*(device const uint4*)(payload+tile*256+lane*4);
+            ushort4 high=*(device const ushort4*)(payload+tile*256+128+lane*2);
             for (uint r=0;r<4;++r) {
-                ushort4 both=as_type<ushort4>(r<2 ? pair_words.xy : pair_words.zw);
-                ushort4 code=(r&1) ? (((both>>12)<<8)|ushort4(as_type<uchar4>(low[r/2]))) : (both&4095);
+                ushort h=high[r];
+                ushort4 ex=ushort4(h,h>>4,h>>8,h>>12)&15;
+                ushort4 code=(ex<<8)|ushort4(as_type<uchar4>(low[r]));
                 ushort4 rotated=code+(ushort(base[r])<<8);
                 ushort4 bits=(rotated>>1)|(rotated<<15);
                 float4 w=float4(as_type<bfloat4>(bits));
