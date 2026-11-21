@@ -4,7 +4,7 @@
   "main_weight_file_bytes": 19526019168,
   "main_weight_file_sha256": "65e60f51aa1284d4fb022584908c315270334d991828bb774af60584523539d1",
   "device": "Apple M3 Ultra",
-  "kernel_commit": "87f6570b735c36931a54a0ac1fed057e34bea608",
+  "kernel_commit": "5e9959b4114074d37e9d87e9d0c062ba534ed8aa",
   "benchmark": "prefill_benchmark.py",
   "roofline_calibration": "prefill-roofline.json",
   "batch_size": 1,
