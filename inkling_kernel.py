@@ -67,6 +67,7 @@ def _make_down(finish):
         // Each SIMD group projects one expert into the same four channels.
         uint slot = simdgroup_index_in_threadgroup;
         uint lane = thread_index_in_simdgroup;
+        float level = fp4_values[lane & 15];
         uint channel = 4 * threadgroup_position_in_grid.x;
         uint expert = indices[slot];
         uint first_row = expert * 2304 + channel;
@@ -80,10 +81,10 @@ def _make_down(finish):
                 uint q = packed[row * 144 + word];
                 float chunk = 0;
                 for (uint k = 0; k < 8; k += 4) {
-                    chunk += x[k] * fp4_values[q & 15]
-                           + x[k+1] * fp4_values[(q >> 4) & 15]
-                           + x[k+2] * fp4_values[(q >> 8) & 15]
-                           + x[k+3] * fp4_values[(q >> 12) & 15];
+                    chunk += x[k] * simd_shuffle(level, ushort(q & 15))
+                           + x[k+1] * simd_shuffle(level, ushort((q >> 4) & 15))
+                           + x[k+2] * simd_shuffle(level, ushort((q >> 8) & 15))
+                           + x[k+3] * simd_shuffle(level, ushort((q >> 12) & 15));
                     q >>= 16;
                 }
                 float term = decode_scale(scales[row * 72 + word / 2]) * chunk;
