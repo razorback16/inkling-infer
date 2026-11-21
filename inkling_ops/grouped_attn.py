@@ -31,7 +31,7 @@ _partial = mx.fast.metal_kernel(
             float scores[8];
             #pragma clang loop unroll(full)
             for (uint pos=0; pos<8; ++pos) {
-                uint at=(kv*1024+tile+pos*128)*(SLIDING_PAIR ? 256 : 128)+d;
+                uint at=((kv*1024+tile+pos*128)*128)+d;
                 auto key_ptr = FRESH && uint(newest)==tile+pos*128 ? fresh+kv*128+d : k+at;
                 float4 key=float4(*(device const bfloat4*)key_ptr);
                 float score=0;
@@ -40,8 +40,8 @@ _partial = mx.fast.metal_kernel(
             }
             #pragma clang loop unroll(full)
             for (uint pos=0; pos<8; ++pos) {
-                uint at=(kv*1024+tile+pos*128)*(SLIDING_PAIR ? 256 : 128)+d;
-                auto value_ptr = FRESH && uint(newest)==tile+pos*128 ? fresh+(NKV+kv)*128+d : v+at+(SLIDING_PAIR ? 128 : 0);
+                uint at=((kv*1024+tile+pos*128)*128)+d;
+                auto value_ptr = FRESH && uint(newest)==tile+pos*128 ? fresh+(NKV+kv)*128+d : v+at;
                 float4 value=float4(*(device const bfloat4*)value_ptr);
                 float score=scores[pos], top=max(peak,score);
                 float a=fast::exp(peak-top), b=fast::exp(score-top);
@@ -71,7 +71,7 @@ _partial = mx.fast.metal_kernel(
                     uint p = (kv*length+pos)*128+d;
                     auto keys = in_tail ? tail : k;
                     auto values = in_tail ? tail+NKV*256*128 : v;
-                    if (SLIDING_PAIR || (ADJACENT && !in_tail)) {
+                    if (ADJACENT && !in_tail) {
                         p=(kv*length+pos)*256+d;
                         keys=k; values=k+128;
                     }
@@ -146,13 +146,10 @@ def attend(layer,q,k,v,rel,sinks,cache,gate):
         slot, end = mx.array(slot,mx.int32).reshape(1), mx.array(end,mx.int32).reshape(1)
     fresh = getattr(cache,"fresh",None)
     adjacent=getattr(cache,"interleaved_prefix",None)
-    sliding_pair=getattr(cache,"sliding_pair",None) if fresh is not None else None
-    if sliding_pair is not None:
-        adjacent=sliding_pair
     parts,stats = _partial(
         inputs=[q,k if adjacent is None else adjacent,v if adjacent is None else adjacent,tail,q if fresh is None else fresh,rel,w,slot,end,
                 sinks.astype(q.dtype),scalar(layer.scaling)],
-        template=[("T",q.dtype),("S",length),("PRE_UPDATE",before is not None),("PAGED",paged),("ADJACENT",paged and adjacent is not None),("SLIDING_PAIR",sliding_pair is not None),("FRESH",fresh is not None),("NKV",k.shape[1]),("GQA",heads//k.shape[1]),("WIDTH",width),("SWIZZLED",swizzled),
+        template=[("T",q.dtype),("S",length),("PRE_UPDATE",before is not None),("PAGED",paged),("ADJACENT",adjacent is not None),("FRESH",fresh is not None),("NKV",k.shape[1]),("GQA",heads//k.shape[1]),("WIDTH",width),("SWIZZLED",swizzled),
                   ("R",extent),("WINDOW",layer.sliding_window)],
         grid=(128*32,heads,1),threadgroup=(128,1,1),
         output_shapes=[(heads,128,128),(heads,128,2)],output_dtypes=[q.dtype,mx.float32])

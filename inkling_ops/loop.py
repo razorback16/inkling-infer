@@ -31,8 +31,7 @@ def _compile(model):
                 slot = ring_slot if shared else offset
             if shared:
                 row = len(grouped)
-                adjacent = slab[row:row+1]
-                packed = mx.concatenate((adjacent[:,:,:,0,:],adjacent[:,:,:,1,:]),axis=1)
+                packed = slab[row:row+1]
             pages = packed if isinstance(packed, tuple) else None
             storage = mx.concatenate(pages[:2], axis=2) if pages is not None else packed
             keys, values = mx.split(storage, 2, axis=1)
@@ -40,7 +39,6 @@ def _compile(model):
             if shared:
                 grouped.append(ring)
                 ring.grouped = True
-                ring.sliding_pair=adjacent
             if pages is not None:
                 ring.page_prefix, ring.page_tail = pages[:2]
                 if len(pages)==3:
@@ -56,9 +54,7 @@ def _compile(model):
                 if value is None:
                     value = mx.take(ring.packed,ring.write_coordinates[0],axis=2)
                 updates.append(value)
-            pair=mx.concatenate(updates,axis=0)
-            pair=pair.reshape(len(grouped),2,8,1,128).transpose(0,2,3,1,4)
-            slab = mx.slice_update(slab, pair,
+            slab = mx.slice_update(slab, mx.concatenate(updates,axis=0),
                                    grouped[0].write_coordinates[0], axes=(2,))
         return result, slab, [
             (tuple(c[1].cache),) if getattr(c[0],"grouped",False) else
@@ -135,11 +131,7 @@ def loop(model, x, cache, conv_mask):
         old = getattr(cache[rows[0]][0], "_shared_rings", None)
         reusable = old is not None and len(tensors)==len(old[1]) and all(
             a is b for a,b in zip(tensors,old[1]))
-        if reusable:
-            slab=old[0]
-        else:
-            raw=mx.concatenate(tensors,axis=0).reshape(len(rows),2,8,1024,128)
-            slab=mx.contiguous(raw.transpose(0,2,3,1,4))
+        slab = old[0] if reusable else mx.concatenate(tensors,axis=0)
         for i in rows:
             incoming[i] = (None,states[i][1])
     ring_slot = None if slab is None else params[slots[rows[0]]]
@@ -152,10 +144,9 @@ def loop(model, x, cache, conv_mask):
         if len(update) == 1:
             history = update[0]
             row = len(views)
-            adjacent=slab[row:row+1]
-            keys,values=adjacent[:,:,:,0,:],adjacent[:,:,:,1,:]
-            packed=mx.concatenate((keys,values),axis=1)
+            packed = slab[row:row+1]
             views.append(packed)
+            keys, values = mx.split(packed,2,axis=1)
         elif len(update) == 2:
             tail, history = update
             pages = (previous[0][0], tail)
