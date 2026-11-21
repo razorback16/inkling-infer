@@ -5,7 +5,7 @@ from mlx_lm.models.cache import BatchRotatingKVCache, RotatingKVCache
 
 _partial = mx.fast.metal_kernel(
     name="inkling_interleaved_attention",
-    input_names=["q","k","v","fresh","rel","w","slot","end","sinks","scale"],output_names=["partials","stats"],
+    input_names=["q","k","v","rel","w","slot","end","sinks","scale"],output_names=["partials","stats"],
     source="""
         uint lane = thread_index_in_simdgroup, head = threadgroup_position_in_grid.y;
         uint tile = thread_position_in_grid.x / 32;
@@ -31,16 +31,13 @@ _partial = mx.fast.metal_kernel(
                 float pb = simd_shuffle(bias,i);
                 if (pb == -INFINITY) continue;
                 uint p = ((kv*S+chunk+tile+i*128)*128)+d;
-                bool latest = HAS_FRESH && int(chunk+tile+i*128) == slot[0]-1;
-                auto keys = latest ? fresh + kv*128+d : k+p;
-                auto values = latest ? fresh + (NKV+kv)*128+d : v+p;
                 float score = 0;
-                for (uint j=0; j<4; ++j) score += query[j]*float(keys[j]);
+                for (uint j=0; j<4; ++j) score += query[j]*float(k[p+j]);
                 score = simd_sum(score)+pb;
                 float top = max(peak,score);
                 float a = fast::exp(peak-top), b = fast::exp(score-top);
                 total = total*a+b;
-                for (uint j=0; j<4; ++j) accum[j] = accum[j]*a+b*float(values[j]);
+                for (uint j=0; j<4; ++j) accum[j] = accum[j]*a+b*float(v[p+j]);
                 peak = top;
             }
         }
@@ -83,12 +80,10 @@ def attend(layer,q,k,v,rel,sinks,cache,gate):
     length, heads = k.shape[2], q.shape[1]
     slot = cache._idx if isinstance(cache,(RotatingKVCache,BatchRotatingKVCache)) else length
     w = layer.rel_logits_proj.proj.astype(rel.dtype)
-    pending = getattr(cache, "pending_pair", None)
-    past_k, past_v, fresh = pending if pending is not None else (k,v,q)
     parts,stats = _partial(
-        inputs=[q,past_k,past_v,fresh,rel,w,mx.array(slot,mx.int32).reshape(1),mx.array(cache.offset,mx.int32).reshape(1),
+        inputs=[q,k,v,rel,w,mx.array(slot,mx.int32).reshape(1),mx.array(cache.offset,mx.int32).reshape(1),
                 sinks.astype(q.dtype),scalar(layer.scaling)],
-        template=[("T",q.dtype),("S",length),("GQA",heads//k.shape[1]),("NKV",k.shape[1]),("HAS_FRESH",pending is not None),("WIDTH",w.shape[0]),
+        template=[("T",q.dtype),("S",length),("GQA",heads//k.shape[1]),("WIDTH",w.shape[0]),
                   ("R",w.shape[1]),("WINDOW",layer.sliding_window)],
         grid=(128*32,heads,1),threadgroup=(128,1,1),
         output_shapes=[(heads,128,128),(heads,128,2)],output_dtypes=[q.dtype,mx.float32])

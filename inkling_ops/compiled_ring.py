@@ -27,7 +27,6 @@ class _DeviceRing(RotatingKVCache):
         return self.keys, self.values
 
     def update_packed(self, new):
-        self.pending_pair = (self.keys, self.values, new)
         self.packed = mx.slice_update(self.packed, new, self._idx, axes=(2,))
         self.keys, self.values = mx.split(self.packed, 2, axis=1)
         self._idx = self._idx + 1
