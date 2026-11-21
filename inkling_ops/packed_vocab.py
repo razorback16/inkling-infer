@@ -19,6 +19,11 @@ def project(x, head):
     return packed_rows.project(x,w,saved[1])
 
 
+@mx.compile
+def capped_logits(logits,cap):
+    return mx.tanh(logits.astype(mx.float32)/cap)*cap
+
+
 def call(model, inputs, cache=None, input_embeddings=None, pixel_values=None):
     head = model.lm_head
     if (inputs.shape != (1,1) or pixel_values is not None or model.sharding_group is not None
@@ -28,7 +33,7 @@ def call(model, inputs, cache=None, input_embeddings=None, pixel_values=None):
     h = model.model.language_model(inputs,cache=cache,input_embeddings=input_embeddings)
     logits = project(h,head) if h.dtype == mx.bfloat16 else head(h)
     cap = model.args.text.final_logit_softcapping
-    return (mx.tanh(logits.astype(mx.float32)/cap)*cap)[...,:model.args.text.unpadded_vocab_size]
+    return capped_logits(logits[...,:model.args.text.unpadded_vocab_size],cap)
 
 
 def install():
