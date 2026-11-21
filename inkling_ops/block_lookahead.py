@@ -57,7 +57,7 @@ def run(grouped,func,*args):
 
 def lookup(module,blocks):
     ctx=_active.get()
-    if ctx is None or id(module) not in ctx[0] or not 1<=blocks.shape[0]<32:
+    if ctx is None or id(module) not in ctx[0] or not 2<=blocks.shape[0]<32:
         return blocks,[("CACHED",False),("STRIDE",1),("COLUMN",0)]
     table,col=ctx[0][id(module)]
     key=(id(blocks),id(table)); n=table.shape[0];k=blocks.shape[0]
