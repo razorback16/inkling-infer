@@ -74,7 +74,10 @@ _partial = mx.fast.metal_kernel(
                     auto keys = in_tail ? tail : k;
                     auto values = in_tail ? tail+NKV*256*128 : v;
                     if (ADJACENT && !in_tail) {
-                        p=(kv*length+pos)*256+d;
+                        uint at=pos;
+                        if ((S-256)%128==0)
+                            at=((pos%128)/16*(length/128)+pos/128)*16+pos%16;
+                        p=(kv*length+at)*256+d;
                         keys=k; values=k+128;
                     }
                     float score = 0;

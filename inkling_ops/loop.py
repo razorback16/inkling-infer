@@ -107,7 +107,11 @@ def loop(model, x, cache, conv_mask):
             saved_prefix=getattr(k,"_interleaved_global_prefix",None)
             if saved_prefix is None or saved_prefix[0] is not prefix:
                 _,banks,length,channels=prefix.shape
-                adjacent=mx.contiguous(prefix.reshape(1,2,banks//2,length,channels).transpose(0,2,3,1,4))
+                if length % 128 == 0:
+                    adjacent = mx.contiguous(prefix.reshape(1,2,banks//2,length//128,8,16,channels)
+                                             .transpose(0,2,4,3,5,1,6))
+                else:
+                    adjacent = mx.contiguous(prefix.reshape(1,2,banks//2,length,channels).transpose(0,2,3,1,4))
                 saved_prefix=(prefix,adjacent)
                 k._interleaved_global_prefix=saved_prefix
             packed=(*packed,saved_prefix[1])
