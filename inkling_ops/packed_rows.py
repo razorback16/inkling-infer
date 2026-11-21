@@ -19,10 +19,11 @@ _ranges = mx.fast.metal_kernel(
 
 _pack = mx.fast.metal_kernel(
     name="inkling_encode_four_rows",
-    input_names=["weight","bases"], output_names=["payload"],
+    input_names=["weight","bases"], output_names=["payload","flags"],
     source="""
         uint lane=thread_index_in_simdgroup, tile=thread_position_in_grid.x/32;
         uint group=tile/18, block=tile%18;
+        bool raw=false;
         uint4 low;
         ushort4 high;
         uchar4 base=*(device const uchar4*)(bases+group*4);
@@ -32,37 +33,45 @@ _pack = mx.fast.metal_kernel(
             ushort4 e=(bits>>7)&255;
             ushort4 delta=e-ushort(base[row]);
             bool4 escapes=delta>15;
-            uchar4 bytes=select(uchar4((bits<<1)|(bits>>15)),uchar4(0),escapes);
+            raw |= any(escapes);
+            uchar4 bytes=uchar4((bits<<1)|(bits>>15));
             low[row]=as_type<uint>(bytes);
-            ushort4 n=select(delta,ushort4(0),escapes);
+            ushort4 n=delta&15;
             high[row]=n.x|(n.y<<4)|(n.z<<8)|(n.w<<12);
         }
+        bool any_raw=simd_any(raw);
+        if (!lane) flags[tile]=uint(any_raw)<<block;
         *(device uint4*)(payload+tile*192+lane*4)=low;
         *(device ushort4*)(payload+tile*192+128+lane*2)=high;
 
     """,
 )
 _dot = mx.fast.metal_kernel(
-    name="inkling_four_row_gemv", input_names=["x","weight","payload","bases"],output_names=["out"],
+    name="inkling_four_row_gemv", input_names=["x","weight","payload","bases","flags"],output_names=["out"],
     source="""
         uint lane=thread_index_in_simdgroup, group=thread_position_in_grid.x/32;
         uchar4 base=*(device const uchar4*)(bases+group*4);
+        uint raw_tiles=flags[group];
         float sums[4]={};
         for (uint block=0;block<18;++block) {
             uint tile=group*18+block;
-            uint4 low=*(device const uint4*)(payload+tile*192+lane*4);
-            ushort4 high=*(device const ushort4*)(payload+tile*192+128+lane*2);
             uint d=block*128+lane*4;
             float4 v=float4(*(device const bfloat4*)(x+d));
+            if (raw_tiles & (1u<<block)) {
+                for (uint r=0;r<4;++r) {
+                    float4 w=float4(*(device const bfloat4*)(weight+(group*4+r)*2304+d));
+                    for (uint j=0;j<4;++j) sums[r]=fma(v[j],w[j],sums[r]);
+                }
+                continue;
+            }
+            uint4 low=*(device const uint4*)(payload+tile*192+lane*4);
+            ushort4 high=*(device const ushort4*)(payload+tile*192+128+lane*2);
             for (uint r=0;r<4;++r) {
                 ushort h=high[r];
                 ushort4 ex=ushort4(h,h>>4,h>>8,h>>12)&15;
                 ushort4 code=(ex<<8)|ushort4(as_type<uchar4>(low[r]));
                 ushort4 rotated=code+(ushort(base[r])<<8);
                 ushort4 bits=(rotated>>1)|(rotated<<15);
-                if (any(code==0)) {
-                    bits=*(device const ushort4*)((device const ushort*)weight+(group*4+r)*2304+d);
-                }
                 float4 w=float4(as_type<bfloat4>(bits));
                 for (uint j=0;j<4;++j) sums[r]=fma(v[j],w[j],sums[r]);
             }
@@ -81,9 +90,9 @@ def encode(weight):
     rows=weight.shape[0]
     bases=_ranges(inputs=[weight],grid=(rows*32,1,1),threadgroup=(128,1,1),
                   output_shapes=[(rows,)],output_dtypes=[mx.uint8])[0]
-    payload=_pack(inputs=[weight,bases],grid=(count//16,1,1),threadgroup=(128,1,1),
-                 output_shapes=[(count//512,192)],output_dtypes=[mx.uint32])[0]
-    return payload,bases
+    payload,flags=_pack(inputs=[weight,bases],grid=(count//16,1,1),threadgroup=(128,1,1),
+                 output_shapes=[(count//512,192),(rows//4,18)],output_dtypes=[mx.uint32,mx.uint32])
+    return payload,bases,mx.sum(flags,axis=1)
 
 
 def project(x,weight,encoded):
