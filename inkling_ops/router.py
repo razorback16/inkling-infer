@@ -7,23 +7,28 @@ from mlx_lm.models.inkling2 import layers
 from .exact_sources import native
 
 _kernel = mx.fast.metal_kernel(
-    name="inkling_normalized_router", input_names=["x", "norm_w", "route_w", "eps"],
+    name="inkling_normalized_router", input_names=["x", "norm_w", "route_w", "eps", "squares"],
     output_names=["normalized", "logits"],
     source="""
         uint tid=thread_position_in_threadgroup.x, lane=thread_index_in_simdgroup;
         uint sg=simdgroup_index_in_threadgroup, base=threadgroup_position_in_grid.x*4;
         threadgroup float sums[18], partial[8][4];
-        for (uint part=sg;part<18;part+=8) {
-            float norm2=0;
-            for (uint j=0;j<4;++j) {
-                float v=x[(part*32+lane)*4+j];
-                norm2+=v*v;
+        float inv;
+        if (PRECOMPUTED) {
+            inv=precise::rsqrt(simd_sum(lane<18 ? squares[lane]:0.f)/2304.f+eps);
+        } else {
+            for (uint part=sg;part<18;part+=8) {
+                float norm2=0;
+                for (uint j=0;j<4;++j) {
+                    float v=x[(part*32+lane)*4+j];
+                    norm2+=v*v;
+                }
+                norm2=simd_sum(norm2);
+                if (!lane) sums[part]=norm2;
             }
-            norm2=simd_sum(norm2);
-            if (!lane) sums[part]=norm2;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            inv=precise::rsqrt(simd_sum(lane<18 ? sums[lane]:0.f)/2304.f+eps);
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        float inv=precise::rsqrt(simd_sum(lane<18 ? sums[lane]:0.f)/2304.f+eps);
         float dots[4]={};
         for (uint d=tid*4;d<2304;d+=1024) {
             for (uint j=0;j<4;++j) {
@@ -134,7 +139,7 @@ _select = mx.fast.metal_kernel(
 )
 
 
-def route(layer, x, dtype, normalized=False, logits=None):
+def route(layer, x, dtype, normalized=False, logits=None, squares=None):
     norm, gate = layer.post_attention_layernorm, layer.mlp.gate
     if (type(norm) is not nn.RMSNorm or type(gate) is not layers.TopKRouter
             or x.dtype != (dtype if normalized else mx.float32) or dtype != mx.bfloat16 or gate.weight.shape != (128,2304)):
@@ -145,8 +150,8 @@ def route(layer, x, dtype, normalized=False, logits=None):
         logits = _dot_only(inputs=[x,native(gate)],grid=(32*256,1,1),threadgroup=(256,1,1),
                            output_shapes=[(1,1,128)],output_dtypes=[mx.float32])[0]
     elif not normalized:
-        x, logits = _kernel(inputs=[x,norm.weight,native(gate),scalar(norm.eps)],
-                            grid=(32*256,1,1),threadgroup=(256,1,1),
+        x, logits = _kernel(inputs=[x,norm.weight,native(gate),scalar(norm.eps),x if squares is None else squares],
+                            template=[("PRECOMPUTED",squares is not None)],grid=(32*256,1,1),threadgroup=(256,1,1),
                             output_shapes=[x.shape,(1,1,128)],output_dtypes=[dtype,mx.float32])
     if gate.top_k == 8:
         indices, weights = _select(

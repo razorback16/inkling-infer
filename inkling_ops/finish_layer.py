@@ -80,12 +80,18 @@ def decode(layer, hidden_states, block_states, *, cache=None, conv_mask=None, me
             residual = hidden_states.astype(mx.float32) + residual
         mixed, _ = depth_norm.evaluate(layer.mlp_input, block_states, residual)
     x = mixed[...,0,:]
+    route_squares = None
     if normalized_messages is not None and type(layer.mlp_message_gate) is layers.MessageGate:
         from . import message_gate
-        x = message_gate.project(layer.mlp_message_gate,x,messages[...,3,:],normalized_messages[...,3,:],reduced_message)
+        result = message_gate.project(layer.mlp_message_gate,x,messages[...,3,:],normalized_messages[...,3,:],
+                                      reduced_message,with_sums=reduced_message is not None)
+        if isinstance(result,tuple):
+            x, route_squares = result
+        else:
+            x = result
     elif messages is not None:
         x = layer.mlp_message_gate(x,messages[...,3,:])
-    x, selected, routing = router.route(layer, x, hidden_states.dtype, normalized=prenormalized, logits=logits)
+    x, selected, routing = router.route(layer, x, hidden_states.dtype, normalized=prenormalized, logits=logits, squares=route_squares)
     active = expert_gate.gated_activation(moe.experts,x,selected)
     w = post.conv1d.weight
     if fused_down:
