@@ -51,45 +51,6 @@ _partial = mx.fast.metal_kernel(
                 for (uint j=0; j<4; ++j) accum[j]=accum[j]*a+b*value[j];
                 peak=top;
             }
-        } else if (PAGED && ADJACENT && !WINDOW && (S-256)%128==0 &&
-                   newest+1==valid && newest>=int(S)-257 && newest<int(S)) {
-            constexpr uint prefix=S-256;
-            for (uint chunk=0; chunk<S; chunk+=4096) {
-                uint pos=chunk+tile+lane*128;
-                int distance=newest-int(pos);
-                float bias=0;
-                if (distance>=0 && distance<R) {
-                    for (uint j=0;j<WIDTH;++j)
-                        bias=fma(float(rel[head*WIDTH+j]),
-                                 float(w[SWIZZLED ? ((distance%128)*WIDTH+j)*(R/128)+distance/128 : j*R+distance]),bias);
-                    bias=float(T(bias));
-                }
-                for (uint i=0;i<32;++i) {
-                    uint position=chunk+tile+i*128;
-                    if (position>uint(newest)) break;
-                    float pb=simd_shuffle(bias,i);
-                    if (pb==-INFINITY) continue;
-                    device const T* kp;
-                    device const T* vp;
-                    if (position<prefix) {
-                        kp=k+(kv*prefix+position)*256+d;
-                        vp=kp+128;
-                    } else {
-                        kp=tail+(kv*256+position-prefix)*128+d;
-                        vp=kp+NKV*256*128;
-                    }
-                    float4 key=float4(*(device const bfloat4*)kp);
-                    float4 value=float4(*(device const bfloat4*)vp);
-                    float score=0;
-                    for (uint j=0;j<4;++j) score+=query[j]*key[j];
-                    score=simd_sum(score)+pb;
-                    float top=max(peak,score);
-                    float a=fast::exp(peak-top), b=fast::exp(score-top);
-                    total=total*a+b;
-                    for (uint j=0;j<4;++j) accum[j]=accum[j]*a+b*value[j];
-                    peak=top;
-                }
-            }
         } else {
             for (uint chunk=0; chunk<S; chunk+=4096) {
                 int pos = chunk + tile + lane*128;
