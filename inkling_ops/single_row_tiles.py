@@ -12,24 +12,23 @@ _pack_rows = mx.fast.metal_kernel(
         ushort highest=0;
         for (uint d=lane*4;d<COLS;d+=128) {
             ushort4 bits=*(device const ushort4*)((device const ushort*)w+row*COLS+d);
-            ushort4 e=(bits>>8)&127;
+            ushort4 e=(bits>>7)&255;
             highest=max(highest,max(max(e.x,e.y),max(e.z,e.w)));
         }
         highest=simd_max(highest);
-        ushort base=ushort(max(0,int(highest)-7));
+        ushort base=ushort(max(0,int(highest)-15));
         uint raw_tiles=0;
         for (uint tile=0;tile<COLS/128;++tile) {
             uint d=tile*128+lane*4;
             ushort4 bits=*(device const ushort4*)((device const ushort*)w+row*COLS+d);
-            ushort4 delta=((bits>>8)&127)-base;
+            ushort4 delta=((bits>>7)&255)-base;
             uint addr=((row/stripe*(COLS/128)+tile)*stripe+row%stripe)*64;
-            if (simd_any(any(delta>7))) {
+            if (simd_any(any(delta>15))) {
                 raw_tiles|=1u<<tile;
                 *(device ushort4*)(payload+addr+lane*2)=bits;
             } else {
-                payload[addr+lane]=as_type<uint>(uchar4(bits));
-                ushort4 n=delta|((bits>>12)&8);
-                ((device ushort*)(payload+addr+32))[lane]=n.x|(n.y<<4)|(n.z<<8)|(n.w<<12);
+                payload[addr+lane]=as_type<uint>(uchar4((bits<<1)|(bits>>15)));
+                ((device ushort*)(payload+addr+32))[lane]=delta.x|(delta.y<<4)|(delta.z<<8)|(delta.w<<12);
             }
         }
         if (!lane) formats[row]=(uint(base)<<24)|raw_tiles;
@@ -37,7 +36,7 @@ _pack_rows = mx.fast.metal_kernel(
 )
 DOT=_STRIPE + """
         uint format=formats[row];
-        ushort base=ushort(format>>24);
+        ushort base=ushort(format>>24)<<8;
         float dot=0;
         for (uint tile=0;tile<COLS/128;++tile) {
             uint d=tile*128+lane*4, addr=((row/stripe*(COLS/128)+tile)*stripe+row%stripe)*64;
@@ -47,8 +46,10 @@ DOT=_STRIPE + """
                 bits=*(device const ushort4*)(payload+addr+lane*2);
             } else {
                 ushort h=((device const ushort*)(payload+addr+32))[lane];
-                ushort4 n=ushort4(h,h>>4,h>>8,h>>12);
-                bits=((n&8)<<12)|(((n&7)+base)<<8)|ushort4(as_type<uchar4>(payload[addr+lane]));
+                ushort4 n=ushort4(h,h>>4,h>>8,h>>12)&15;
+                ushort4 code=(n<<8)|ushort4(as_type<uchar4>(payload[addr+lane]));
+                ushort4 rot=code+base;
+                bits=(rot>>1)|(rot<<15);
             }
             float4 w=float4(as_type<bfloat4>(bits));
             for (uint j=0;j<4;++j) dot=fma(a[j],w[j],dot);
