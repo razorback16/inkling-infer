@@ -4,7 +4,7 @@ import mlx.nn as nn
 from mlx_lm.models.inkling2 import layers
 
 from .head_norm import normalize
-from . import rel_mask, filtered_kv, packed_rows
+from . import rel_mask, filtered_kv, quad_codes
 
 _sliding = layers.SlidingAttention.__call__
 _full = layers.FullAttention.__call__
@@ -42,7 +42,7 @@ def prepare_query_weights(model):
             saved = getattr(layer,name+"_tiles",None)
             if weight.shape[0]%16 or (saved is not None and saved[0] is weight):
                 continue
-            encoded = packed_rows.encode(weight)
+            encoded = quad_codes.encode(weight)
             object.__setattr__(layer,name+"_tiles",(weight,encoded))
             arrays.extend(encoded)
     if arrays:
@@ -61,7 +61,7 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
     name = "_all_qkv" if same else "_common_q"
     packed, boundaries = projection(layer,modules,name)
     tiles = getattr(layer,name+"_tiles",None)
-    projected = (packed_rows.project(hidden_states,packed,tiles[1])
+    projected = (quad_codes.project(hidden_states,packed,tiles[1])
                  if tiles is not None and tiles[0] is packed and hidden_states.dtype==mx.bfloat16
                  else hidden_states @ packed.T)
     parts = mx.split(projected,boundaries,axis=-1)
