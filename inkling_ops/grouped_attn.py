@@ -5,15 +5,8 @@ import mlx.core as mx
 from mlx_lm.kernels.common import scalar
 from mlx_lm.models.cache import BatchRotatingKVCache, RotatingKVCache
 
-_layout_header = """
-    template<uint Tiles, uint Channels>
-    inline uint partial_index(uint row, uint channel) {
-        return (row/Tiles*128+channel/Channels*Channels)*Tiles+row%Tiles*Channels+channel%Channels;
-    }
-"""
-
 _partial = mx.fast.metal_kernel(
-    name="inkling_interleaved_attention", header=_layout_header,
+    name="inkling_interleaved_attention",
     input_names=["q","k","v","tail","fresh","rel","w","slot","end","sinks","scale"],output_names=["partials","stats"],
     source="""
         uint lane = thread_index_in_simdgroup, head = threadgroup_position_in_grid.y;
@@ -95,7 +88,7 @@ _partial = mx.fast.metal_kernel(
                 }
             }
         }
-        for (uint j=0; j<4; ++j) partials[partial_index<TILES,CHANNELS>(addr,d+j)] = T(accum[j]);
+        for (uint j=0; j<4; ++j) partials[addr*128+d+j] = T(accum[j]);
         if (!lane) { stats[addr*2] = peak; stats[addr*2+1] = total; }
     """,
 )
@@ -121,7 +114,7 @@ def gate_probabilities():
 
 
 _merge = mx.fast.metal_kernel(
-    name="inkling_attention_gate", header=_layout_header, input_names=["partial","stats","gate","table"], output_names=["out"],
+    name="inkling_attention_gate", input_names=["partial","stats","gate","table"], output_names=["out"],
     source="""
         uint lane = thread_index_in_simdgroup;
         uint head = threadgroup_position_in_grid.y;
@@ -135,7 +128,7 @@ _merge = mx.fast.metal_kernel(
         for (uint n=0; n<128; n+=32) {
             float a = fast::exp(stats[(i+n)*2] - peak);
             z += a*stats[(i+n)*2+1];
-            for (uint j=0; j<2; ++j) acc[j] += a*float(partial[partial_index<TILES,CHANNELS>(i+n,d+j)]);
+            for (uint j=0; j<2; ++j) acc[j] += a*float(partial[(i+n)*128+d+j]);
         }
         z = simd_sum(z);
         for (uint j=0; j<2; ++j) {
@@ -184,20 +177,13 @@ def attend(layer,q,k,v,rel,sinks,cache,gate,scaled_query=None):
     fresh = getattr(cache,"fresh",None)
     adjacent=getattr(cache,"interleaved_prefix",None)
     threads = 64 if length==1024 and layer.sliding_window==1024 else 256 if paged else 128
-    if length==1024 and layer.sliding_window==1024:
-        tiles, channels = 32, 8
-    elif paged:
-        tiles, channels = 4, 2
-    else:
-        tiles, channels = 1, 128
-    layout = [("TILES",tiles),("CHANNELS",channels)]
     parts,stats = _partial(
         inputs=[q if scaled_query is None else scaled_query,k if adjacent is None else adjacent,v if adjacent is None else adjacent,tail,q if fresh is None else fresh,rel,w,slot,end,
                 sinks.astype(q.dtype),scalar(layer.scaling)],
-        template=layout+[("SCALED",scaled_query is not None),("T",q.dtype),("S",length),("PRE_UPDATE",before is not None),("PAGED",paged),("ADJACENT",adjacent is not None),("FRESH",fresh is not None),("NKV",k.shape[1]),("GQA",heads//k.shape[1]),("WIDTH",width),("SWIZZLED",swizzled),
+        template=[("SCALED",scaled_query is not None),("T",q.dtype),("S",length),("PRE_UPDATE",before is not None),("PAGED",paged),("ADJACENT",adjacent is not None),("FRESH",fresh is not None),("NKV",k.shape[1]),("GQA",heads//k.shape[1]),("WIDTH",width),("SWIZZLED",swizzled),
                   ("R",extent),("WINDOW",layer.sliding_window)],
         grid=(128*32,heads,1),threadgroup=(threads,1,1),
         output_shapes=[(heads,128,128),(heads,128,2)],output_dtypes=[q.dtype,mx.float32])
-    return _merge(inputs=[parts,stats,gate,gate_probabilities()],template=layout+[("LOOKUP",gate.dtype==mx.bfloat16),("T",q.dtype)],
+    return _merge(inputs=[parts,stats,gate,gate_probabilities()],template=[("LOOKUP",gate.dtype==mx.bfloat16),("T",q.dtype)],
                   grid=(64*32,heads,1),threadgroup=(256,1,1),
                   output_shapes=[gate.shape],output_dtypes=[q.dtype])[0]
