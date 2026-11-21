@@ -81,14 +81,18 @@ def loop(model, x, cache, conv_mask):
                 return _reference(model, x, cache, conv_mask)
             slot = k._idx % capacity
         else:
-            if offset >= capacity:
+            if offset > capacity or (offset == capacity and not
+                    (k.step == 256 and 1024 <= capacity <= 7936 and capacity % 256 == 0)):
                 return _reference(model, x, cache, conv_mask)
             slot = offset
         slots.append(slot)
         joined = getattr(k, "_joint_decode_state", None)
         packed = (joined[0] if joined is not None and joined[1] is k.keys and joined[2] is k.values
                   else mx.concatenate((k.keys, k.values), axis=1))
-        if (type(k) is KVCache and 1024 <= capacity <= 8192 and capacity % 256 == 0
+        if type(k) is KVCache and offset == capacity:
+            shape = (*packed.shape[:2], k.step, packed.shape[3])
+            packed = (packed, mx.zeros(shape, dtype=packed.dtype))
+        elif (type(k) is KVCache and 1024 <= capacity <= 8192 and capacity % 256 == 0
                 and offset >= capacity - 256):
             saved_pages = getattr(k, "_decode_pages", None)
             if saved_pages is not None and saved_pages[0] is k.keys and saved_pages[1] is k.values:
