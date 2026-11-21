@@ -11,8 +11,8 @@ _kernel = mx.fast.metal_kernel(
     output_names=["normalized", "logits"],
     source="""
         uint tid=thread_position_in_threadgroup.x, lane=thread_index_in_simdgroup;
-        uint sg=simdgroup_index_in_threadgroup, base=threadgroup_position_in_grid.x*4;
-        threadgroup float sums[18], partial[8][4];
+        uint sg=simdgroup_index_in_threadgroup, base=threadgroup_position_in_grid.x*ROWS;
+        threadgroup float sums[18], partial[8][ROWS];
         float inv;
         if (PRECOMPUTED) {
             inv=precise::rsqrt(simd_sum(lane<18 ? squares[lane]:0.f)/2304.f+eps);
@@ -29,22 +29,22 @@ _kernel = mx.fast.metal_kernel(
             threadgroup_barrier(mem_flags::mem_threadgroup);
             inv=precise::rsqrt(simd_sum(lane<18 ? sums[lane]:0.f)/2304.f+eps);
         }
-        float dots[4]={};
+        float dots[ROWS]={};
         for (uint d=tid*4;d<2304;d+=1024) {
             for (uint j=0;j<4;++j) {
                 bfloat16_t value=bfloat16_t((float(x[d+j])*inv)*float(norm_w[d+j]));
                 if (!base) normalized[d+j]=value;
-                for (uint r=0;r<4;++r)
+                for (uint r=0;r<ROWS;++r)
                     dots[r]=fma(float(value),float(route_w[(base+r)*2304+d+j]),dots[r]);
             }
         }
-        for (uint r=0;r<4;++r) {
+        for (uint r=0;r<ROWS;++r) {
             float dot=dots[r];
             for (ushort i=16;i;i>>=1) dot+=simd_shuffle_down(dot,i);
             if (!lane) partial[sg][r]=dot;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (tid<4) {
+        if (tid<ROWS) {
             float total=partial[0][tid];
             for (uint i=1;i<8;++i) total+=partial[i][tid];
             logits[base+tid]=total;
@@ -151,7 +151,8 @@ def route(layer, x, dtype, normalized=False, logits=None, squares=None):
                            output_shapes=[(1,1,128)],output_dtypes=[mx.float32])[0]
     elif not normalized:
         x, logits = _kernel(inputs=[x,norm.weight,native(gate),scalar(norm.eps),x if squares is None else squares],
-                            template=[("PRECOMPUTED",squares is not None)],grid=(32*256,1,1),threadgroup=(256,1,1),
+                            template=[("PRECOMPUTED",squares is not None),("ROWS",2 if squares is not None else 4)],
+                            grid=((64 if squares is not None else 32)*256,1,1),threadgroup=(256,1,1),
                             output_shapes=[x.shape,(1,1,128)],output_dtypes=[dtype,mx.float32])
     if gate.top_k == 8:
         indices, weights = _select(
