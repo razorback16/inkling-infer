@@ -88,9 +88,9 @@ def prepare_query_weights(model):
         mx.eval(arrays)
 
 
-def _grouped_output(layer,q,k,v,rel,sinks,kv,gate,scaled_query):
+def _grouped_output(layer,q,k,v,rel,sinks,kv,gate,scaled_query,gate_ready=False):
     from . import grouped_attn
-    features=grouped_attn.attend(layer,q,k,v,rel,sinks,kv,gate,scaled_query)
+    features=grouped_attn.attend(layer,q,k,v,rel,sinks,kv,gate,scaled_query,gate_ready)
     from . import filtered_output
     out=filtered_output.apply(layer.o_proj,features,getattr(kv,"output_filter",None))
     return layer.o_proj(features) if out is None else out
@@ -119,7 +119,7 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
                                            conv_states,conv_mask,cache[0],extra)
             if prepared is not None:
                 q,k,v,rel,gate,scaled=prepared
-                return _grouped_output(layer,q,k,v,rel,layer.sink_proj(hidden_states),cache[0],gate,scaled)
+                return _grouped_output(layer,q,k,v,rel,layer.sink_proj(hidden_states),cache[0],gate,scaled,gate_ready=True)
     projected = (packed_rows.project(hidden_states,packed,tiles[1])
                  if tiles is not None and tiles[0] is packed and hidden_states.dtype==mx.bfloat16
                  else hidden_states @ packed.T)
