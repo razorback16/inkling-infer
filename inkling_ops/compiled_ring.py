@@ -1,9 +1,9 @@
-"""Trace a complete sliding decode block once the KV ring has reached its capacity."""
+"""Trace a complete sliding decode block using fixed-size KV backing buffers."""
 import weakref
 
 import mlx.core as mx
 from mlx.utils import tree_flatten
-from mlx_lm.models.cache import ArraysCache, CacheList, RotatingKVCache
+from mlx_lm.models.cache import ArraysCache, CacheList, KVCache, RotatingKVCache
 from mlx_lm.models.inkling2 import layers
 
 _reference = layers.DecoderLayer.__call__
@@ -39,12 +39,23 @@ def _build(layer):
 def decode(layer, hidden_states, block_states, cache=None, conv_mask=None, messages=None):
     kwargs = dict(cache=cache, conv_mask=conv_mask, messages=messages)
     if (hidden_states.shape[:2] != (1, 1) or conv_mask is not None or cache is None
-            or type(cache[0]) is not RotatingKVCache or layer.mlp.sharding_group is not None):
+            or type(cache[0]) not in (KVCache, RotatingKVCache) or layer.mlp.sharding_group is not None):
         return _reference(layer, hidden_states, block_states, **kwargs)
     kv, conv = cache[0], cache[1]
-    if (kv.keys is None or kv.keys.shape[2] != kv.max_size or kv.offset < kv.max_size
-            or kv.keep or conv.left_padding is not None or conv.lengths is not None):
+    if kv.keys is None or conv.left_padding is not None or conv.lengths is not None:
         return _reference(layer, hidden_states, block_states, **kwargs)
+    rotating = type(kv) is RotatingKVCache
+    capacity = kv.keys.shape[2]
+    if rotating:
+        if capacity != kv.max_size or kv.offset < capacity or kv.keep:
+            return _reference(layer, hidden_states, block_states, **kwargs)
+        slot = kv._idx % capacity
+    else:
+        # Let upstream allocate the next block. Inside a block, the attention
+        # mask uses the physical write slot and excludes its still-unused tail.
+        if kv.offset < 1024 or kv.offset >= capacity:
+            return _reference(layer, hidden_states, block_states, **kwargs)
+        slot = kv.offset
     # Re-prime packed projections and the compiled graph if weights were replaced.
     weights = tuple(v for _, v in tree_flatten(layer) if isinstance(v, mx.array))
     saved = getattr(layer, "_compiled_ring", None)
@@ -55,14 +66,14 @@ def decode(layer, hidden_states, block_states, cache=None, conv_mask=None, messa
     if has_messages not in saved[1]:
         saved[1].add(has_messages)
         return _reference(layer, hidden_states, block_states, **kwargs)
-    slot = kv._idx % kv.max_size
     y, blocks, keys, values, history = saved[2](
         hidden_states, block_states, messages, kv.keys, kv.values,
         mx.array([kv.offset], mx.int32), mx.array([slot], mx.int32), tuple(conv.cache),
     )
     kv.keys, kv.values = keys, values
     kv.offset += 1
-    kv._idx = slot + 1
+    if rotating:
+        kv._idx = slot + 1
     conv.cache = list(history)
     return y, blocks
 
