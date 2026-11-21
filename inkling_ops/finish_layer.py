@@ -1,5 +1,6 @@
 """Finish NVFP4 expert mixing, temporal convolution and residual in one launch."""
 import mlx.core as mx
+import mlx.nn as nn
 from mlx_lm.models.inkling2 import layers
 
 from . import postmix, depth_norm, expert_gate, router
@@ -39,8 +40,11 @@ def decode(layer, hidden_states, block_states, *, cache=None, conv_mask=None, me
     if layer.is_block_boundary:
         block = normed[None]
         block_states = block if block_states is None else mx.concatenate((block_states, block))
+    prenormalized = False
     if type(layer.post_attention_convolution) is layers.ShortConvolution and layer.post_attention_convolution.kernel_size == 4:
-        mixed, residual, history[2] = depth_norm.post_attention(layer, block_states, attention, history[2], hidden_states)
+        prenormalized = messages is None and type(layer.post_attention_layernorm) is nn.RMSNorm
+        mixed, residual, history[2] = depth_norm.post_attention(
+            layer,block_states,attention,history[2],hidden_states,normalize=prenormalized)
     else:
         filtered, history[2] = layer.post_attention_convolution(attention,history[2],None)
         residual = filtered.astype(mx.float32)
@@ -53,7 +57,7 @@ def decode(layer, hidden_states, block_states, *, cache=None, conv_mask=None, me
         x = message_gate.project(layer.mlp_message_gate,x,messages[...,3,:],normalized_messages[...,3,:])
     elif messages is not None:
         x = layer.mlp_message_gate(x,messages[...,3,:])
-    x, selected, routing = router.route(layer, x, hidden_states.dtype)
+    x, selected, routing = router.route(layer, x, hidden_states.dtype, normalized=prenormalized)
     active = expert_gate.gated_activation(moe.experts,x,selected)
     w = post.conv1d.weight
     if fused_down:

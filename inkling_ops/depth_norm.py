@@ -110,14 +110,10 @@ def evaluate(module, blocks, x):
                    output_shapes=[(1,1,q,2304),x.shape],output_dtypes=[mx.float32,mx.float32])
 
 
-_normalized_input_source = _source.replace("FILTER", "").replace(
-    "mixed[query*2304+d] = v + norm[d]*coeff[K];",
-    "values[j] = v + norm[d]*coeff[K];")
-_normalized_inputs = mx.fast.metal_kernel(
-    name="inkling_depth_attention_input_norm",
-    input_names=["x", "blocks", "queries", "weights", "eps"],
-    output_names=["mixed", "normalized"],
-    source=_normalized_input_source + """
+def normalized_source(filtered=False):
+    source = _source.replace("FILTER", _filter if filtered else "").replace(
+        "mixed[query*2304+d] = v + norm[d]*coeff[K];", "values[j] = v + norm[d]*coeff[K];")
+    return source + """
         float norm2=0;
         for (uint j=0; j<4; ++j) norm2+=values[j]*values[j];
         norm2=simd_sum(norm2);
@@ -128,7 +124,19 @@ _normalized_inputs = mx.fast.metal_kernel(
             uint col=query*2304+tid*4+j;
             mixed[col]=bfloat16_t((values[j]*inv)*float(weights[col]));
         }
-    """,
+    """
+
+
+_normalized_inputs = mx.fast.metal_kernel(
+    name="inkling_depth_attention_input_norm",
+    input_names=["x","blocks","queries","weights","eps"], output_names=["mixed","normalized"],
+    source=normalized_source(),
+)
+_mlp_inputs = mx.fast.metal_kernel(
+    name="inkling_depth_mlp_input_norm",
+    input_names=["x","blocks","queries","history","w","hidden","weights","eps"],
+    output_names=["mixed","normalized","residual","window"],
+    source=normalized_source(filtered=True),
 )
 
 
@@ -157,13 +165,19 @@ def attention_inputs(layer, blocks, x):
     return inputs, normalized
 
 
-def post_attention(layer, blocks, attention, history, hidden):
+def post_attention(layer, blocks, attention, history, hidden, normalize=False):
     weights = layer.post_attention_convolution.conv1d.weight
-    mixed, _, residual, window = _filtered(
-        inputs=[attention, blocks, layer.mlp_input.query, history, weights, hidden],
+    inputs = [attention,blocks,layer.mlp_input.query,history,weights,hidden]
+    kernel = _filtered
+    if normalize:
+        norm = layer.post_attention_layernorm
+        inputs += [norm.weight,scalar(norm.eps)]
+        kernel = _mlp_inputs
+    mixed, _, residual, window = kernel(
+        inputs=inputs,
         template=[("K", blocks.shape[0]), ("T", attention.dtype), ("W", weights.dtype),
                   ("BOUNDARY", layer.is_block_boundary)],
         grid=(576,1,1), threadgroup=(576,1,1),
         output_shapes=[(1,1,1,2304), hidden.shape, hidden.shape, (1,4,2304)],
-        output_dtypes=[mx.float32]*4)
+        output_dtypes=[attention.dtype if normalize else mx.float32]+[mx.float32]*3)
     return mixed, residual, window

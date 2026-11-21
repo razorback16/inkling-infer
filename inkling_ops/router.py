@@ -51,6 +51,29 @@ _kernel = mx.fast.metal_kernel(
 )
 
 
+_dot_only = mx.fast.metal_kernel(
+    name="inkling_prenormalized_router", input_names=["x","w"], output_names=["logits"],
+    source="""
+        uint tid=thread_position_in_threadgroup.x, lane=thread_index_in_simdgroup;
+        uint sg=simdgroup_index_in_threadgroup, base=threadgroup_position_in_grid.x*4;
+        threadgroup float partial[8][4];
+        for (uint r=0;r<4;++r) {
+            float dot=0;
+            for (uint d=tid*4;d<2304;d+=1024)
+                for (uint j=0;j<4;++j) dot=fma(float(x[d+j]),float(w[(base+r)*2304+d+j]),dot);
+            for (ushort n=16;n;n>>=1) dot+=simd_shuffle_down(dot,n);
+            if (!lane) partial[sg][r]=dot;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid<4) {
+            float val=partial[0][tid];
+            for (uint i=1;i<8;++i) val+=partial[i][tid];
+            logits[base+tid]=val;
+        }
+    """,
+)
+
+
 _select = mx.fast.metal_kernel(
     name="inkling_parallel_rank_routes",
     input_names=["logits","bias","eps","scale"], output_names=["inds","weights"],
@@ -114,16 +137,20 @@ _select = mx.fast.metal_kernel(
 )
 
 
-def route(layer, x, dtype):
+def route(layer, x, dtype, normalized=False):
     norm, gate = layer.post_attention_layernorm, layer.mlp.gate
     if (type(norm) is not nn.RMSNorm or type(gate) is not layers.TopKRouter
-            or x.dtype != mx.float32 or dtype != mx.bfloat16 or gate.weight.shape != (128,2304)):
-        x = norm(x).astype(dtype)
+            or x.dtype != (dtype if normalized else mx.float32) or dtype != mx.bfloat16 or gate.weight.shape != (128,2304)):
+        x = x if normalized else norm(x).astype(dtype)
         indices, weights = gate(x)
         return x, indices, weights
-    x, logits = _kernel(inputs=[x,norm.weight,native(gate),scalar(norm.eps)],
-                        grid=(32*576,1,1),threadgroup=(576,1,1),
-                        output_shapes=[x.shape,(1,1,128)],output_dtypes=[dtype,mx.float32])
+    if normalized:
+        logits = _dot_only(inputs=[x,native(gate)],grid=(32*256,1,1),threadgroup=(256,1,1),
+                           output_shapes=[(1,1,128)],output_dtypes=[mx.float32])[0]
+    else:
+        x, logits = _kernel(inputs=[x,norm.weight,native(gate),scalar(norm.eps)],
+                            grid=(32*576,1,1),threadgroup=(576,1,1),
+                            output_shapes=[x.shape,(1,1,128)],output_dtypes=[dtype,mx.float32])
     if gate.top_k == 8:
         indices, weights = _select(
             inputs=[logits,gate.e_score_correction_bias,scalar(layers._ROUTER_SCORE_EPS),
