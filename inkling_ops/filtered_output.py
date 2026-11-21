@@ -26,11 +26,11 @@ _kernel = mx.fast.metal_kernel(
                 uint d=first+r;
                 float val=float(bfloat16_t(dot)), filtered=0;
                 for (uint t=0;t<3;++t) {
-                    float old=history[t*2304+d]; window[t*2304+d]=old;
+                    float old=history[t*2304+d]; if (t) window[(t-1)*2304+d]=old;
                     filtered=fma(float(W(old)),float(conv[d*4+t]),filtered);
                 }
                 filtered=fma(float(W(val)),float(conv[d*4+3]),filtered);
-                window[3*2304+d]=val;
+                window[2*2304+d]=val;
                 float out=float(bfloat16_t((float(W(filtered))+val)*0.4472135954999579f));
                 if (!BOUNDARY) out+=float(hidden[d]);
                 residual[d]=out; norm2+=out*out;
@@ -53,11 +53,11 @@ _compact_rows = mx.fast.metal_kernel(
             float v=float(bfloat16_t(dot)),filtered=0;
             for (uint t=0;t<3;++t) {
                 float old=history[t*2304+row];
-                window[t*2304+row]=old;
+                if (t) window[(t-1)*2304+row]=old;
                 filtered=fma(float(W(old)),float(conv[row*4+t]),filtered);
             }
             filtered=fma(float(W(v)),float(conv[row*4+3]),filtered);
-            window[3*2304+row]=v;
+            window[2*2304+row]=v;
             float out=float(bfloat16_t((float(W(filtered))+v)*0.4472135954999579f));
             if (!BOUNDARY) out+=float(hidden[row]);
             residual[row]=out;
@@ -104,5 +104,5 @@ def apply(projection, x, post):
     return tuple(kernel(inputs=inputs,
                          template=[("W",conv.dtype),("BOUNDARY",layer.is_block_boundary),("COLS",3072)],
                          grid=((2304 if compact else 576)*32,1,1),threadgroup=(128,1,1),
-                         output_shapes=[hidden.shape,(1,4,2304),(576,)],
+                         output_shapes=[hidden.shape,(1,3,2304),(576,)],
                          output_dtypes=[mx.float32]*3))
