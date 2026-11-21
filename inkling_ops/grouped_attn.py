@@ -121,9 +121,8 @@ _merge = mx.fast.metal_kernel(
 )
 
 
-def attend(layer,q,k,v,rel,sinks,cache,gate,prescaled=False):
+def attend(layer,q,k,v,rel,sinks,cache,gate,scaled_query=None):
     length, heads = k.shape[2], q.shape[1]
-    dtype = rel.dtype if prescaled else q.dtype
     slot = cache._idx if isinstance(cache,(RotatingKVCache,BatchRotatingKVCache)) else length
     before = getattr(cache, "write_coordinates", None)
     slot, end = before if before is not None else (slot, cache.offset)
@@ -139,7 +138,7 @@ def attend(layer,q,k,v,rel,sinks,cache,gate,prescaled=False):
             object.__setattr__(layer, "_relative_tiles", saved)
         w = saved[2]
     paged = hasattr(cache, "page_tail")
-    tail = cache.page_tail if paged else k
+    tail = cache.page_tail if paged else q
     if paged:
         k, v = mx.split(cache.page_prefix, 2, axis=1)
     # A compiled ring already carries one-element int32 graph inputs.
@@ -148,12 +147,12 @@ def attend(layer,q,k,v,rel,sinks,cache,gate,prescaled=False):
     fresh = getattr(cache,"fresh",None)
     adjacent=getattr(cache,"interleaved_prefix",None)
     parts,stats = _partial(
-        inputs=[q,k if adjacent is None else adjacent,v if adjacent is None else adjacent,tail,k if fresh is None else fresh,rel,w,slot,end,
-                sinks.astype(dtype),scalar(layer.scaling)],
-        template=[("SCALED",prescaled),("T",dtype),("S",length),("PRE_UPDATE",before is not None),("PAGED",paged),("ADJACENT",adjacent is not None),("FRESH",fresh is not None),("NKV",k.shape[1]),("GQA",heads//k.shape[1]),("WIDTH",width),("SWIZZLED",swizzled),
+        inputs=[q if scaled_query is None else scaled_query,k if adjacent is None else adjacent,v if adjacent is None else adjacent,tail,q if fresh is None else fresh,rel,w,slot,end,
+                sinks.astype(q.dtype),scalar(layer.scaling)],
+        template=[("SCALED",scaled_query is not None),("T",q.dtype),("S",length),("PRE_UPDATE",before is not None),("PAGED",paged),("ADJACENT",adjacent is not None),("FRESH",fresh is not None),("NKV",k.shape[1]),("GQA",heads//k.shape[1]),("WIDTH",width),("SWIZZLED",swizzled),
                   ("R",extent),("WINDOW",layer.sliding_window)],
         grid=(128*32,heads,1),threadgroup=(128,1,1),
-        output_shapes=[(heads,128,128),(heads,128,2)],output_dtypes=[dtype,mx.float32])
-    return _merge(inputs=[parts,stats,gate],template=[("T",dtype)],
+        output_shapes=[(heads,128,128),(heads,128,2)],output_dtypes=[q.dtype,mx.float32])
+    return _merge(inputs=[parts,stats,gate],template=[("T",q.dtype)],
                   grid=(32*32,heads,1),threadgroup=(128,1,1),
-                  output_shapes=[gate.shape],output_dtypes=[dtype])[0]
+                  output_shapes=[gate.shape],output_dtypes=[q.dtype])[0]

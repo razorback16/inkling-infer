@@ -80,9 +80,9 @@ def _scaled_kernel(filtered):
         inputs = inputs + ["kh","vh","kw","vw"]
         outputs = outputs + ["k_window","v_window"]
     source = source.replace("if (query) qo[base+d] = x;",
-                            "if (query) qo[base+d] = attention_scale * float(x);")
+                            "if (query) { qo[base+d] = x; scaled[base+d] = attention_scale * float(x); }")
     return mx.fast.metal_kernel(name="inkling_scaled_filtered_heads" if filtered else "inkling_scaled_heads",
-                                input_names=inputs+["attention_scale"],output_names=outputs,source=source)
+                                input_names=inputs+["attention_scale"],output_names=outputs+["scaled"],source=source)
 
 
 _scaled = _scaled_kernel(False)
@@ -152,10 +152,14 @@ def normalize(layer, query, key, value, relative, return_pair=False, filters=Non
     if prepare_scale:
         kernel = _scaled_filtered if filters is not None else _scaled
         inputs.append(scalar(layer.scaling))
-        types[0] = mx.float32
+        shapes.append(shapes[0])
+        types.append(mx.float32)
     q, pair, r, *windows = kernel(
         inputs=inputs, template=template, grid=(32*(2*heads+2*kv),1,1), threadgroup=(32,1,1),
         output_shapes=shapes, output_dtypes=types)
+    if prepare_scale:
+        scaled = windows.pop()
+        q = (q, scaled)
     if filters is not None:
         return q, pair, r, windows
     k, v = mx.split(pair,2,axis=2)
