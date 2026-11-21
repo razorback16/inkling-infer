@@ -53,6 +53,21 @@ def prepare_query_weights(model):
             if any(type(p) is not nn.Linear or "bias" in p or p.weight.dtype!=mx.bfloat16
                    or p.weight.shape[1]!=2304 for p in modules):
                 continue
+            if name=="_common_q" and isinstance(layer,layers.SlidingAttention):
+                joint=getattr(layer,"_all_qkv",None)
+                tiles=getattr(layer,"_all_qkv_tiles",None)
+                rows=sum(p.weight.shape[0] for p in modules)
+                if (rows%16==0 and joint is not None and tiles is not None
+                        and tiles[0] is joint[1] and all(p.weight is w for p,w in zip(modules,joint[0]))):
+                    weights=tuple(p.weight for p in modules)
+                    w=joint[1][:rows]
+                    boundaries=joint[2][:len(modules)-1]
+                    data,bases,flags=tiles[1]
+                    subset=(data[:rows//4*18],bases[:rows],flags[:rows//4])
+                    object.__setattr__(layer,name,(weights,w,boundaries))
+                    object.__setattr__(layer,name+"_tiles",(w,subset))
+                    arrays.extend(subset)
+                    continue
             weight,_ = projection(layer,modules,name)
             saved = getattr(layer,name+"_tiles",None)
             if weight.shape[0]%16 or (saved is not None and saved[0] is weight):
