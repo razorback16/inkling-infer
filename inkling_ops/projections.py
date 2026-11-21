@@ -79,7 +79,7 @@ def prepare_query_weights(model):
         mx.eval(arrays)
 
 
-def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cache, conv_states, conv_mask):
+def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cache, conv_states, conv_mask, prepared_sinks=None):
     full = isinstance(layer, layers.FullAttention)
     same = hidden_states is key_hidden_states and hidden_states is value_hidden_states
     common = (layer.q_proj, layer.r_proj, layer.gate_proj)
@@ -96,7 +96,7 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
                  else hidden_states @ packed.T)
     parts = mx.split(projected,boundaries,axis=-1)
     query, relative, gate = parts[:3]
-    sinks = layer.sink_proj(hidden_states)
+    sinks = layer.sink_proj(hidden_states) if prepared_sinks is None else prepared_sinks
     filtered = (None if full or same else
                 filtered_kv.apply(layer,key_hidden_states,value_hidden_states,conv_states,conv_mask))
     if filtered is not None:
