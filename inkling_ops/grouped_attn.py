@@ -163,7 +163,7 @@ def attend(layer,q,k,v,rel,sinks,cache,gate,scaled_query=None):
         weight = layer.rel_logits_proj.proj
         saved = getattr(layer, "_relative_tiles", None)
         if saved is None or saved[0] is not weight or saved[1] != rel.dtype:
-            tiled = mx.contiguous(w.reshape(width, extent//128, 128).transpose(2,0,1).astype(mx.float32 if layer.sliding_window==1024 else w.dtype))
+            tiled = mx.contiguous(w.reshape(width, extent//128, 128).transpose(2,0,1))
             saved = (weight, rel.dtype, tiled)
             object.__setattr__(layer, "_relative_tiles", saved)
         w = saved[2]
