@@ -1,4 +1,4 @@
-"""Score the fixed residual blocks for all MLP inputs in their six-layer segment."""
+"""Score the fixed residual blocks for MLP and attention inputs in their six-layer segment."""
 from contextvars import ContextVar
 import mlx.core as mx
 
@@ -30,13 +30,18 @@ def prepare(model):
     arrays=[]
     for start in range(0,len(model.layers),width):
         layers=model.layers[start:start+width]
-        qs=[layer.mlp_input.query for layer in layers]
-        if any(q.size!=2304 or q.dtype!=mx.float32 for q in qs):
+        modules = [layer.mlp_input for layer in layers]
+        modules.extend(layer.attention_input for layer in layers
+                       if not layer.is_block_boundary and layer.attention_input is not None)
+        queries = [module.query for module in modules]
+        if any(q.size % 2304 or q.dtype != mx.float32 for q in queries):
             continue
-        table=mx.concatenate([q.reshape(1,2304) for q in qs])
+        table = mx.concatenate([q.reshape(-1, 2304) for q in queries])
         arrays.append(table)
-        for local, layer in enumerate(layers):
-            result[id(layer)] = (table,local)
+        column = 0
+        for module, query in zip(modules, queries):
+            result[id(module)] = (table, column)
+            column += query.size // 2304
     if arrays:
         mx.eval(arrays)
     return result
@@ -50,11 +55,11 @@ def run(grouped,func,*args):
         _active.reset(token)
 
 
-def lookup(layer,blocks):
+def lookup(module,blocks):
     ctx=_active.get()
-    if ctx is None or id(layer) not in ctx[0] or not 2<=blocks.shape[0]<32:
+    if ctx is None or id(module) not in ctx[0] or not 2<=blocks.shape[0]<32:
         return blocks,[("CACHED",False),("STRIDE",1),("COLUMN",0)]
-    table,col=ctx[0][id(layer)]
+    table,col=ctx[0][id(module)]
     key=(id(blocks),id(table)); n=table.shape[0];k=blocks.shape[0]
     if key not in ctx[1]:
         scores=_kernel(inputs=[blocks,table],grid=(n*288,k,1),threadgroup=(288,1,1),

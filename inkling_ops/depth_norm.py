@@ -2,6 +2,7 @@
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.kernels.common import scalar
+from . import block_lookahead
 
 _filter = """
             uint d = tid*4+j;
@@ -86,16 +87,29 @@ _source = """
     """
 
 
+def cached_source(source):
+    source=source.replace("for (uint i=group; i<=K; i+=2)",
+                          "for (uint i=(CACHED ? K+group : group); i<=K; i+=2)")
+    source=source.replace("for (uint j=0; j<9; ++j) dot+=scores[lane][j];",
+                          "if (CACHED && lane<K) dot=closed[lane*STRIDE+COLUMN+query]; "
+                          "else for (uint j=0; j<9; ++j) dot+=scores[lane][j];")
+    return source
+
+
 def make_kernel(filtered):
     inputs = ["x", "blocks", "queries"]
     outputs = ["mixed", "normalized"]
     if filtered:
         inputs.extend(["history", "w", "hidden"])
         outputs.extend(["residual", "window"])
+    source = _source.replace("FILTER", _filter if filtered else "")
+    if not filtered:
+        inputs.append("closed")
+        source = cached_source(source)
     return mx.fast.metal_kernel(
         name="inkling_filtered_depth" if filtered else "inkling_residual_depth",
         input_names=inputs, output_names=outputs,
-        source=_source.replace("FILTER", _filter if filtered else ""),
+        source=source,
     )
 
 
@@ -105,7 +119,8 @@ _filtered = make_kernel(True)
 
 def evaluate(module, blocks, x):
     q = module.query.size // 2304
-    return _kernel(inputs=[x,blocks,module.query], template=[("K",blocks.shape[0])],
+    closed, config = block_lookahead.lookup(module, blocks)
+    return _kernel(inputs=[x,blocks,module.query,closed], template=[("K",blocks.shape[0]), *config],
                    grid=(q*576,1,1),threadgroup=(576,1,1),
                    output_shapes=[(1,1,q,2304),x.shape],output_dtypes=[mx.float32,mx.float32])
 
@@ -129,8 +144,8 @@ def normalized_source(filtered=False):
 
 _normalized_inputs = mx.fast.metal_kernel(
     name="inkling_depth_attention_input_norm",
-    input_names=["x","blocks","queries","weights","eps"], output_names=["mixed","normalized"],
-    source=normalized_source(),
+    input_names=["x","blocks","queries","weights","eps","closed"], output_names=["mixed","normalized"],
+    source=cached_source(normalized_source()),
 )
 _mlp_inputs = mx.fast.metal_kernel(
     name="inkling_depth_mlp_input_norm",
@@ -157,9 +172,10 @@ def attention_inputs(layer, blocks, x):
             object.__setattr__(layer, "_attention_norm_weights", saved)
         joined = saved[1]
     q = len(norms)
+    closed, config = block_lookahead.lookup(layer.attention_input, blocks)
     states, normalized = _normalized_inputs(
-        inputs=[x,blocks,layer.attention_input.query,joined,scalar(norms[0].eps)],
-        template=[("K",blocks.shape[0])], grid=(q*576,1,1), threadgroup=(576,1,1),
+        inputs=[x,blocks,layer.attention_input.query,joined,scalar(norms[0].eps),closed],
+        template=[("K",blocks.shape[0]), *config], grid=(q*576,1,1), threadgroup=(576,1,1),
         output_shapes=[(1,q,2304),x.shape],output_dtypes=[mx.bfloat16,mx.float32])
     inputs = (states,)*3 if q==1 else tuple(mx.split(states,3,axis=1))
     return inputs, normalized
@@ -186,11 +202,7 @@ def make_projected(normalize):
     source = normalized_source() if normalize else _source.replace("FILTER","")
     source = source.replace("sum += v*v;", "").replace("sum = simd_sum(sum);","sum = simd_sum(squares[tid]);",1)
     source = source.replace("if (!query) normalized[d] = norm[d];","")
-    source=source.replace("for (uint i=group; i<=K; i+=2)",
-                          "for (uint i=(CACHED ? K+group : group); i<=K; i+=2)")
-    source=source.replace("for (uint j=0; j<9; ++j) dot+=scores[lane][j];",
-                          "if (CACHED && lane<K) dot=closed[lane*STRIDE+COLUMN]; "
-                          "else for (uint j=0; j<9; ++j) dot+=scores[lane][j];")
+    source = cached_source(source)
     inputs = ["x","blocks","queries","squares","closed"]
     if normalize:
         inputs.extend(["weights","eps"])
@@ -202,8 +214,7 @@ _projected = (make_projected(False),make_projected(True))
 
 
 def from_projection(layer, blocks, residual, squares, normalize):
-    from . import block_lookahead
-    closed,config=block_lookahead.lookup(layer,blocks)
+    closed,config=block_lookahead.lookup(layer.mlp_input,blocks)
     inputs = [residual,blocks,layer.mlp_input.query,squares,closed]
     if normalize:
         norm=layer.post_attention_layernorm
