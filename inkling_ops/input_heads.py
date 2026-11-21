@@ -53,40 +53,6 @@ _from_sums = mx.fast.metal_kernel(
 )
 
 
-_prepared_sinks = mx.fast.metal_kernel(
-    name="inkling_prepared_attention_sinks",input_names=["q","k","v","qw","kw","vw","eps","sums","w"],
-    output_names=["qo","ko","vo","sinks"],source="""
-        uint team=threadgroup_position_in_grid.x, head=team<24 ? 0 : team-23;
-        uint tid=thread_position_in_threadgroup.x, lane=thread_index_in_simdgroup;
-        uint sg=simdgroup_index_in_threadgroup;
-        float inv=precise::rsqrt(simd_sum(lane<18 ? sums[head*18+lane] : 0.f)/2304.f+eps);
-        float dot=0;
-        for (uint start=tid*4;start<2304;start+=1024) {
-            for (uint j=0;j<4;++j) {
-                uint d=start+j;
-                if (head==0) {
-                    T val=T(float(A(float(q[d])*inv))*float(qw[d]));
-                    if (!team) qo[d]=val;
-                    dot=fma(float(val),float(w[team*2304+d]),dot);
-                } else if (head==1) ko[d]=T(float(A(float(k[d])*inv))*float(kw[d]));
-                else vo[d]=T(float(A(float(v[d])*inv))*float(vw[d]));
-            }
-        }
-        if (head==0) {
-            threadgroup float partial[8];
-            for (ushort step=16;step;step>>=1) dot+=simd_shuffle_down(dot,step);
-            if (!lane) partial[sg]=dot;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (!tid) {
-                float total=partial[0];
-                for (uint i=1;i<8;++i) total+=partial[i];
-                sinks[team]=T(total);
-            }
-        }
-    """,
-)
-
-
 def attention(layer, x, inputs, cache, conv_states, conv_mask, messages):
     inverse = None
     if isinstance(inputs,tuple):
@@ -123,17 +89,6 @@ def attention(layer, x, inputs, cache, conv_states, conv_mask, messages):
         kernel,grid,group = _kernel,(3*576,1,1),(576,1,1)
     else:
         args.append(sums)
-        from . import projections
-        attn=layer.self_attn
-        sink=attn.sink_proj
-        if (getattr(attn.__call__,"__func__",None) is projections.attend and type(sink) is nn.Linear
-                and "bias" not in sink and sink.weight.shape==(24,2304) and sink.weight.dtype==x.dtype==mx.bfloat16):
-            q,k,v,sinks=_prepared_sinks(inputs=[*args,sink.weight],
-                                        template=[("A",mx.result_type(states[0],weights[0])),("T",x.dtype)],
-                                        grid=(26*256,1,1),threadgroup=(256,1,1),
-                                        output_shapes=[x.shape]*3+[(1,1,24)],output_dtypes=[x.dtype]*4)
-            return projections.attend(attn,q,k,v,cache=cache,conv_states=conv_states,
-                                      conv_mask=conv_mask,prepared_sinks=sinks)
         kernel,grid,group = _from_sums,(576,3,1),(128,1,1)
     q,k,v = kernel(inputs=args,template=[("A",mx.result_type(states[0],weights[0])),("T",x.dtype)],
                    grid=grid,threadgroup=group,output_shapes=[x.shape]*3,output_dtypes=[x.dtype]*3)
