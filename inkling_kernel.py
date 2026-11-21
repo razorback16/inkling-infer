@@ -72,25 +72,19 @@ def _make_down(finish):
         uint first_row = expert * 2304 + channel;
         float accum[4] = {};
         for (uint word = lane; word < 144; word += 32) {
-            float4 input[2];
-            half4 small[2];
-            bool safe[2];
-            for (uint part=0;part<2;++part) {
-                input[part]=float4(((device const bfloat4*)(hidden + slot*1152 + word*8))[part]);
-                float4 mag=abs(input[part]);
-                safe[part]=all((mag==0.f)|((mag>=0x1p-13f)&(mag<0x1p13f)));
-                small[part]=half4(input[part]);
-            }
+            float x[8];
+            for (uint k = 0; k < 8; ++k)
+                x[k] = float(hidden[slot * 1152 + word * 8 + k]);
             for (uint r = 0; r < 4; ++r) {
                 uint row = first_row + r;
                 uint q = packed[row * 144 + word];
                 float chunk = 0;
-                for (uint part=0;part<2;++part) {
-                    half4 w=half4(fp4_values[q&15],fp4_values[(q>>4)&15],
-                                  fp4_values[(q>>8)&15],fp4_values[(q>>12)&15]);
-                    float4 product=safe[part] ? float4(small[part]*w) : input[part]*float4(w);
-                    chunk+=product.x+product.y+product.z+product.w;
-                    q>>=16;
+                for (uint k = 0; k < 8; k += 4) {
+                    chunk += x[k] * fp4_values[q & 15]
+                           + x[k+1] * fp4_values[(q >> 4) & 15]
+                           + x[k+2] * fp4_values[(q >> 8) & 15]
+                           + x[k+3] * fp4_values[(q >> 12) & 15];
+                    q >>= 16;
                 }
                 float term = decode_scale(scales[row * 72 + word / 2]) * chunk;
                 accum[r] += term;
