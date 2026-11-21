@@ -43,15 +43,6 @@ def prepare_query_weights(model):
                 tables[params]=_position_table(mx.arange(8192,dtype=mx.float32),*params)
                 arrays.append(tables[params])
             object.__setattr__(layer,"_decode_position_table",(params,tables[params]))
-        if (isinstance(layer,layers.FullAttention)
-                and all(type(p) is nn.Linear and "bias" not in p and p.weight.shape==(1024,2304)
-                        and p.weight.dtype==mx.bfloat16 for p in (layer.k_proj,layer.v_proj))):
-            k,v=layer.k_proj.weight,layer.v_proj.weight
-            saved=getattr(layer,"_four_row_kv",None)
-            if saved is None or saved[0] is not k or saved[1] is not v:
-                encoded=packed_rows.encode(mx.concatenate((k,v)))
-                object.__setattr__(layer,"_four_row_kv",(k,v,encoded))
-                arrays.extend(encoded)
         common = (layer.q_proj,layer.r_proj,layer.gate_proj)
         variants = []
         if isinstance(layer,layers.SlidingAttention):
@@ -113,12 +104,8 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
     elif same:
         key, value = parts[3:]
     else:
-        pair = packed_rows.project_kv(layer,key_hidden_states,value_hidden_states) if full else None
-        if pair is None:
-            key = layer.k_proj(key_hidden_states)
-            value = layer.v_proj(value_hidden_states)
-        else:
-            key,value = pair
+        key = layer.k_proj(key_hidden_states)
+        value = layer.v_proj(value_hidden_states)
     fused_norm = (same and not full and conv_mask is None and conv_states is not None and layer.head_dim == 128
                   and relative.shape[-1] // layer.num_heads <= 128
                   and key.dtype == value.dtype == query.dtype
