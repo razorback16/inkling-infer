@@ -138,15 +138,17 @@ def loop(model, x, cache, conv_mask):
     positions = [None if state[0] is None or type(c[0]) is KVCache else params[slot]
                  for state,c,slot in zip(incoming,cache,slots)]
     result, slab, updated = saved[1](x, incoming, params[offset], positions, slab, ring_slot)
-    views = []
+    views = ()
+    if slab is not None:
+        views = tuple(mx.split(slab, len(rows), axis=0))
+        all_keys, all_values = mx.split(slab, 2, axis=1)
+        pairs = iter(zip(views, mx.split(all_keys, len(rows), axis=0),
+                         mx.split(all_values, len(rows), axis=0)))
     for c, slot, previous, update in zip(cache, slots, states, updated):
         k, conv = c[0], c[1]
         if len(update) == 1:
             history = update[0]
-            row = len(views)
-            packed = slab[row:row+1]
-            views.append(packed)
-            keys, values = mx.split(packed,2,axis=1)
+            packed, keys, values = next(pairs)
         elif len(update) == 2:
             tail, history = update
             pages = (previous[0][0], tail)
@@ -162,7 +164,7 @@ def loop(model, x, cache, conv_mask):
             k._idx = slot + 1
         conv.cache = list(history)
     if views:
-        cache[rows[0]][0]._shared_rings = (slab, tuple(views))
+        cache[rows[0]][0]._shared_rings = (slab, views)
     return result
 
 
