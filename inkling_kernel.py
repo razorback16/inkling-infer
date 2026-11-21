@@ -65,9 +65,10 @@ def _make_down(finish):
     source="""
         #pragma clang fp contract(off)
         // Each SIMD group projects one expert into the same four channels.
-        uint slot = simdgroup_index_in_threadgroup;
+        uint quarter=simdgroup_index_in_threadgroup%2;
+        uint slot=simdgroup_index_in_threadgroup/2;
         uint lane = thread_index_in_simdgroup;
-        uint channel = 4 * threadgroup_position_in_grid.x;
+        uint channel=4*(2*threadgroup_position_in_grid.x+quarter);
         uint expert = indices[slot];
         uint first_row = expert * 2304 + channel;
         float accum[4] = {};
@@ -90,17 +91,17 @@ def _make_down(finish):
                 accum[r] += term;
             }
         }
-        threadgroup float projected[8][4];
+        threadgroup float projected[2][8][4];
         for (uint r = 0; r < 4; ++r) {
             float dot = simd_sum(accum[r]);
             if (lane == 0)
-                projected[slot][r] = float(T(dot * (amax[expert] / 2688.f)));
+                projected[quarter][slot][r] = float(T(dot * (amax[expert] / 2688.f)));
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (slot == 0 && lane < 4) {
             float value = 0;
             for (uint e = 0; e < 8; ++e) {
-                float term = projected[e][lane] * float(routing[e]);
+                float term = projected[quarter][e][lane] * float(routing[e]);
                 value = value + term;
             }
             STORE
@@ -131,8 +132,8 @@ def single_token_moe(self, x):
         hidden = gated_activation(self.experts, x, experts)
         return _down_mix(
             inputs=[hidden, experts, weights, down.weight, down.scales, down.global_scale],
-            template=[("T", x.dtype)], grid=(576 * 256, 1, 1),
-            threadgroup=(256, 1, 1), output_shapes=[x.shape], output_dtypes=[x.dtype],
+            template=[("T", x.dtype)], grid=(288 * 512, 1, 1),
+            threadgroup=(512, 1, 1), output_shapes=[x.shape], output_dtypes=[x.dtype],
         )[0]
     return mix(self.experts(x, experts), weights, x.dtype)
 
