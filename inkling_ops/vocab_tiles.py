@@ -52,6 +52,7 @@ _dot = mx.fast.metal_kernel(
         uint fmt=formats[row], mask=fmt&0x3ffffu;
         ushort base=ushort(fmt>>24);
         float dot=0;
+        #pragma clang loop unroll_count(3)
         for (uint t=0;t<18;++t) {
             uint addr=((row/4*18+t)*4+row%4)*48;
             ushort h=((device const ushort*)(tiles+addr+32))[lane];
@@ -87,5 +88,5 @@ def encode(w):
 
 def project(x,weight,encoded):
     rows=weight.shape[0]
-    return _dot(inputs=[x,*encoded], grid=(rows*32,1,1), threadgroup=(256,1,1),
+    return _dot(inputs=[x,*encoded], grid=(rows*32,1,1), threadgroup=(128,1,1),
                 output_shapes=[(1,1,rows)], output_dtypes=[x.dtype])[0]
