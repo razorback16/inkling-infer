@@ -63,6 +63,7 @@ _dot = mx.fast.metal_kernel(
         uchar4 base=as_type<uchar4>(meta.x);
         uint raw_tiles=meta.y;
         float sums[4]={};
+        #pragma clang loop unroll_count(3)
         for (uint block=0;block<18;++block) {
             uint tile=(group/4)*73+1+block*4+group%4;
             uint d=block*128+lane*4;
