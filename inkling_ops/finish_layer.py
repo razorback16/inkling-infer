@@ -24,6 +24,10 @@ def decode(layer, hidden_states, block_states, *, cache=None, conv_mask=None, me
             or (not fused_down and getattr(down, "mode", None) != "mxfp8")):
         return _reference(layer, hidden_states, block_states, cache=cache, conv_mask=conv_mask, messages=messages)
     history = list(cache[1].cache)
+    if (type(layer.post_attention_convolution) is layers.ShortConvolution
+            and layer.post_attention_convolution.kernel_size==4
+            and history[2] is not None and history[2].shape==(1,3,2304)):
+        cache[0].output_filter = (layer,history[2],hidden_states)
     normalized_inputs = (depth_norm.attention_inputs(layer,block_states,hidden_states)
                          if messages is None and layer.attention_input is not None else None)
     if normalized_inputs is not None:
@@ -41,7 +45,11 @@ def decode(layer, hidden_states, block_states, *, cache=None, conv_mask=None, me
         block = normed[None]
         block_states = block if block_states is None else mx.concatenate((block_states, block))
     prenormalized = False
-    if type(layer.post_attention_convolution) is layers.ShortConvolution and layer.post_attention_convolution.kernel_size == 4:
+    if isinstance(attention,tuple):
+        residual,history[2],squares = attention
+        prenormalized = messages is None and type(layer.post_attention_layernorm) is nn.RMSNorm
+        mixed=depth_norm.from_projection(layer,block_states,residual,squares,prenormalized)
+    elif type(layer.post_attention_convolution) is layers.ShortConvolution and layer.post_attention_convolution.kernel_size == 4:
         prenormalized = messages is None and type(layer.post_attention_layernorm) is nn.RMSNorm
         mixed, residual, history[2] = depth_norm.post_attention(
             layer,block_states,attention,history[2],hidden_states,normalize=prenormalized)

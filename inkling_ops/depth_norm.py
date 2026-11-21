@@ -181,3 +181,27 @@ def post_attention(layer, blocks, attention, history, hidden, normalize=False):
         output_shapes=[(1,1,1,2304), hidden.shape, hidden.shape, (1,4,2304)],
         output_dtypes=[attention.dtype if normalize else mx.float32]+[mx.float32]*3)
     return mixed, residual, window
+
+def make_projected(normalize):
+    source = normalized_source() if normalize else _source.replace("FILTER","")
+    source = source.replace("sum += v*v;", "").replace("sum = simd_sum(sum);","sum = simd_sum(squares[tid]);",1)
+    source = source.replace("if (!query) normalized[d] = norm[d];","")
+    inputs = ["x","blocks","queries","squares"]
+    if normalize:
+        inputs.extend(["weights","eps"])
+    return mx.fast.metal_kernel(name="inkling_projected_depth_norm" if normalize else "inkling_projected_depth",
+                                input_names=inputs,output_names=["mixed"],source=source)
+
+
+_projected = (make_projected(False),make_projected(True))
+
+
+def from_projection(layer, blocks, residual, squares, normalize):
+    inputs = [residual,blocks,layer.mlp_input.query,squares]
+    if normalize:
+        norm=layer.post_attention_layernorm
+        inputs.extend([norm.weight,scalar(norm.eps)])
+    return _projected[normalize](inputs=inputs,template=[("K",blocks.shape[0])],
+                                 grid=(576,1,1),threadgroup=(576,1,1),
+                                 output_shapes=[(1,1,1,2304)],
+                                 output_dtypes=[mx.bfloat16 if normalize else mx.float32])[0]

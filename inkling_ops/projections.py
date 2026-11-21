@@ -76,7 +76,10 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
     if (kv is not None and 1024 <= k.shape[2] <= 8192 and q.shape[-1] == 128
             and type(layer.rel_logits_proj) is layers.RelativeLogits and rel.dtype == q.dtype == mx.bfloat16):
         from . import grouped_attn
-        return layer.o_proj(grouped_attn.attend(layer,q,k,v,rel,sinks,kv,gate))
+        features=grouped_attn.attend(layer,q,k,v,rel,sinks,kv,gate)
+        from . import filtered_output
+        out=filtered_output.apply(layer.o_proj,features,getattr(kv,"output_filter",None))
+        return layer.o_proj(features) if out is None else out
     if kv is not None and type(layer.rel_logits_proj) is layers.RelativeLogits and rel.dtype == q.dtype:
         output = rel_mask.attend(layer, q, k, v, rel, sinks, kv)
     else:
