@@ -1,6 +1,5 @@
 """Trace the recurrent layer visits together for one-token fixed-capacity decode."""
 import weakref
-from functools import lru_cache
 
 import mlx.core as mx
 from .parameter_guard import CapturedParameters
@@ -11,34 +10,6 @@ from .compiled_ring import _DeviceRing
 from . import prepared_bank, block_lookahead
 
 _reference = TextModel._run_loop
-
-
-@lru_cache(maxsize=20)
-def _ring_pack(count):
-    names = [f"row{i}" for i in range(count)]
-    cases = "".join(f"case {i}: src = {name}; break;\n" for i, name in enumerate(names[1:], 1))
-    return mx.fast.metal_kernel(
-        name=f"inkling_pack_{count}_ring_updates", input_names=names, output_names=["packed"],
-        source="""
-            uint row=threadgroup_position_in_grid.y, word=thread_position_in_grid.x;
-            device const bfloat16_t *src=row0;
-            switch (row) { CASES }
-            ((device uint2*)packed)[row*512+word]=((device const uint2*)src)[word];
-        """.replace("CASES", cases),
-    )
-
-
-def _pack_updates(rows):
-    if any(r.shape != (1,16,1,128) or r.dtype != mx.bfloat16 for r in rows):
-        return mx.concatenate(rows, axis=0)
-    batches = []
-    for start in range(0,len(rows),20):
-        group = rows[start:start+20]
-        count = len(group)
-        batch, = _ring_pack(count)(inputs=group, grid=(512,count,1), threadgroup=(128,1,1),
-                                   output_shapes=[(count,16,1,128)], output_dtypes=[mx.bfloat16])
-        batches.append(batch)
-    return batches[0] if len(batches)==1 else mx.concatenate(batches, axis=0)
 
 
 def _compile(model):
@@ -83,7 +54,7 @@ def _compile(model):
                 if value is None:
                     value = mx.take(ring.packed,ring.write_coordinates[0],axis=2)
                 updates.append(value)
-            slab = mx.slice_update(slab, _pack_updates(updates),
+            slab = mx.slice_update(slab, mx.concatenate(updates,axis=0),
                                    grouped[0].write_coordinates[0], axes=(2,))
         return result, slab, [
             (tuple(c[1].cache),) if getattr(c[0],"grouped",False) else
