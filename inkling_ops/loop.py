@@ -13,8 +13,6 @@ _reference = TextModel._run_loop
 
 
 def _compile(model):
-    from . import expert_gate
-    expert_gate.prepare(model)
     groups=block_lookahead.prepare(model)
     owner = weakref.ref(model)
 
