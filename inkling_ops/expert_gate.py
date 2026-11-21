@@ -24,32 +24,44 @@ _kernel = mx.fast.metal_kernel(
         uint lane = thread_index_in_simdgroup;
         uint slot = threadgroup_position_in_grid.y;
         uint expert = ids[slot];
-        uint first = threadgroup_position_in_grid.x * 16 + simdgroup_index_in_threadgroup * 4;
-        float sums[4] = {};
-        for (uint word = lane; word < 288; word += 32) {
-            float v[8];
-            for (uint i = 0; i < 8; ++i) v[i] = float(x[word * 8 + i]);
-            for (uint r = 0; r < 4; ++r) {
-                uint row = expert * 2304 + first + r;
-                uint bits = packed[row * 288 + word];
-                float partial = 0.f;
-                for (uint i = 0; i < 8; i += 4) {
-                    partial += v[i] * levels[bits & 15] + v[i+1] * levels[(bits >> 4) & 15]
-                             + v[i+2] * levels[(bits >> 8) & 15] + v[i+3] * levels[(bits >> 12) & 15];
-                    bits >>= 16;
+        uint first = threadgroup_position_in_grid.x*16 + simdgroup_index_in_threadgroup*4 + (lane/16)*2;
+        float sums[2][2] = {};
+        for (uint word=2*(lane%16);word<288;word+=32) {
+            float v[2][8];
+            for (uint part=0;part<2;++part)
+                for (uint i=0;i<8;++i) v[part][i]=float(x[(word+part)*8+i]);
+            for (uint r=0;r<2;++r) {
+                uint row=expert*2304+first+r;
+                uint2 pair=*(device const uint2*)(packed+row*288+word);
+                float scale=fp8_scale(scales[row*144+word/2]);
+                for (uint part=0;part<2;++part) {
+                    uint bits=pair[part];
+                    float partial=0.f;
+                    for (uint i=0;i<8;i+=4) {
+                        partial += v[part][i]*levels[bits&15] + v[part][i+1]*levels[(bits>>4)&15]
+                                 + v[part][i+2]*levels[(bits>>8)&15] + v[part][i+3]*levels[(bits>>12)&15];
+                        bits>>=16;
+                    }
+                    float term=partial*scale;
+                    sums[part][r]+=term;
                 }
-                float term = partial * fp8_scale(scales[row * 144 + word / 2]);
-                sums[r] += term;
             }
         }
-        for (uint i = 0; i < 4; ++i) sums[i] = simd_sum(sums[i]);
-        if (lane < 2) {
-            float scale = amax[expert] / 2688.f;
-            ushort g = as_type<ushort>(bfloat16_t(sums[lane*2]*scale));
-            ushort u = as_type<ushort>(bfloat16_t(sums[lane*2+1]*scale));
+        float dots[2];
+        for (uint r=0;r<2;++r) {
+            float even0=simd_shuffle(sums[0][r],lane/2), odd0=simd_shuffle(sums[1][r],lane/2);
+            float even1=simd_shuffle(sums[0][r],16+lane/2), odd1=simd_shuffle(sums[1][r],16+lane/2);
+            float left=simd_sum((lane&1) ? odd0 : even0);
+            float right=simd_sum((lane&1) ? odd1 : even1);
+            dots[r]=lane<16 ? left : right;
+        }
+        if (!(lane%16)) {
+            float scale=amax[expert]/2688.f;
+            ushort g=as_type<ushort>(bfloat16_t(dots[0]*scale));
+            ushort u=as_type<ushort>(bfloat16_t(dots[1]*scale));
             uint gi=((uint(g)&32767)<<2)|((g>>15)<<1);
             uint ui=((uint(u)&32767)<<2)|((u>>15)<<1);
-            out[slot*1152+first/2+lane]=bfloat16_t(activation[gi]*activation[ui+1]);
+            out[slot*1152+first/2]=bfloat16_t(activation[gi]*activation[ui+1]);
         }
     """,
 )
