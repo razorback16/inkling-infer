@@ -79,7 +79,6 @@ _select = mx.fast.metal_kernel(
         uint warp=simdgroup_index_in_threadgroup;
         threadgroup float biased[128], scores[128], selected[8];
         threadgroup uint special[4];
-        threadgroup float pair_max[8];
         if (tid<128) {
             float x=logits[tid];
             float p=1.f/(1.f+precise::exp(abs(x)));
@@ -87,11 +86,6 @@ _select = mx.fast.metal_kernel(
             scores[tid]=score;
             float b=score+float(bias[tid]);
             biased[tid]=b;
-            float peak = max(b,simd_shuffle_xor(b,8));
-            peak=max(peak,simd_shuffle_xor(peak,4));
-            peak=max(peak,simd_shuffle_xor(peak,2));
-            peak=max(peak,simd_shuffle_xor(peak,1));
-            if (!(lane&15)) pair_max[tid/16]=peak;
             bool nonfinite=simd_any(!isfinite(b));
             if (!lane) special[warp]=nonfinite;
         }
@@ -118,14 +112,11 @@ _select = mx.fast.metal_kernel(
                 }
             }
         } else {
-            // Every disjoint group supplies a candidate at or above this bound.
-            float cutoff=simd_min(pair_max[lane&7]);
             float other[4];
             for (uint j=0;j<4;++j) other[j]=biased[lane+32*j];
             for (uint i=0;i<4;++i) {
                 uint e=warp+32*i;
                 float query=simd_shuffle(other[i],warp);
-                if (query<cutoff) continue;
                 uint ahead=0;
                 for (uint j=0;j<4;++j)
                     ahead+=uint(other[j]>query || (other[j]==query && lane+32*j<e));
