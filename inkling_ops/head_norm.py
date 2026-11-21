@@ -71,6 +71,35 @@ _filtered = mx.fast.metal_kernel(
 
 
 
+_dynamic_filter = """
+            if (key || val) {
+                auto hist=key ? kh : vh;
+                auto fixed=key ? kw : vw;
+                auto coefs=key ? kd : vd;
+                auto window=key ? k_window : v_window;
+                float sum=0;
+                for (uint lag=0;lag<4;++lag) {
+                    float v=x;
+                    if (lag) {
+                        uint at=(3-lag)*KV*D+i;
+                        v=hist[at];
+                        window[at]=v;
+                    }
+                    float weight=float(fixed[lag*KV*D+i])+float(coefs[local_head*4+lag]);
+                    volatile float product=v*weight;
+                    sum+=product;
+                }
+                window[3*KV*D+i]=x;
+                x=float(T((sum+x)/3.f));
+            }
+"""
+_dynamic = mx.fast.metal_kernel(
+    name="inkling_head_norm_dynamic_pair",input_names=_inputs+["kh","vh","kw","vw","kd","vd"],
+    output_names=_outputs+["k_window","v_window"],
+    source=_source.replace("            states[d",_dynamic_filter+"            states[d",1),
+)
+
+
 def normalize(layer, query, key, value, relative, return_pair=False, filters=None):
     heads, kv, dim = layer.num_heads, layer.num_key_value_heads, layer.head_dim
     rel = relative.shape[-1] // heads
@@ -84,8 +113,11 @@ def normalize(layer, query, key, value, relative, return_pair=False, filters=Non
         inputs.extend(filters)
         shapes.extend([(1,4,kv*dim)] * 2)
         types.extend([mx.float32] * 2)
-        template.append(("W", filters[2].dtype))
-        kernel = _filtered
+        if len(filters)==6:
+            kernel=_dynamic
+        else:
+            template.append(("W", filters[2].dtype))
+            kernel=_filtered
     q, pair, r, *windows = kernel(
         inputs=inputs, template=template, grid=(32*(2*heads+2*kv),1,1), threadgroup=(32,1,1),
         output_shapes=shapes, output_dtypes=types)
