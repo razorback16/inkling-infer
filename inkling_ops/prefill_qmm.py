@@ -63,7 +63,7 @@ def kernel():
         contents=(root/name).read_text().replace("#pragma once","")
         return re.sub(r'^#include "([^"]+)"',lambda m:include(m[1]),contents,flags=re.M)
     return mx.fast.metal_kernel(
-        name="inkling_prompt_lookup_gemm",input_names=["x","w","scales","table","tiles","activation","token_rows"],
+        name="inkling_prompt_lookup_gemm",input_names=["x","w","scales","table","tiles","activation","token_rows","original_slots"],
         output_names=["out"],header=include(mma),source="""
             uint tile=threadgroup_position_in_grid.y, row=tiles[3*tile], expert=tiles[3*tile+1];
             uint count=tiles[3*tile+2];
@@ -105,6 +105,15 @@ def kernel():
                         out[(row+r)*(N/2)+c/2]=bfloat16_t(activation[gi]*activation[ui+1]);
                     }
                 }
+            } else if (ROUTE_LAYOUT) {
+                for (short i=0;i<2;++i) {
+                    uint r=mma.sm+i*16;
+                    if (r>=count) continue;
+                    uint original=original_slots[row+r], token=original/8, slot=original%8;
+                    uint base=((token*(N/64)+column/64)*8+slot)*64;
+                    for (short j=0;j<4;++j)
+                        *(device bfloat2*)(out+base+mma.sn+j*16)=bfloat2(mma.Ctile.frag_at(i,j));
+                }
             } else {
                 auto result=out+row*N+column;
                 if (count==32) mma.store_result(result,N);
@@ -121,7 +130,7 @@ def applicable(proj):
             and proj.weight.shape[0]==128 and proj.input_dims%32==0 and proj.output_dims%64==0)
 
 
-def project(proj, x, tiles, activation=None, token_rows=None):
+def project(proj, x, tiles, activation=None, token_rows=None, original_slots=None):
     scale=proj.global_scale
     saved=getattr(proj,"_prompt_coefficients",None)
     if saved is None or saved[0] is not scale:
@@ -135,7 +144,7 @@ def project(proj, x, tiles, activation=None, token_rows=None):
     width=n//2 if activation is not None else n
     m=x.shape[0] if token_rows is None else token_rows.size
     return kernel()(inputs=[x,proj.weight,proj.scales,saved[1],tiles,x if activation is None else activation,
-                            tiles if token_rows is None else token_rows],
-                    template=[("K",proj.input_dims),("N",n),("GATED",activation is not None),("GATHER",token_rows is not None)],
+                            tiles if token_rows is None else token_rows,tiles if original_slots is None else original_slots],
+                    template=[("K",proj.input_dims),("N",n),("GATED",activation is not None),("GATHER",token_rows is not None),("ROUTE_LAYOUT",original_slots is not None)],
                     grid=(n//64*128,tiles.shape[0],1),threadgroup=(128,1,1),
                     output_shapes=[(m,1,width)],output_dtypes=[x.dtype])[0]

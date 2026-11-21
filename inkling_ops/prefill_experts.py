@@ -22,8 +22,8 @@ _mix_sorted = mx.fast.metal_kernel(
         float4 sum=0;
         for (uint slot=0;slot<8;++slot) {
             uint pos=token*8+slot;
-            uint row=inverse[pos];
-            float4 state=float4(*(device const bfloat4*)(states+row*2304+col));
+            uint addr=ROUTE_LAYOUT ? ((token*36+col/64)*8+slot)*64+col%64 : inverse[pos]*2304+col;
+            float4 state=float4(*(device const bfloat4*)(states+addr));
             sum+=state*float(weights[pos]);
         }
         *(device bfloat4*)(out+token*2304+col)=bfloat4(sum);
@@ -74,10 +74,10 @@ def mix(layer, x):
                              threadgroup=(128,1,1),output_shapes=[shape],output_dtypes=[gated.dtype])[0]
         else:
             active=experts.act_fn(gated[...,0::2],gated[...,1::2])
-    results=(prefill_qmm.project(experts.down_proj,active,tiles) if custom
+    results=(prefill_qmm.project(experts.down_proj,active,tiles,original_slots=order) if custom
              else experts.down_proj(active,sorted_ids,sorted_indices=True))
     return _mix_sorted(
-        inputs=[results, inverse, weights], grid=(576, x.shape[1], 1),
+        inputs=[results, inverse, weights], template=[("ROUTE_LAYOUT",custom)], grid=(576, x.shape[1], 1),
         threadgroup=(64, 1, 1), output_shapes=[x.shape], output_dtypes=[x.dtype],
     )[0]
 
