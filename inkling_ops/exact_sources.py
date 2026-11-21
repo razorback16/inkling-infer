@@ -10,7 +10,7 @@ def sanitize(model, weights):
     arrays = _reference(model, weights)
     modules = dict(model.named_modules())
     for name, raw in weights.items():
-        if raw.dtype != mx.bfloat16 or not name.endswith((".forget_weight", ".gain_weight",
+        if raw.dtype != mx.bfloat16 or not name.endswith((".mlp.gate.weight", ".forget_weight", ".gain_weight",
                 ".forget_gate_proj.weight", ".message_gate_proj.weight")):
             continue
         path = checkpoint._rename(name) if name.startswith("model.llm.") else name

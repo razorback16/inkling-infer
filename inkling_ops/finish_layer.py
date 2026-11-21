@@ -2,7 +2,7 @@
 import mlx.core as mx
 from mlx_lm.models.inkling2 import layers
 
-from . import depth_norm, expert_gate
+from . import depth_norm, expert_gate, router
 
 _reference = layers.DecoderLayer.__call__
 
@@ -38,8 +38,7 @@ def decode(layer, hidden_states, block_states, *, cache=None, conv_mask=None, me
     x = mixed[...,0,:]
     if messages is not None:
         x = layer.mlp_message_gate(x,messages[...,3,:])
-    x = layer.post_attention_layernorm(x).astype(hidden_states.dtype)
-    selected, routing = moe.gate(x)
+    x, selected, routing = router.route(layer, x, hidden_states.dtype)
     active = expert_gate.gated_activation(moe.experts,x,selected)
     down = moe.experts.down_proj
     w = post.conv1d.weight
