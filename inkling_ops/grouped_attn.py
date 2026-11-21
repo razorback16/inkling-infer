@@ -16,29 +16,60 @@ _partial = mx.fast.metal_kernel(
         float peak = tile ? -FLT_MAX : float(sinks[head]);
         float total = tile ? 0.f : 1.f;
         float4 accum = 0;
-        for (uint chunk=0; chunk<S; chunk+=4096) {
-            int pos = chunk + tile + lane*128;
-            int dist = slot[0]-1-pos;
-            if (dist < 0) dist += S;
+        if (S==1024 && WINDOW==1024 && end[0]>=1024) {
             float bias = 0;
-            if (pos >= S || dist >= end[0] || (WINDOW && dist >= WINDOW)) bias = -INFINITY;
-            else if (dist < R) {
-                for (uint j=0; j<WIDTH; ++j)
-                    bias = fma(float(rel[head*WIDTH+j]), float(w[SWIZZLED ? ((dist%128)*WIDTH+j)*(R/128)+dist/128 : j*R+dist]), bias);
-                bias = float(T(bias));
+            if (lane < 8) {
+                uint dist = uint(slot[0]-1-int(tile+128*lane)) & 1023u;
+                if (dist<R) {
+                    for (uint j=0; j<WIDTH; ++j)
+                        bias = fma(float(rel[head*WIDTH+j]),float(w[SWIZZLED ? ((dist%128)*WIDTH+j)*(R/128)+dist/128 : j*R+dist]),bias);
+                    bias = float(T(bias));
+                }
             }
-            for (uint i=0; i<32 && chunk+tile+i*128<S; ++i) {
-                float pb = simd_shuffle(bias,i);
-                if (pb == -INFINITY) continue;
-                uint p = ((kv*S+chunk+tile+i*128)*128)+d;
-                float score = 0;
-                for (uint j=0; j<4; ++j) score += query[j]*float(k[p+j]);
-                score = simd_sum(score)+pb;
-                float top = max(peak,score);
-                float a = fast::exp(peak-top), b = fast::exp(score-top);
-                total = total*a+b;
-                for (uint j=0; j<4; ++j) accum[j] = accum[j]*a+b*float(v[p+j]);
-                peak = top;
+            float scores[8];
+            #pragma clang loop unroll(full)
+            for (uint pos=0; pos<8; ++pos) {
+                uint at=((kv*1024+tile+pos*128)*128)+d;
+                float4 key=float4(*(device const bfloat4*)(k+at));
+                float score=0;
+                for (uint j=0; j<4; ++j) score += query[j]*key[j];
+                scores[pos]=simd_sum(score)+simd_shuffle(bias,pos);
+            }
+            #pragma clang loop unroll(full)
+            for (uint pos=0; pos<8; ++pos) {
+                uint at=((kv*1024+tile+pos*128)*128)+d;
+                float4 value=float4(*(device const bfloat4*)(v+at));
+                float score=scores[pos], top=max(peak,score);
+                float a=fast::exp(peak-top), b=fast::exp(score-top);
+                total=total*a+b;
+                for (uint j=0; j<4; ++j) accum[j]=accum[j]*a+b*value[j];
+                peak=top;
+            }
+        } else {
+            for (uint chunk=0; chunk<S; chunk+=4096) {
+                int pos = chunk + tile + lane*128;
+                int dist = slot[0]-1-pos;
+                if (dist < 0) dist += S;
+                float bias = 0;
+                if (pos >= S || dist >= end[0] || (WINDOW && dist >= WINDOW)) bias = -INFINITY;
+                else if (dist < R) {
+                    for (uint j=0; j<WIDTH; ++j)
+                        bias = fma(float(rel[head*WIDTH+j]), float(w[SWIZZLED ? ((dist%128)*WIDTH+j)*(R/128)+dist/128 : j*R+dist]), bias);
+                    bias = float(T(bias));
+                }
+                for (uint i=0; i<32 && chunk+tile+i*128<S; ++i) {
+                    float pb = simd_shuffle(bias,i);
+                    if (pb == -INFINITY) continue;
+                    uint p = ((kv*S+chunk+tile+i*128)*128)+d;
+                    float score = 0;
+                    for (uint j=0; j<4; ++j) score += query[j]*float(k[p+j]);
+                    score = simd_sum(score)+pb;
+                    float top = max(peak,score);
+                    float a = fast::exp(peak-top), b = fast::exp(score-top);
+                    total = total*a+b;
+                    for (uint j=0; j<4; ++j) accum[j] = accum[j]*a+b*float(v[p+j]);
+                    peak = top;
+                }
             }
         }
         for (uint j=0; j<4; ++j) partials[addr*128+d+j] = T(accum[j]);
