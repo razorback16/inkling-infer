@@ -1,0 +1,5 @@
+#!/bin/sh
+export ANTHROPIC_BASE_URL=http://127.0.0.1:4010
+export ANTHROPIC_AUTH_TOKEN="$(cat "$(dirname "$0")/.proxy-key")"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=inkling ANTHROPIC_DEFAULT_SONNET_MODEL=inkling ANTHROPIC_DEFAULT_OPUS_MODEL=inkling
+exec claude --model inkling "$@"

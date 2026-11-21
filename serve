@@ -1,0 +1,12 @@
+#!/bin/bash
+set -eu
+cd "$(dirname "$0")"
+export LITELLM_MASTER_KEY="$(cat .proxy-key)"
+.venv/bin/python backend.py --chat-template-args '{"reasoning_effort":"low"}' --model thinkingmachines/Inkling-2-Mini --host 127.0.0.1 --port 8089 &
+backend=$!
+trap 'kill "$backend" 2>/dev/null || true' EXIT
+while ! curl -fsS http://127.0.0.1:8089/v1/models >/dev/null 2>&1; do
+  kill -0 "$backend" || exit 1
+  sleep 1
+done
+.venv/bin/litellm --config proxy.yaml --host 127.0.0.1 --port 4010

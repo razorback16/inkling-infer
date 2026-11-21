@@ -1,0 +1,4 @@
+.venv/
+.proxy-key
+__pycache__/
+*.log
