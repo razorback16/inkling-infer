@@ -35,19 +35,20 @@ _pack_rows = mx.fast.metal_kernel(
     """,
 )
 DOT=_STRIPE + """
-        uint format=formats[row];
+        device const uint *group=payload+(row/stripe)*(stripe*(COLS/128)*64+32);
+        uint format=group[row%stripe];
         ushort base=ushort(format>>24)<<8;
         float dot=0;
         for (uint tile=0;tile<COLS/128;++tile) {
-            uint d=tile*128+lane*4, addr=((row/stripe*(COLS/128)+tile)*stripe+row%stripe)*64;
+            uint d=tile*128+lane*4, addr=32+(tile*stripe+row%stripe)*64;
             float4 a=float4(*(device const bfloat4*)(x+d));
             ushort4 bits;
             if (format&(1u<<tile)) {
-                bits=*(device const ushort4*)(payload+addr+lane*2);
+                bits=*(device const ushort4*)(group+addr+lane*2);
             } else {
-                ushort h=((device const ushort*)(payload+addr+32))[lane];
+                ushort h=((device const ushort*)(group+addr+32))[lane];
                 ushort4 n=ushort4(h,h>>4,h>>8,h>>12)&15;
-                ushort4 code=(n<<8)|ushort4(as_type<uchar4>(payload[addr+lane]));
+                ushort4 code=(n<<8)|ushort4(as_type<uchar4>(group[addr+lane]));
                 ushort4 rot=code+base;
                 bits=(rot>>1)|(rot<<15);
             }
@@ -60,12 +61,15 @@ DOT=_STRIPE + """
 
 def encode(w):
     rows,cols=w.shape
-    return _pack_rows(inputs=[w],template=[("COLS",cols)],
+    payload,formats = _pack_rows(inputs=[w],template=[("COLS",cols)],
                       grid=(rows*32,1,1),threadgroup=(128,1,1),
                       output_shapes=[(rows,cols//128,64),(rows,)],output_dtypes=[mx.uint32,mx.uint32])
+    stripe = 16 if cols==3072 else 2 if cols==2304 else 4
+    headers = mx.pad(formats.reshape(-1,stripe), [(0,0),(0,32-stripe)])
+    return (mx.concatenate((headers,payload.reshape(-1,stripe*(cols//128)*64)),axis=1),)
 
 
-_matvec=mx.fast.metal_kernel(name="inkling_single_tile_matvec",input_names=["x","payload","formats"],
+_matvec=mx.fast.metal_kernel(name="inkling_single_tile_matvec",input_names=["x","payload"],
     output_names=["out"],source="""
         uint lane=thread_index_in_simdgroup,row=thread_position_in_grid.x/32;
     """ + DOT + """
