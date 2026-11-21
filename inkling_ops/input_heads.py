@@ -5,9 +5,7 @@ from mlx_lm.models.inkling2 import layers
 
 _full = layers.FullDecoderLayer._self_attention
 _sliding = layers.SlidingDecoderLayer._self_attention
-_kernel = mx.fast.metal_kernel(
-    name="inkling_three_input_norm", input_names=["q","k","v","qw","kw","vw","eps"], output_names=["qo","ko","vo"],
-    source="""
+_source = """
         uint h = threadgroup_position_in_grid.x;
         uint tid = thread_position_in_threadgroup.x, lane = thread_index_in_simdgroup;
         uint sg = simdgroup_index_in_threadgroup;
@@ -31,8 +29,47 @@ _kernel = mx.fast.metal_kernel(
             else if (h==1) ko[d] = T(x*float(kw[d]));
             else vo[d] = T(x*float(vw[d]));
         }
-    """,
+    """
+_kernel = mx.fast.metal_kernel(
+    name="inkling_three_input_norm", input_names=["q","k","v","qw","kw","vw","eps"], output_names=["qo","ko","vo"],
+    source=_source,
 )
+_score = """
+        if (partition<3) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            threadgroup float partial[16][4];
+            uint base=partition*8+(sg/8)*4;
+            if (tid<512) {
+                float dots[4]={};
+                for (uint col=(tid%256)*4;col<2304;col+=1024)
+                    for (uint j=0;j<4;++j)
+                        for (uint r=0;r<4;++r)
+                            dots[r]=fma(norm_query[col+j],float(sink_w[(base+r)*2304+col+j]),dots[r]);
+                for (uint r=0;r<4;++r) {
+                    float val=dots[r];
+                    for (ushort step=16;step;step>>=1) val+=simd_shuffle_down(val,step);
+                    if (!lane) partial[sg][r]=val;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (tid<8) {
+                uint start=(tid/4)*8, r=tid%4;
+                float sum=partial[start][r];
+                for (uint i=1;i<8;++i) sum+=partial[start+i][r];
+                sinks[partition*8+tid]=bfloat16_t(sum);
+            }
+        }
+"""
+_with_sink=mx.fast.metal_kernel(
+    name="inkling_three_input_norm_sinks",
+    input_names=["q","k","v","qw","kw","vw","eps","sink_w"],output_names=["qo","ko","vo","sinks"],
+    source=_source.replace("uint h = threadgroup_position_in_grid.x;",
+        "uint partition=threadgroup_position_in_grid.x,h=partition<3 ? 0 : partition-2; "
+        "threadgroup float norm_query[2304];").replace(
+        "if (h==0) qo[d] = T(x*float(qw[d]));",
+        "if (h==0) { T val=T(x*float(qw[d])); norm_query[d]=float(val); if (!partition) qo[d]=val; }")+_score,
+)
+
 
 
 def attention(layer, x, inputs, cache, conv_states, conv_mask, messages):
@@ -58,6 +95,16 @@ def attention(layer, x, inputs, cache, conv_states, conv_mask, messages):
             states = layer._mix_messages(states,messages)
     weights = [n.weight for n in norms]
     from mlx_lm.kernels.common import scalar
+    from . import projections
+    attn=layer.self_attn
+    sink=attn.sink_proj
+    if (getattr(attn.__call__,"__func__",None) is projections.attend and type(sink) is nn.Linear
+            and "bias" not in sink and sink.weight.shape==(24,2304) and sink.weight.dtype==x.dtype==mx.bfloat16):
+        q,k,v,sinks=_with_sink(inputs=[*states,*weights,scalar(norms[0].eps),sink.weight],
+                               template=[("A",mx.result_type(states[0],weights[0])),("T",x.dtype)],
+                               grid=(5*576,1,1),threadgroup=(576,1,1),
+                               output_shapes=[x.shape]*3+[(1,1,24)],output_dtypes=[x.dtype]*4)
+        return attn(q,k,v,cache=cache,conv_states=conv_states,conv_mask=conv_mask,sinks=sinks)
     q,k,v = _kernel(inputs=[*states,*weights,scalar(norms[0].eps)],
                     template=[("A",mx.result_type(states[0],weights[0])),("T",x.dtype)],
                     grid=(3*576,1,1),threadgroup=(576,1,1),
