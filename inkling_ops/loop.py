@@ -17,8 +17,6 @@ def _compile(model):
     filtered_output.prepare(model)
     from .projections import prepare_query_weights
     prepare_query_weights(model)
-    from . import expert_gate
-    expert_gate.prepare(model)
     groups=block_lookahead.prepare(model)
     owner = weakref.ref(model)
 
