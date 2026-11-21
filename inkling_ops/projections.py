@@ -4,6 +4,7 @@ import mlx.nn as nn
 from mlx_lm.models.inkling2 import layers
 
 from .head_norm import normalize
+from . import rel_mask
 
 _sliding = layers.SlidingAttention.__call__
 _full = layers.FullAttention.__call__
@@ -61,11 +62,14 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
         tau = 1.0 + layer.log_scaling_alpha * mx.log(mx.maximum((pos + 1) / layer.log_scaling_n_floor, 1.0))
         query = (query.astype(mx.float32) * tau[..., None, None]).astype(query.dtype)
         rel = (rel.astype(mx.float32) * tau[..., None, None]).astype(rel.dtype)
-    bias = layer.rel_logits_proj(rel)
     q, k, v = (x.transpose(0, 2, 1, 3) for x in (query, key, value))
     if kv is not None:
         k, v = kv.update_and_fetch(k, v)
-    output = layer._attention(q, k, v, bias, sinks, kv).reshape(1, 1, -1).astype(mx.float32)
+    if kv is not None and type(layer.rel_logits_proj) is layers.RelativeLogits and rel.dtype == q.dtype:
+        output = rel_mask.attend(layer, q, k, v, rel, sinks, kv)
+    else:
+        output = layer._attention(q, k, v, layer.rel_logits_proj(rel), sinks, kv)
+    output = output.reshape(1, 1, -1).astype(mx.float32)
     return layer.o_proj((output * mx.sigmoid(gate.astype(mx.float32))).astype(gate.dtype))
 
 
