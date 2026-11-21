@@ -13,8 +13,6 @@ _reference = TextModel._run_loop
 
 
 def _compile(model):
-    from . import filtered_output
-    filtered_output.prepare(model)
     owner = weakref.ref(model)
 
     @mx.compile
