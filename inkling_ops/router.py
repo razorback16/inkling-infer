@@ -152,9 +152,7 @@ _select = mx.fast.metal_kernel(
 )
 
 
-_rank_pairs = mx.fast.metal_kernel(
-    name="inkling_rank_probability_pairs",input_names=["logits","eps","scale"],
-    output_names=["inds","weights"],source="""
+_pair_rank_source = """
         uint tid=thread_position_in_threadgroup.x, lane=thread_index_in_simdgroup;
         uint warp=simdgroup_index_in_threadgroup;
         threadgroup float selected[8];
@@ -204,11 +202,28 @@ _rank_pairs = mx.fast.metal_kernel(
             for (uint i=0;i<8;++i) total=selected[i]+total;
             weights[tid]=selected[tid]/(total+eps)*scale;
         }
-    """,
-)
+    """
+
+_pair_inputs=["logits","eps","scale"]
+_rank_pairs=mx.fast.metal_kernel(name="inkling_rank_probability_pairs",input_names=_pair_inputs,
+                                 output_names=["inds","weights"],source=_pair_rank_source)
+_packed_rank_source=_pair_rank_source.replace(
+    "threadgroup float selected[8];","threadgroup float selected[8]; threadgroup uint picked[8];").replace(
+    "inds[k]=winner;", "inds[k]=winner; picked[k]=winner;").replace(
+    "inds[rank]=e;", "inds[rank]=e; picked[rank]=e;").replace(
+    "weights[tid]=selected[tid]/(total+eps)*scale;", """
+    uint e=picked[tid];
+    float probability=selected[tid]/(total+eps)*scale;
+    uint4 entry=uint4(e*2304u*144u,e*2304u*72u,
+                      as_type<uint>(e<128 ? down_scale[e]/2688.f : 0.f),as_type<uint>(probability));
+    ((device uint4*)weights)[tid]=entry;
+    """)
+_rank_for_down=mx.fast.metal_kernel(name="inkling_rank_down_addresses",input_names=_pair_inputs+["down_scale"],
+                                    output_names=["inds","weights"],source=_packed_rank_source)
 
 
-def route(layer, x, dtype, normalized=False, logits=None, squares=None):
+
+def route(layer, x, dtype, normalized=False, logits=None, squares=None, down_scale=None):
     norm, gate = layer.post_attention_layernorm, layer.mlp.gate
     if (type(norm) is not nn.RMSNorm or type(gate) is not layers.TopKRouter
             or x.dtype != (dtype if normalized else mx.float32) or dtype != mx.bfloat16 or gate.weight.shape != (128,2304)):
@@ -229,8 +244,13 @@ def route(layer, x, dtype, normalized=False, logits=None, squares=None):
         kernel = _rank_pairs if paired else _select
         args = [logits] if paired else [logits,gate.e_score_correction_bias]
         args.extend([scalar(layers._ROUTER_SCORE_EPS),scalar(gate.routed_scaling_factor)])
+        packed=paired and down_scale is not None and down_scale.shape==(128,)
+        if packed:
+            kernel=_rank_for_down
+            args.append(down_scale)
         indices, weights = kernel(inputs=args, grid=(1024,1,1),threadgroup=(1024,1,1),
-            output_shapes=[(1,1,8)]*2, output_dtypes=[mx.uint32,mx.float32])
+            output_shapes=[(1,1,8),(8,4) if packed else (1,1,8)],
+            output_dtypes=[mx.uint32,mx.uint32 if packed else mx.float32])
     else:
         indices, weights = layers.expert_routing(
             logits, gate.e_score_correction_bias, top_k=gate.top_k, multiplier=1.,
