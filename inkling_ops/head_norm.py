@@ -2,11 +2,26 @@
 import mlx.core as mx
 from mlx_lm.kernels.common import scalar
 
-_kernel = mx.fast.metal_kernel(
-    name="inkling_head_norm",
-    input_names=["q", "k", "v", "r", "qs", "rs", "threshold", "rel_threshold", "eps"],
-    output_names=["qo", "ko", "vo", "ro"],
-    source="""
+_filter = """
+    if (key || val) {
+        uint channels = KV * D;
+        float total = 0;
+        for (uint j = 0; j < 3; ++j) {
+            uint t = j * channels + i;
+            float previous = key ? kh[t] : vh[t];
+            if (key) kout[t] = previous;
+            else vout[t] = previous;
+            float weight = key ? float(kw[i*4+j]) : float(vw[i*4+j]);
+            total = fma(float(W(previous)), weight, total);
+        }
+        if (key) kout[3*channels+i] = x;
+        else vout[3*channels+i] = x;
+        float weight = key ? float(kw[i*4+3]) : float(vw[i*4+3]);
+        total = fma(float(W(x)), weight, total);
+        x = float(T((float(W(total)) + x) * 0.4472135954999579f));
+    }
+"""
+_source = """
         const uint head = threadgroup_position_in_grid.x;
         const uint lane = thread_index_in_simdgroup;
         const bool query = head < H;
@@ -22,6 +37,7 @@ _kernel = mx.fast.metal_kernel(
             uint i = base + d;
             float x = query ? float(q[i]) * float(qs[i]) :
                       key ? float(k[i]) : val ? float(v[i]) : float(r[i]) * float(rs[i]);
+            FILTER
             states[d/32] = x;
             sum += x*x;
         }
@@ -35,19 +51,42 @@ _kernel = mx.fast.metal_kernel(
             else if (val) vo[base+d] = x;
             else ro[base+d] = x;
         }
-    """,
-)
+    """
 
 
-def normalize(layer, query, key, value, relative):
+def _build(filtered):
+    inputs = ["q", "k", "v", "r", "qs", "rs", "threshold", "rel_threshold", "eps"]
+    outputs = ["qo", "ko", "vo", "ro"]
+    if filtered:
+        inputs.extend(["kh", "vh", "kw", "vw"])
+        outputs.extend(["kout", "vout"])
+    return mx.fast.metal_kernel(
+        name="inkling_filtered_head_norm" if filtered else "inkling_head_norm",
+        input_names=inputs, output_names=outputs,
+        source=_source.replace("FILTER", _filter if filtered else ""),
+    )
+
+
+_kernel = _build(False)
+_filtered = _build(True)
+
+
+def normalize(layer, query, key, value, relative, histories=None):
     heads, kv, dim = layer.num_heads, layer.num_key_value_heads, layer.head_dim
     rel = relative.shape[-1] // heads
-    q, k, v, r = _kernel(
-        inputs=[query, key, value, relative, layer.q_l2_clip.scale, layer.rel_l2_clip.scale,
-                scalar(layer.q_l2_clip.threshold), scalar(layer.rel_l2_clip.threshold), scalar(layer.eps)],
-        template=[("T", query.dtype), ("H", heads), ("KV", kv), ("D", dim), ("R", rel)],
-        grid=(32 * (2 * heads + 2 * kv), 1, 1), threadgroup=(32, 1, 1),
-        output_shapes=[(1, 1, heads, dim), (1, 1, kv, dim), (1, 1, kv, dim), (1, 1, heads, rel)],
-        output_dtypes=[query.dtype] * 4,
-    )
-    return q, k, v, r
+    inputs = [query, key, value, relative, layer.q_l2_clip.scale, layer.rel_l2_clip.scale,
+              scalar(layer.q_l2_clip.threshold), scalar(layer.rel_l2_clip.threshold), scalar(layer.eps)]
+    shape = [(1, 1, heads, dim), (1, 1, kv, dim), (1, 1, kv, dim), (1, 1, heads, rel)]
+    types = [query.dtype] * 4
+    template = [("T", query.dtype), ("H", heads), ("KV", kv), ("D", dim), ("R", rel)]
+    kernel = _kernel
+    if histories is not None:
+        kw, vw = layer.k_sconv.conv1d.weight, layer.v_sconv.conv1d.weight
+        inputs.extend([histories[0], histories[1], kw, vw])
+        shape.extend([(1, 4, kv * dim)] * 2)
+        types.extend([mx.float32] * 2)
+        template.append(("W", kw.dtype))
+        kernel = _filtered
+    return kernel(inputs=inputs, template=template,
+                  grid=(32 * (2 * heads + 2 * kv), 1, 1), threadgroup=(32, 1, 1),
+                  output_shapes=shape, output_dtypes=types)
