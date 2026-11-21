@@ -1,6 +1,7 @@
 """Decode interleaved NVFP4 projections and activate each routed expert."""
 from functools import lru_cache
 
+from inkling_ops.fp4_pairs import table
 import mlx.core as mx
 from mlx_lm.models.inkling2 import layers
 
@@ -10,9 +11,7 @@ _kernel = mx.fast.metal_kernel(
     input_names=["x", "ids", "packed", "scales", "amax", "gate_lut", "up_lut"],
     output_names=["out"],
     header="""
-        constant float levels[16] = {
-            0, .5, 1, 1.5, 2, 3, 4, 6, -0., -.5, -1, -1.5, -2, -3, -4, -6
-        };
+        """ + table() + """
         inline float fp8_scale(uchar bits) {
             ushort mag = bits & 127;
             ushort raw = (mag << 7) | (((mag + 1) >> 7) << 14) | ((bits & 128) << 8);
@@ -34,8 +33,10 @@ _kernel = mx.fast.metal_kernel(
                 uint bits = packed[row * 288 + word];
                 float partial = 0.f;
                 for (uint i = 0; i < 8; i += 4) {
-                    partial += v[i] * levels[bits & 15] + v[i+1] * levels[(bits >> 4) & 15]
-                             + v[i+2] * levels[(bits >> 8) & 15] + v[i+3] * levels[(bits >> 12) & 15];
+                    float2 first_pair = float2(nibble_pairs[bits & 255]);
+                    float2 second_pair = float2(nibble_pairs[(bits >> 8) & 255]);
+                    partial += v[i]*first_pair.x + v[i+1]*first_pair.y
+                           + v[i+2]*second_pair.x + v[i+3]*second_pair.y;
                     bits >>= 16;
                 }
                 float term = partial * fp8_scale(scales[row * 144 + word / 2]);

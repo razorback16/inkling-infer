@@ -1,4 +1,5 @@
 """Single-token weighted mixture of eight Inkling expert outputs."""
+from inkling_ops.fp4_pairs import table
 import mlx.core as mx
 from mlx_lm.models.inkling2 import layers
 
@@ -51,9 +52,7 @@ def _make_down(finish):
         name="inkling_finish_nvfp4_layer" if finish else "inkling_nvfp4_down_mix",
         input_names=inputs, output_names=outputs,
     header="""
-        constant float fp4_values[16] = {
-            0, .5, 1, 1.5, 2, 3, 4, 6, -0., -.5, -1, -1.5, -2, -3, -4, -6
-        };
+        """ + table() + """
 
         inline float decode_scale(uchar bits) {
             ushort magnitude = bits & 127;
@@ -80,10 +79,10 @@ def _make_down(finish):
                 uint q = packed[row * 144 + word];
                 float chunk = 0;
                 for (uint k = 0; k < 8; k += 4) {
-                    chunk += x[k] * fp4_values[q & 15]
-                           + x[k+1] * fp4_values[(q >> 4) & 15]
-                           + x[k+2] * fp4_values[(q >> 8) & 15]
-                           + x[k+3] * fp4_values[(q >> 12) & 15];
+                    float2 first_pair = float2(nibble_pairs[q & 255]);
+                    float2 second_pair = float2(nibble_pairs[(q >> 8) & 255]);
+                    chunk += x[k]*first_pair.x + x[k+1]*first_pair.y
+                           + x[k+2]*second_pair.x + x[k+3]*second_pair.y;
                     q >>= 16;
                 }
                 float term = decode_scale(scales[row * 72 + word / 2]) * chunk;
