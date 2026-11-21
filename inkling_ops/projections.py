@@ -81,11 +81,18 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
                  else hidden_states @ packed.T)
     parts = mx.split(projected,boundaries,axis=-1)
     query, relative, gate = parts[:3]
-    sinks = layer.sink_proj(hidden_states)
+    five=None
+    if (full and not same and conv_mask is None and conv_states is not None
+            and all(type(c) is layers.DynamicShortConvolution for c in (layer.k_sconv,layer.v_sconv))):
+        from . import full_projections
+        five=full_projections.apply(layer,hidden_states,key_hidden_states,value_hidden_states)
+    sinks = layer.sink_proj(hidden_states) if five is None else five[4]
     filtered = (None if full or same else
                 filtered_kv.apply(layer,key_hidden_states,value_hidden_states,conv_states,conv_mask))
     if filtered is not None:
         key,value,conv_states[0],conv_states[1] = filtered
+    elif five is not None:
+        key,value=five[:2]
     elif same:
         key, value = parts[3:]
     else:
@@ -120,8 +127,9 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
     pair = None
     if fused_norm or dynamic_norm:
         if dynamic_norm:
-            filters=[*conv_states[:2],layer.k_sconv.static_weight,layer.v_sconv.static_weight,
-                     layer.k_sconv.weight_proj(key_hidden_states),layer.v_sconv.weight_proj(value_hidden_states)]
+            coefs=five[2:4] if five is not None else (
+                layer.k_sconv.weight_proj(key_hidden_states),layer.v_sconv.weight_proj(value_hidden_states))
+            filters=[*conv_states[:2],layer.k_sconv.static_weight,layer.v_sconv.static_weight,*coefs]
         else:
             filters=[*conv_states[:2],layer.k_sconv.conv1d.weight,layer.v_sconv.conv1d.weight]
         query, pair, rel, conv_states[:2] = normalize(layer,query,key,value,relative,filters=filters,position=position)
