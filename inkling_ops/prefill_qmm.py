@@ -84,12 +84,9 @@ def kernel():
                     *(threadgroup bfloat4*)(Xs+xr*40+xc+j)=v;
                 }
                 uint tile=((expert*(N/64)+column/64)*(K/32)+k/32);
-                auto data=w+tile*288;
-                uint scale=((device const uchar*)data)[tid];
-                auto values=table+(expert*256+scale)*16;
-                uint2 codes=((device const uint2*)(data+32))[tid];
-                for (ushort j=0;j<16;++j)
-                    Ws[wr*40+wc+j]=values[(codes[j/8]>>((j%8)*4))&15];
+                auto weight=(device const bfloat4*)(w+tile*2048+wr*32+wc);
+                for (ushort j=0;j<4;++j)
+                    *(threadgroup bfloat4*)(Ws+wr*40+wc+j*4)=weight[j];
                 threadgroup_barrier(mem_flags::mem_threadgroup);
                 mma.mma(Xs,Ws);
             }
@@ -126,26 +123,38 @@ def kernel():
 
 
 def applicable(proj):
-    return (getattr(proj,"mode",None)=="nvfp4" and proj.bits==4 and proj.group_size==16
+    return (mx.device_info()["memory_size"] >= 192*1024**3 and getattr(proj,"mode",None)=="nvfp4" and proj.bits==4 and proj.group_size==16
             and "bias" not in proj and proj.global_scale is not None and proj.global_scale.shape==(128,)
             and proj.weight.dtype==mx.uint32 and proj.scales.dtype==mx.uint8
             and proj.weight.shape[0]==128 and proj.input_dims%32==0 and proj.output_dims%64==0)
 
 
-def packed_tiles(proj):
-    weight,scales=proj.weight,proj.scales
-    saved=getattr(proj,"_prompt_tiles",None)
-    if saved is None or saved[0] is not weight or saved[1] is not scales:
+_expand = mx.fast.metal_kernel(
+    name="inkling_prompt_expand_expert_tiles",input_names=["weight","scales","table"],output_names=["data"],
+    source="""
+        uint index=thread_position_in_grid.x;
+        uint tile=index/256, expert=tile/((N/64)*(K/32));
+        uint nb=(tile/(K/32))%(N/64), kb=tile%(K/32);
+        uint row=expert*N+nb*64+(index%256)/4, word=kb*4+index%4;
+        uint bits=weight[row*(K/8)+word];
+        uint scale=scales[row*(K/16)+word/2];
+        auto values=table+(expert*256+scale)*16;
+        for (uint i=0;i<8;++i) data[index*8+i]=values[(bits>>(i*4))&15];
+    """,
+)
+
+
+def expanded_tiles(proj,table):
+    saved=getattr(proj,"_prompt_expanded_tiles",None)
+    if saved is None or saved[0] is not proj.weight or saved[1] is not proj.scales or saved[2] is not table:
         e,n,k=proj.num_experts,proj.output_dims,proj.input_dims
-        groups=(e,n//64,k//32)
-        codes=weight.reshape(e,n//64,64,k//32,4).transpose(0,1,3,2,4).reshape(*groups,256)
-        levels=scales.reshape(e,n//64,64,k//32,2).transpose(0,1,3,2,4)
-        levels=mx.contiguous(levels).reshape(*groups,128).view(mx.uint32)
-        packed=mx.concatenate((levels,codes),axis=-1)
-        mx.eval(packed)
-        saved=(weight,scales,packed)
-        object.__setattr__(proj,"_prompt_tiles",saved)
-    return saved[2]
+        data,=_expand(inputs=[proj.weight,proj.scales,table],template=[("N",n),("K",k)],
+                      grid=(e*n*k//8,1,1),threadgroup=(128,1,1),
+                      output_shapes=[(e,n//64,k//32,64,32)],output_dtypes=[mx.bfloat16])
+        mx.eval(data)
+        saved=(proj.weight,proj.scales,table,data)
+        object.__setattr__(proj,"_prompt_expanded_tiles",saved)
+    return saved[3]
 
 
 def project(proj, x, tiles, activation=None, token_rows=None, original_slots=None):
@@ -161,7 +170,7 @@ def project(proj, x, tiles, activation=None, token_rows=None, original_slots=Non
     n=proj.output_dims
     width=n//2 if activation is not None else n
     m=x.shape[0] if token_rows is None else token_rows.size
-    return kernel()(inputs=[x,packed_tiles(proj),proj.scales,saved[1],tiles,x if activation is None else activation,
+    return kernel()(inputs=[x,expanded_tiles(proj,saved[1]),proj.scales,saved[1],tiles,x if activation is None else activation,
                             tiles if token_rows is None else token_rows,tiles if original_slots is None else original_slots],
                     template=[("K",proj.input_dims),("N",n),("GATED",activation is not None),("GATHER",token_rows is not None),("ROUTE_LAYOUT",original_slots is not None)],
                     grid=(n//64*128,tiles.shape[0],1),threadgroup=(128,1,1),
