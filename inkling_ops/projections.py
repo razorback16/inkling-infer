@@ -27,6 +27,9 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
     modules = common + (layer.k_proj, layer.v_proj) if same else common
     if hidden_states.shape[:2] != (1, 1) or any(type(m) is not nn.Linear or "bias" in m for m in modules):
         reference = _full if full else _sliding
+        if hidden_states.shape[:2] == (1,2048) and type(layer) in (layers.FullAttention,layers.SlidingAttention):
+            from .prefill_dense import PromptAttention
+            layer = PromptAttention(layer)
         return reference(layer, hidden_states, key_hidden_states, value_hidden_states,
                           cache=cache, conv_states=conv_states, conv_mask=conv_mask)
     if not full and cache is not None and getattr(cache[0],"grouped",False):

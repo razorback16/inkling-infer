@@ -52,7 +52,7 @@ def schedule(ids):
 
 
 @lru_cache(maxsize=1)
-def kernel():
+def matrix_header():
     # Use the installed MLX matrix accumulator to preserve its floating-point order.
     root=Path(mx.__file__).parent/"include"
     mma="mlx/backend/metal/kernels/steel/gemm/mma.h"
@@ -65,9 +65,17 @@ def kernel():
         seen.add(name)
         contents=(root/name).read_text().replace("#pragma once","")
         return re.sub(r'^#include "([^"]+)"',lambda m:include(m[1]),contents,flags=re.M)
+    return include(mma)
+
+
+@lru_cache(maxsize=1)
+def kernel():
+    header = matrix_header()
+    if header is None:
+        return None
     return mx.fast.metal_kernel(
         name="inkling_prompt_lookup_gemm",input_names=["x","w","scales","table","global_scale","tiles","activation","token_rows","original_slots"],
-        output_names=["out"],header=include(mma)+"\nconstant float fp4[16]={0,.5,1,1.5,2,3,4,6,-0.f,-.5,-1,-1.5,-2,-3,-4,-6};\n",source="""
+        output_names=["out"],header=header+"\nconstant float fp4[16]={0,.5,1,1.5,2,3,4,6,-0.f,-.5,-1,-1.5,-2,-3,-4,-6};\n",source="""
             uint tile=threadgroup_position_in_grid.y*SWIZZLE+threadgroup_position_in_grid.x%SWIZZLE;
             if (tile>=TILES) return;
             uint row=tiles[3*tile], expert=tiles[3*tile+1];
