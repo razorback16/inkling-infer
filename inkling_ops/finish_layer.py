@@ -95,11 +95,10 @@ def decode(layer, hidden_states, block_states, *, cache=None, conv_mask=None, me
     active = expert_gate.gated_activation(moe.experts,x,selected)
     w = post.conv1d.weight
     if fused_down:
-        weight, striped = expert_gate.decode_weights(down)
         out, next_history = _finish_mix(
-            inputs=[active, selected, routing, weight, down.scales, down.global_scale,
+            inputs=[active, selected, routing, down.weight, down.scales, down.global_scale,
                     history[3], w, residual],
-            template=[("STRIPED",striped),("T", x.dtype), ("W",w.dtype)], grid=(576*256,1,1), threadgroup=(256,1,1),
+            template=[("T", x.dtype), ("W",w.dtype)], grid=(576*256,1,1), threadgroup=(256,1,1),
             output_shapes=[x.shape, (1,3,2304)], output_dtypes=[x.dtype,mx.float32])
     else:
         out, next_history = postmix.project_and_finish(down, active, selected, routing, history[3], w, residual)
