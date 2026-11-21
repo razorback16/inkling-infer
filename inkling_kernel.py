@@ -138,6 +138,8 @@ def single_token_moe(self, x):
 
 
 def install():
+    from inkling_ops.grouped_attn import gate_denominators
+    gate_denominators()
     from inkling_ops import packed_vocab
     packed_vocab.install()
     from inkling_ops import attention_mask, compiled_ring, dynamic_conv, message_gate, projections, short_conv, triplet
