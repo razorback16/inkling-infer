@@ -135,8 +135,11 @@ def attend(layer,q,k,v,rel,sinks,cache,gate):
     tail = cache.page_tail if paged else q
     if paged:
         k, v = mx.split(cache.page_prefix, 2, axis=1)
+    # mx.array(existing_array) makes a fresh Metal buffer even when its dtype matches.
+    slot_arg = slot if isinstance(slot,mx.array) and slot.dtype==mx.int32 else mx.array(slot,mx.int32)
+    end_arg = end if isinstance(end,mx.array) and end.dtype==mx.int32 else mx.array(end,mx.int32)
     parts,stats = _partial(
-        inputs=[q,k,v,tail,rel,w,mx.array(slot,mx.int32).reshape(1),mx.array(end,mx.int32).reshape(1),
+        inputs=[q,k,v,tail,rel,w,slot_arg.reshape(1),end_arg.reshape(1),
                 sinks.astype(q.dtype),scalar(layer.scaling)],
         template=[("T",q.dtype),("S",length),("PRE_UPDATE",before is not None),("PAGED",paged),("NKV",k.shape[1]),("GQA",heads//k.shape[1]),("WIDTH",width),("SWIZZLED",swizzled),
                   ("R",extent),("WINDOW",layer.sliding_window)],
