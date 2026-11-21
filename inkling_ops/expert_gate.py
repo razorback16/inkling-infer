@@ -29,14 +29,14 @@ _kernel = mx.fast.metal_kernel(
             for (uint i = 0; i < 8; ++i) v[i] = float(x[word * 8 + i]);
             for (uint r = 0; r < 4; ++r) {
                 uint row = expert * 2304 + first + r;
-                uint bits = packed[row * 288 + word];
+                uint bits = packed[((row/4*9 + word/32)*4 + row%4)*32 + word%32];
                 float partial = 0.f;
                 for (uint i = 0; i < 8; i += 4) {
                     partial += v[i] * levels[bits & 15] + v[i+1] * levels[(bits >> 4) & 15]
                              + v[i+2] * levels[(bits >> 8) & 15] + v[i+3] * levels[(bits >> 12) & 15];
                     bits >>= 16;
                 }
-                float term = partial * fp8_scale(scales[row * 144 + word / 2]);
+                float term = partial * fp8_scale(scales[((row/4*9 + word/32)*4 + row%4)*16 + word%32/2]);
                 sums[r] += term;
             }
         }
@@ -63,8 +63,16 @@ def gated_activation(layer, x, indices):
             or layer.act_fn.gate_softcap != 4 or layer.act_fn.up_softcap != 25):
         pair = proj(x[..., None, None, :], indices)
         return layer.act_fn(pair[..., 0::2], pair[..., 1::2])
+    saved = getattr(proj, "_tiled_expert_gate", None)
+    if saved is None or saved[0] is not proj.weight or saved[1] is not proj.scales:
+        def pack(matrix, width):
+            e, n, k = matrix.shape
+            blocks = matrix.reshape(e,n//4,4,k//width,width)
+            return mx.contiguous(blocks.transpose(0,1,3,2,4))
+        saved = (proj.weight, proj.scales, pack(proj.weight,32), pack(proj.scales,16))
+        object.__setattr__(proj, "_tiled_expert_gate", saved)
     active = _kernel(
-        inputs=[x, indices, proj.weight, proj.scales, proj.global_scale],
+        inputs=[x, indices, saved[2], saved[3], proj.global_scale],
         grid=(144 * 128, 8, 1), threadgroup=(128, 1, 1),
         output_shapes=[(1, 1, 8, 1, 1152)], output_dtypes=[x.dtype],
     )[0]
