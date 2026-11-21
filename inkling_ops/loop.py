@@ -1,4 +1,5 @@
 """Trace the recurrent layer visits together for one-token fixed-capacity decode."""
+from functools import lru_cache
 import weakref
 
 import mlx.core as mx
@@ -20,7 +21,6 @@ def _compile(model):
     groups=block_lookahead.prepare(model)
     owner = weakref.ref(model)
 
-    @mx.compile
     def run(x, states, offset, slots, slab, ring_slot):
         caches = []
         grouped = []
@@ -59,7 +59,47 @@ def _compile(model):
             else (c[0].packed, c[0].keys, c[0].values, tuple(c[1].cache)) for c in caches
         ]
 
-    return run
+    general = mx.compile(run)
+
+    @lru_cache(maxsize=4)
+    def flat_program(has_pages):
+        @mx.compile
+        def program(x, offset, slab, slot, *buffers):
+            it = iter(buffers)
+            states = []
+            for paged in has_pages:
+                packed = (next(it), next(it)) if paged else None
+                history = tuple(next(it) for _ in range(4))
+                states.append((packed, history))
+            result, slab, updates = run(x, states, offset, (None,) * len(states), slab, slot)
+            outputs = [*result, slab]
+            for update in updates:
+                outputs.extend(update[:-1])
+                outputs.extend(update[-1])
+            return outputs
+        return program
+
+    def dispatch(x, states, offset, slots, slab, slot):
+        if slab is None or any(v is not None for v in slots) or any(
+            len(history) != 4 or (p is not None and not isinstance(p, tuple))
+            for p, history in states
+        ):
+            return general(x, states, offset, slots, slab, slot)
+        has_pages = tuple(p is not None for p, _ in states)
+        inputs = []
+        for p, history in states:
+            if p is not None:
+                inputs.extend(p)
+            inputs.extend(history)
+        outputs = iter(flat_program(has_pages)(x, offset, slab, slot, *inputs))
+        result, slab = (next(outputs), next(outputs)), next(outputs)
+        updated = []
+        for paged in has_pages:
+            tail = (next(outputs),) if paged else ()
+            updated.append((*tail, tuple(next(outputs) for _ in range(4))))
+        return result, slab, updated
+
+    return dispatch
 
 
 def loop(model, x, cache, conv_mask):
