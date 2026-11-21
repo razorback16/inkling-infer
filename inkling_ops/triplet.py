@@ -3,18 +3,13 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.inkling2 import layers
 
-from . import paired_norm
-
 _reference = layers.DecoderLayer._mix_messages
 
 
 @mx.compile
 def _apply(states, messages, down, up):
     norm = layers.unweighted_rms_norm
-    if states.shape[-1] == 2304 and states.dtype == messages.dtype == mx.float32:
-        joined = paired_norm.join(states, messages, down.dtype)
-    else:
-        joined = mx.concatenate((norm(states), norm(messages)), axis=-1).astype(down.dtype)
+    joined = mx.concatenate((norm(states), norm(messages)), axis=-1).astype(down.dtype)
     reduced = (joined @ down.swapaxes(-1, -2)).astype(mx.float32)
     gates = mx.tanh(reduced @ up.swapaxes(-1, -2))
     forget, gain = mx.split(gates, 2, axis=-1)
