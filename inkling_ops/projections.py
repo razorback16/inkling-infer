@@ -104,12 +104,8 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
     elif same:
         key, value = parts[3:]
     else:
-        raw=filtered_kv.raw(layer,key_hidden_states,value_hidden_states) if full else None
-        if raw is None:
-            key = layer.k_proj(key_hidden_states)
-            value = layer.v_proj(value_hidden_states)
-        else:
-            key,value=raw
+        key = layer.k_proj(key_hidden_states)
+        value = layer.v_proj(value_hidden_states)
     fused_norm = (same and not full and conv_mask is None and conv_states is not None and layer.head_dim == 128
                   and relative.shape[-1] // layer.num_heads <= 128
                   and key.dtype == value.dtype == query.dtype

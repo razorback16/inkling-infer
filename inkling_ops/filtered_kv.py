@@ -64,33 +64,11 @@ _compact=mx.fast.metal_kernel(
     """)
 
 
-_raw=mx.fast.metal_kernel(
-    name="inkling_inline_global_kv",input_names=["kx","vx","payload","formats"],output_names=["pair"],
-    source="""
-        uint lane=thread_index_in_simdgroup,row=thread_position_in_grid.x/32;
-        auto x=row<1024 ? kx : vx;
-    """ + single_row_tiles.DOT + """
-        if (!lane) pair[row]=bfloat16_t(dot);
-    """)
-
-
-def raw(layer,k,v):
-    saved=getattr(layer,"_filter_tiles",None)
-    if (saved is None or saved[0] is not layer.k_proj.weight or saved[1] is not layer.v_proj.weight
-            or k.shape!=(1,1,2304) or k.shape!=v.shape or k.dtype!=v.dtype or k.dtype!=mx.bfloat16
-            or any(type(p) is not nn.Linear or "bias" in p for p in (layer.k_proj,layer.v_proj))):
-        return None
-    pair=_raw(inputs=[k,v,*saved[2]],template=[("COLS",2304)],grid=(2048*32,1,1),threadgroup=(128,1,1),
-              output_shapes=[(1,1,2048)],output_dtypes=[k.dtype])[0]
-    return mx.split(pair,2,axis=-1)
-
-
 def prepare(model):
     arrays=[]
-    for index,block in enumerate(model.layers):
-        layer=block.self_attn
-        if not (isinstance(layer,layers.FullAttention) or
-                (isinstance(layer,layers.SlidingAttention) and index in model.args.loop_core)):
+    for index in model.args.loop_core:
+        layer=model.layers[index].self_attn
+        if not isinstance(layer,layers.SlidingAttention):
             continue
         k,v=layer.k_proj.weight,layer.v_proj.weight
         if k.shape!=v.shape or k.shape!=(1024,2304) or k.dtype!=v.dtype or k.dtype!=mx.bfloat16:
