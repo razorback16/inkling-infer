@@ -45,7 +45,8 @@ _pack = mx.fast.metal_kernel(
 _dot = mx.fast.metal_kernel(
     name="inkling_four_row_gemv", input_names=["x","weight","payload","bases"],output_names=["out"],
     source="""
-        uint lane=thread_index_in_simdgroup, group=thread_position_in_grid.x/32;
+        uint lane=thread_index_in_simdgroup, start=(thread_position_in_grid.x/32)*ROWS;
+        uint group=start/4,first=start%4;
         uchar4 base=*(device const uchar4*)(bases+group*4);
         float sums[4]={};
         for (uint block=0;block<18;++block) {
@@ -54,7 +55,7 @@ _dot = mx.fast.metal_kernel(
             ushort4 high=*(device const ushort4*)(payload+tile*192+128+lane*2);
             uint d=block*128+lane*4;
             float4 v=float4(*(device const bfloat4*)(x+d));
-            for (uint r=0;r<4;++r) {
+            for (uint r=first;r<first+ROWS;++r) {
                 ushort h=high[r];
                 ushort4 ex=ushort4(h,h>>4,h>>8,h>>12)&15;
                 ushort4 code=(ex<<8)|ushort4(as_type<uchar4>(low[r]));
@@ -67,7 +68,7 @@ _dot = mx.fast.metal_kernel(
                 for (uint j=0;j<4;++j) sums[r]=fma(v[j],w[j],sums[r]);
             }
         }
-        for (uint r=0;r<4;++r) {
+        for (uint r=first;r<first+ROWS;++r) {
             float dot=sums[r];
             for (ushort step=16;step;step>>=1) dot+=simd_shuffle_down(dot,step);
             if (!lane) out[group*4+r]=bfloat16_t(dot);
@@ -88,5 +89,8 @@ def encode(weight):
 
 def project(x,weight,encoded):
     rows=weight.shape[0]
-    return _dot(inputs=[x,weight,*encoded],grid=(rows*8,1,1),threadgroup=(128,1,1),
+    per_simd = 2 if rows<=16384 else 4
+    threads = 64 if per_simd==2 else 128
+    return _dot(inputs=[x,weight,*encoded],template=[("ROWS",per_simd)],
+                grid=(rows//per_simd*32,1,1),threadgroup=(threads,1,1),
                 output_shapes=[(1,1,rows)],output_dtypes=[x.dtype])[0]
