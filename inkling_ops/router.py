@@ -77,21 +77,23 @@ _select = mx.fast.metal_kernel(
     source="""
         uint tid=thread_position_in_threadgroup.x, lane=thread_index_in_simdgroup;
         uint warp=simdgroup_index_in_threadgroup;
-        threadgroup float selected[8];
-        float scores[4], other[4];
-        bool special=false;
-        for (uint j=0;j<4;++j) {
-            uint e=lane+j*32;
-            float x=logits[e];
+        threadgroup float biased[128], scores[128], selected[8];
+        threadgroup uint special[4];
+        if (tid<128) {
+            float x=logits[tid];
             float p=1.f/(1.f+precise::exp(abs(x)));
-            scores[j]=x<0 ? p : 1.f-p;
-            other[j]=scores[j]+float(bias[e]);
-            special |= !isfinite(other[j]);
+            float score=x<0 ? p : 1.f-p;
+            scores[tid]=score;
+            float b=score+float(bias[tid]);
+            biased[tid]=b;
+            bool nonfinite=simd_any(!isfinite(b));
+            if (!lane) special[warp]=nonfinite;
         }
-        if (simd_any(special)) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (special[0] || special[1] || special[2] || special[3]) {
             if (!warp) {
                 float b[4];
-                for (uint j=0;j<4;++j) b[j]=other[j];
+                for (uint j=0;j<4;++j) b[j]=biased[lane+32*j];
                 for (uint k=0;k<8;++k) {
                     float best=-INFINITY;
                     uint which=128;
@@ -103,13 +105,15 @@ _select = mx.fast.metal_kernel(
                     uint winner=simd_min(best==peak ? which : 128u);
                     float keep=0;
                     for (uint j=0;j<4;++j) if (lane+32*j==winner) {
-                        keep=scores[j]; b[j]=-INFINITY;
+                        keep=scores[winner]; b[j]=-INFINITY;
                     }
                     float w=simd_sum(keep);
                     if (!lane) {inds[k]=winner; selected[k]=w;}
                 }
             }
         } else {
+            float other[4];
+            for (uint j=0;j<4;++j) other[j]=biased[lane+32*j];
             for (uint i=0;i<4;++i) {
                 uint e=warp+32*i;
                 float query=simd_shuffle(other[i],warp);
@@ -117,8 +121,7 @@ _select = mx.fast.metal_kernel(
                 for (uint j=0;j<4;++j)
                     ahead+=uint(other[j]>query || (other[j]==query && lane+32*j<e));
                 uint rank=simd_sum(ahead);
-                float score=simd_shuffle(scores[i],warp);
-                if (!lane && rank<8) {inds[rank]=e; selected[rank]=score;}
+                if (!lane && rank<8) {inds[rank]=e; selected[rank]=scores[e];}
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
