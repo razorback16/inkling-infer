@@ -4,6 +4,7 @@ import mlx.nn as nn
 from mlx_lm.models.inkling2 import layers
 
 from .head_norm import normalize
+from .dense import matvec
 
 _sliding = layers.SlidingAttention.__call__
 _full = layers.FullAttention.__call__
@@ -32,10 +33,21 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
         reference = _full if full else _sliding
         return reference(layer, hidden_states, key_hidden_states, value_hidden_states,
                           cache=cache, conv_states=conv_states, conv_mask=conv_mask)
-    packed, boundaries = projection(layer, modules, "_all_qkv" if same else "_common_q")
-    parts = mx.split(hidden_states @ packed.T, boundaries, axis=-1)
+    separate = (not same and all(type(m) is nn.Linear and "bias" not in m and
+                m.weight.dtype == mx.bfloat16 and m.weight.shape[0] % 2 == 0
+                for m in (*common, layer.k_proj, layer.v_proj)) and
+                all(x.dtype == mx.bfloat16 and x.shape == (1, 1, 2304)
+                    for x in (hidden_states, key_hidden_states, value_hidden_states)))
+    if separate:
+        packed, boundaries = projection(layer, common + (layer.k_proj, layer.v_proj), "_all_qkv")
+        raw = matvec(hidden_states, key_hidden_states, value_hidden_states, packed,
+                     boundaries[-2], boundaries[-1])
+    else:
+        packed, boundaries = projection(layer, modules, "_all_qkv" if same else "_common_q")
+        raw = hidden_states @ packed.T
+    parts = mx.split(raw, boundaries, axis=-1)
     query, relative, gate, sinks = parts[:4]
-    if same:
+    if same or separate:
         key, value = parts[4:]
     else:
         key = layer.k_proj(key_hidden_states)
