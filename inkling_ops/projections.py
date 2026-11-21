@@ -79,49 +79,6 @@ def prepare_query_weights(model):
         mx.eval(arrays)
 
 
-_small_three=mx.fast.metal_kernel(name="inkling_sink_and_filter_projections",
-    input_names=["q","k","v","sw","kw","vw"],output_names=["sink","kc","vc"],source="""
-        uint g=threadgroup_position_in_grid.x,tid=thread_position_in_threadgroup.x;
-        uint lane=thread_index_in_simdgroup,sg=simdgroup_index_in_threadgroup;
-        uint bank=g<6 ? 0 : g<14 ? 1 : 2;
-        uint first=4*(bank==0 ? g : bank==1 ? g-6 : g-14);
-        auto x=bank==0 ? q : bank==1 ? k : v;
-        auto w=bank==0 ? sw : bank==1 ? kw : vw;
-        float sums[4]={};
-        for (uint d=tid*4;d<2304;d+=1024) {
-            float4 values=float4(*(device const bfloat4*)(x+d));
-            for (uint r=0;r<4;++r) {
-                float4 weight=float4(*(device const bfloat4*)(w+(first+r)*2304+d));
-                for (uint j=0;j<4;++j) sums[r]=fma(values[j],weight[j],sums[r]);
-            }
-        }
-        threadgroup float parts[8][4];
-        for (uint r=0;r<4;++r) {
-            float sum=sums[r];
-            for (ushort h=16;h;h>>=1) sum+=simd_shuffle_down(sum,h);
-            if (!lane) parts[sg][r]=sum;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (tid<4) {
-            float total=parts[0][tid];
-            for (uint i=1;i<8;++i) total+=parts[i][tid];
-            auto dest=bank==0 ? sink : bank==1 ? kc : vc;
-            dest[first+tid]=bfloat16_t(total);
-        }
-    """)
-
-
-def _small_outputs(layer,q,k,v):
-    mods=(layer.sink_proj,layer.k_sconv.weight_proj,layer.v_sconv.weight_proj)
-    if any(x.shape!=(1,1,2304) or x.dtype!=mx.bfloat16 for x in (q,k,v)):
-        return None
-    if any(type(m) is not nn.Linear or "bias" in m or m.weight.shape!=(n,2304)
-           or m.weight.dtype!=mx.bfloat16 for m,n in zip(mods,(24,32,32))):
-        return None
-    return _small_three(inputs=[q,k,v,*[m.weight for m in mods]],grid=(22*256,1,1),threadgroup=(256,1,1),
-                        output_shapes=[(1,1,n) for n in (24,32,32)],output_dtypes=[q.dtype]*3)
-
-
 def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cache, conv_states, conv_mask):
     full = isinstance(layer, layers.FullAttention)
     same = hidden_states is key_hidden_states and hidden_states is value_hidden_states
@@ -139,10 +96,7 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
                  else hidden_states @ packed.T)
     parts = mx.split(projected,boundaries,axis=-1)
     query, relative, gate = parts[:3]
-    small=(_small_outputs(layer,hidden_states,key_hidden_states,value_hidden_states)
-           if full and conv_mask is None and conv_states is not None and
-           all(type(c) is layers.DynamicShortConvolution for c in (layer.k_sconv,layer.v_sconv)) else None)
-    sinks = layer.sink_proj(hidden_states) if small is None else small[0]
+    sinks = layer.sink_proj(hidden_states)
     filtered = (None if full or same else
                 filtered_kv.apply(layer,key_hidden_states,value_hidden_states,conv_states,conv_mask))
     if filtered is not None:
@@ -182,8 +136,7 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
     if fused_norm or dynamic_norm:
         if dynamic_norm:
             filters=[*conv_states[:2],layer.k_sconv.static_weight,layer.v_sconv.static_weight,
-                     *(small[1:] if small is not None else
-                        (layer.k_sconv.weight_proj(key_hidden_states),layer.v_sconv.weight_proj(value_hidden_states)))]
+                     layer.k_sconv.weight_proj(key_hidden_states),layer.v_sconv.weight_proj(value_hidden_states)]
         else:
             filters=[*conv_states[:2],layer.k_sconv.conv1d.weight,layer.v_sconv.conv1d.weight]
         query, pair, rel, conv_states[:2] = normalize(layer,query,key,value,relative,filters=filters,position=position)
