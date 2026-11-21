@@ -97,8 +97,15 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
     pair = None
     if fused_norm or dynamic_norm:
         if dynamic_norm:
-            filters=[*conv_states[:2],layer.k_sconv.static_weight,layer.v_sconv.static_weight,
-                     layer.k_sconv.weight_proj(key_hidden_states),layer.v_sconv.weight_proj(value_hidden_states)]
+            filters=[*conv_states[:2],layer.k_sconv.static_weight,layer.v_sconv.static_weight]
+            kp,vp=layer.k_sconv.weight_proj,layer.v_sconv.weight_proj
+            if (all(type(p) is nn.Linear and "bias" not in p and p.weight.dtype==mx.bfloat16
+                    and p.weight.shape==(32,2304) for p in (kp,vp))
+                    and key_hidden_states.shape==value_hidden_states.shape==(1,1,2304)
+                    and key_hidden_states.dtype==value_hidden_states.dtype==query.dtype==mx.bfloat16):
+                filters.extend([kp.weight,vp.weight,key_hidden_states,value_hidden_states])
+            else:
+                filters.extend([kp(key_hidden_states),vp(value_hidden_states)])
         else:
             filters=[*conv_states[:2],layer.k_sconv.conv1d.weight,layer.v_sconv.conv1d.weight]
         query, pair, rel, conv_states[:2] = normalize(layer,query,key,value,relative,filters=filters)
