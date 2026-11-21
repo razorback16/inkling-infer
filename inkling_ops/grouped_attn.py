@@ -31,7 +31,7 @@ _partial = mx.fast.metal_kernel(
             float scores[8];
             #pragma clang loop unroll(full)
             for (uint pos=0; pos<8; ++pos) {
-                uint at=((kv*1024+tile+pos*128)*(ADJACENT ? 256 : 128))+d;
+                uint at=((kv*1024+tile+pos*128)*128)+d;
                 auto key_ptr = FRESH && uint(newest)==tile+pos*128 ? fresh+kv*128+d : k+at;
                 float4 key=float4(*(device const bfloat4*)key_ptr);
                 float score=0;
@@ -40,8 +40,8 @@ _partial = mx.fast.metal_kernel(
             }
             #pragma clang loop unroll(full)
             for (uint pos=0; pos<8; ++pos) {
-                uint at=((kv*1024+tile+pos*128)*(ADJACENT ? 256 : 128))+d;
-                auto value_ptr = FRESH && uint(newest)==tile+pos*128 ? fresh+(NKV+kv)*128+d : v+at+(ADJACENT ? 128 : 0);
+                uint at=((kv*1024+tile+pos*128)*128)+d;
+                auto value_ptr = FRESH && uint(newest)==tile+pos*128 ? fresh+(NKV+kv)*128+d : v+at;
                 float4 value=float4(*(device const bfloat4*)value_ptr);
                 float score=scores[pos], top=max(peak,score);
                 float a=fast::exp(peak-top), b=fast::exp(score-top);
@@ -146,8 +146,6 @@ def attend(layer,q,k,v,rel,sinks,cache,gate,scaled_query=None):
         slot, end = mx.array(slot,mx.int32).reshape(1), mx.array(end,mx.int32).reshape(1)
     fresh = getattr(cache,"fresh",None)
     adjacent=getattr(cache,"interleaved_prefix",None)
-    if fresh is not None and length==1024 and layer.sliding_window==1024:
-        adjacent=getattr(cache,"adjacent_ring",adjacent)
     threads = 64 if length==1024 and layer.sliding_window==1024 else 256 if paged else 128
     parts,stats = _partial(
         inputs=[q if scaled_query is None else scaled_query,k if adjacent is None else adjacent,v if adjacent is None else adjacent,tail,q if fresh is None else fresh,rel,w,slot,end,
