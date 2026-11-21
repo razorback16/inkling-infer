@@ -118,8 +118,8 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
             prepared=project_heads.compute(layer,hidden_states,joint[1],getattr(layer,"_all_qkv_tiles",None),
                                            conv_states,conv_mask,cache[0],extra)
             if prepared is not None:
-                q,k,v,rel,gate,scaled=prepared
-                return _grouped_output(layer,q,k,v,rel,layer.sink_proj(hidden_states),cache[0],gate,scaled)
+                q,k,v,rel,gate,scaled,sinks=prepared
+                return _grouped_output(layer,q,k,v,rel,sinks,cache[0],gate,scaled)
     projected = (packed_rows.project(hidden_states,packed,tiles[1])
                  if tiles is not None and tiles[0] is packed and hidden_states.dtype==mx.bfloat16
                  else hidden_states @ packed.T)

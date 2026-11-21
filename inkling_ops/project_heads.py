@@ -1,5 +1,6 @@
 """Project and normalize a full head in a single workgroup on shared-input sliding visits."""
 import mlx.core as mx
+import mlx.nn as nn
 from mlx_lm.kernels.common import scalar
 from mlx_lm.models.inkling2 import layers
 
@@ -61,8 +62,33 @@ _epilogue = """
             else pair[(key ? 0 : 1024)+d]=value;
         }
 """
+_sink_groups = """
+        uint sink_group=threadgroup_position_in_grid.x;
+        if (sink_group>=67) {
+            uint sg=simdgroup_index_in_threadgroup;
+            uint lane=thread_index_in_simdgroup;
+            uint row=(sink_group-67)*4+sg/8, part=sg%8;
+            uint tid=part*32+lane;
+            float dot=0;
+            for (uint d=tid*4;d<2304;d+=1024) {
+                float4 v=float4(*(device const bfloat4*)(x+d));
+                float4 w=float4(*(device const bfloat4*)(sw+row*2304+d));
+                for (uint j=0;j<4;++j) dot=fma(v[j],w[j],dot);
+            }
+            for (ushort step=16;step;step>>=1) dot+=simd_shuffle_down(dot,step);
+            threadgroup float partial[32];
+            if (!lane) partial[sg]=dot;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (!tid) {
+                float total=partial[sg];
+                for (uint j=1;j<8;++j) total+=partial[sg+j];
+                sinks[row]=bfloat16_t(total);
+            }
+            return;
+        }
+"""
 def _make_kernel(distinct):
-    inputs=["x","payload","qs","rs","qt","rt","eps","attention_scale","kh","vh","kw","vw"]
+    inputs=["x","payload","qs","rs","qt","rt","eps","attention_scale","kh","vh","kw","vw","sw"]
     prefix="#pragma clang fp contract(off)\nthreadgroup bfloat16_t raw[128]; uint sg=simdgroup_index_in_threadgroup;\n"
     projection=_dot_source.replace("out[group*4+r]=bfloat16_t(dot);","raw[sg*4+r]=bfloat16_t(dot);")
     if distinct:
@@ -71,7 +97,7 @@ def _make_kernel(distinct):
         projection=projection.replace("(x+d)","(input+d)")
     return mx.fast.metal_kernel(
         name="inkling_project_recurrent_heads" if distinct else "inkling_project_complete_heads",input_names=inputs,
-        output_names=["q","scaled","rel","gate","pair","k_window","v_window"],source=prefix+projection+_epilogue)
+        output_names=["q","scaled","rel","gate","pair","k_window","v_window","sinks"],source=prefix+_sink_groups+projection+_epilogue)
 
 
 _kernel=_make_kernel(False)
@@ -87,17 +113,20 @@ def compute(layer,x,packed,tiles,conv_states,conv_mask,kv,extra=()):
             or any(type(c) is not layers.ShortConvolution or c.kernel_size!=4 for c in (layer.k_sconv,layer.v_sconv))
             or any(h is None or h.shape!=(1,3,1024) for h in conv_states[:2])):
         return None
+    sink=layer.sink_proj
+    if type(sink) is not nn.Linear or "bias" in sink or sink.weight.dtype!=x.dtype or sink.weight.shape!=(24,2304):
+        return None
     kw,vw=layer.k_sconv.conv1d.weight,layer.v_sconv.conv1d.weight
     if kw.dtype!=vw.dtype or kw.shape!=vw.shape:
         return None
     kernel=_distinct if extra else _kernel
-    q,scaled,rel,gate,pair,kh,vh=kernel(
+    q,scaled,rel,gate,pair,kh,vh,sinks=kernel(
         inputs=[x,*tiles[1],layer.q_l2_clip.scale,layer.rel_l2_clip.scale,scalar(layer.q_l2_clip.threshold),
-                scalar(layer.rel_l2_clip.threshold),scalar(layer.eps),scalar(layer.scaling),*conv_states[:2],kw,vw,*extra],
-        template=[("W",kw.dtype)],grid=(8576*8,1,1),threadgroup=(1024,1,1),
-        output_shapes=[(1,24,1,128),(1,24,1,128),(1,1,24,16),(1,1,3072),(1,16,1,128),(1,4,1024),(1,4,1024)],
-        output_dtypes=[mx.bfloat16,mx.float32,mx.bfloat16,mx.bfloat16,mx.bfloat16,mx.float32,mx.float32])
+                scalar(layer.rel_l2_clip.threshold),scalar(layer.eps),scalar(layer.scaling),*conv_states[:2],kw,vw,sink.weight,*extra],
+        template=[("W",kw.dtype)],grid=(73*1024,1,1),threadgroup=(1024,1,1),
+        output_shapes=[(1,24,1,128),(1,24,1,128),(1,1,24,16),(1,1,3072),(1,16,1,128),(1,4,1024),(1,4,1024),(1,1,24)],
+        output_dtypes=[mx.bfloat16,mx.float32,mx.bfloat16,mx.bfloat16,mx.bfloat16,mx.float32,mx.float32,mx.bfloat16])
     conv_states[:2]=kh,vh
     kv.defer_update=True
     k,v=kv.update_packed(pair)
-    return q,k,v,rel,gate,scaled
+    return q,k,v,rel,gate,scaled,sinks
