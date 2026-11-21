@@ -19,7 +19,7 @@ _mix = mx.fast.metal_kernel(
 
 def mix(states, weights, dtype):
     return _mix(inputs=[states, weights], template=[("T", dtype)],
-                grid=(2304, 1, 1), threadgroup=(128, 1, 1),
+                grid=(2304, 1, 1), threadgroup=(32, 1, 1),
                 output_shapes=[(1, 1, 2304)], output_dtypes=[dtype])[0]
 
 
