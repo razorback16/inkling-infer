@@ -13,6 +13,16 @@ _kernel = mx.fast.metal_kernel(
         constant float levels[16] = {
             0, .5, 1, 1.5, 2, 3, 4, 6, -0., -.5, -1, -1.5, -2, -3, -4, -6
         };
+        inline float activation_value(device const float* table,ushort code,uint field) {
+            uint mag=uint(code)&32767, which=(uint(code)>>15)*2+field;
+            if (mag-103u*128u<33u*128u) return table[(mag-103u*128u)*4+which];
+            uint e=mag>>7, page=32, adjustment=0;
+            if (e<6) page=33+uint(max(int(e)-2,0));
+            else if (e<103) { page=0; adjustment=(e-103u)<<23; }
+            else if (e==255) page=37;
+            uint bits=as_type<uint>(table[(page*128+(mag&127))*4+which]);
+            return as_type<float>(bits+adjustment);
+        }
         inline float fp8_scale(uchar bits) {
             ushort mag = bits & 127;
             ushort raw = (mag << 7) | (((mag + 1) >> 7) << 14) | ((bits & 128) << 8);
@@ -47,9 +57,13 @@ _kernel = mx.fast.metal_kernel(
             float scale = amax[expert] / 2688.f;
             ushort g = as_type<ushort>(bfloat16_t(sums[lane*2]*scale));
             ushort u = as_type<ushort>(bfloat16_t(sums[lane*2+1]*scale));
+            if (COMPACT) {
+                out[slot*1152+first/2+lane]=bfloat16_t(activation_value(activation,g,0)*activation_value(activation,u,1));
+            } else {
             uint gi=((uint(g)&32767)<<2)|((g>>15)<<1);
             uint ui=((uint(u)&32767)<<2)|((u>>15)<<1);
             out[slot*1152+first/2+lane]=bfloat16_t(activation[gi]*activation[ui+1]);
+            }
         }
     """,
 )
@@ -61,8 +75,16 @@ def activation_tables():
     gates = (mx.tanh(values / 4)*4) * mx.sigmoid(values)
     ups = mx.tanh(values / 25)*25
     table=mx.contiguous(mx.stack((gates,ups),axis=1).reshape(2,32768,2).transpose(1,0,2))
-    mx.eval(table)
-    return table
+    pages=table.reshape(256,128,4)
+    short=mx.concatenate((pages[103:136],pages[mx.array([0,3,4,5,255])]))
+    ex=mx.arange(256,dtype=mx.int32)
+    index=mx.where(ex<6,33+mx.maximum(ex-2,0),mx.where(ex==255,37,mx.clip(ex-103,0,32)))
+    delta=mx.where((ex>=6)&(ex<103),ex-103,0).astype(mx.uint32)<<23
+    restored=short.view(mx.uint32)[index]+delta.reshape(256,1,1)
+    if mx.array_equal(restored,pages.view(mx.uint32)).item():
+        mx.eval(short)
+        return short,True
+    return table,False
 
 
 def gated_activation(layer, x, indices):
@@ -74,8 +96,9 @@ def gated_activation(layer, x, indices):
             or layer.act_fn.gate_softcap != 4 or layer.act_fn.up_softcap != 25):
         pair = proj(x[..., None, None, :], indices)
         return layer.act_fn(pair[..., 0::2], pair[..., 1::2])
+    table,compact=activation_tables()
     active = _kernel(
-        inputs=[x, indices, proj.weight, proj.scales, proj.global_scale, activation_tables()],
+        inputs=[x, indices, proj.weight, proj.scales, proj.global_scale, table], template=[("COMPACT",compact)],
         grid=(144 * 128, 8, 1), threadgroup=(128, 1, 1),
         output_shapes=[(1, 1, 8, 1, 1152)], output_dtypes=[x.dtype],
     )[0]
