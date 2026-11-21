@@ -12,6 +12,18 @@ from . import prepared_bank, block_lookahead
 _reference = TextModel._run_loop
 
 
+def _adjacent_ring(packed):
+    n, banks, length, channels = packed.shape
+    rows = packed.reshape(n,2,banks//2,length,channels).transpose(0,2,3,1,4)
+    return mx.contiguous(rows.reshape(n,banks//2,length,2*channels))
+
+
+def _logical_ring(adjacent):
+    n, heads, length, pair = adjacent.shape
+    rows = adjacent.reshape(n,heads,length,2,pair//2).transpose(0,3,1,2,4)
+    return rows.reshape(n,heads*2,length,pair//2)
+
+
 def _compile(model):
     from . import filtered_output, filtered_kv
     filtered_output.prepare(model)
@@ -31,7 +43,8 @@ def _compile(model):
                 slot = ring_slot if shared else offset
             if shared:
                 row = len(grouped)
-                packed = slab[row:row+1]
+                adjacent = slab[row:row+1]
+                packed = _logical_ring(adjacent)
             pages = packed if isinstance(packed, tuple) else None
             storage = mx.concatenate(pages[:2], axis=2) if pages is not None else packed
             keys, values = mx.split(storage, 2, axis=1)
@@ -39,6 +52,7 @@ def _compile(model):
             if shared:
                 grouped.append(ring)
                 ring.grouped = True
+                ring.adjacent_ring = adjacent
             if pages is not None:
                 ring.page_prefix, ring.page_tail = pages[:2]
                 if len(pages)==3:
@@ -54,7 +68,7 @@ def _compile(model):
                 if value is None:
                     value = mx.take(ring.packed,ring.write_coordinates[0],axis=2)
                 updates.append(value)
-            slab = mx.slice_update(slab, mx.concatenate(updates,axis=0),
+            slab = mx.slice_update(slab, _adjacent_ring(mx.concatenate(updates,axis=0)),
                                    grouped[0].write_coordinates[0], axes=(2,))
         return result, slab, [
             (tuple(c[1].cache),) if getattr(c[0],"grouped",False) else
@@ -129,9 +143,9 @@ def loop(model, x, cache, conv_mask):
     if rows and all(slots[i] == slots[rows[0]] for i in rows):
         tensors = tuple(states[i][0] for i in rows)
         old = getattr(cache[rows[0]][0], "_shared_rings", None)
-        reusable = old is not None and len(tensors)==len(old[1]) and all(
+        reusable = old is not None and old[0].shape==(len(rows),8,1024,256) and len(tensors)==len(old[1]) and all(
             a is b for a,b in zip(tensors,old[1]))
-        slab = old[0] if reusable else mx.concatenate(tensors,axis=0)
+        slab = old[0] if reusable else _adjacent_ring(mx.concatenate(tensors,axis=0))
         for i in rows:
             incoming[i] = (None,states[i][1])
     ring_slot = None if slab is None else params[slots[rows[0]]]
@@ -144,7 +158,7 @@ def loop(model, x, cache, conv_mask):
         if len(update) == 1:
             history = update[0]
             row = len(views)
-            packed = slab[row:row+1]
+            packed = _logical_ring(slab[row:row+1])
             views.append(packed)
             keys, values = mx.split(packed,2,axis=1)
         elif len(update) == 2:
