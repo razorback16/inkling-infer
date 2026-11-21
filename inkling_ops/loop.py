@@ -42,7 +42,10 @@ def _compile(model):
             if pages is not None:
                 ring.page_prefix, ring.page_tail = pages[:2]
                 if len(pages)==3:
-                    ring.interleaved_prefix=pages[2]
+                    if pages[2].dtype==mx.uint32:
+                        ring.compact_prefix=pages[2]
+                    else:
+                        ring.interleaved_prefix=pages[2]
             conv = ArraysCache(4)
             conv.cache = list(history)
             caches.append(CacheList(ring, conv))
@@ -107,7 +110,11 @@ def loop(model, x, cache, conv_mask):
             saved_prefix=getattr(k,"_interleaved_global_prefix",None)
             if saved_prefix is None or saved_prefix[0] is not prefix:
                 _,banks,length,channels=prefix.shape
-                adjacent=mx.contiguous(prefix.reshape(1,2,banks//2,length,channels).transpose(0,2,3,1,4))
+                if prefix.dtype==mx.bfloat16:
+                    from .grouped_attn import pack_prefix
+                    adjacent=pack_prefix(prefix)
+                else:
+                    adjacent=mx.contiguous(prefix.reshape(1,2,banks//2,length,channels).transpose(0,2,3,1,4))
                 saved_prefix=(prefix,adjacent)
                 k._interleaved_global_prefix=saved_prefix
             packed=(*packed,saved_prefix[1])
