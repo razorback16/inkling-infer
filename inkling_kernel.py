@@ -34,6 +34,8 @@ def single_token_moe(self, x):
 
 def install():
     from inkling_ops import attention_mask, compiled_ring, dynamic_conv, message_gate, projections, short_conv, triplet
+    from inkling_ops import expert_gate
+    expert_gate.install()
     short_conv.install()
     message_gate.install()
     attention_mask.install()
