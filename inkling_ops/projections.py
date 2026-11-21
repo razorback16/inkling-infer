@@ -5,7 +5,6 @@ from mlx_lm.models.inkling2 import layers
 
 from .head_norm import normalize
 from . import rel_mask
-from .packed_vocab import project_weight
 
 _sliding = layers.SlidingAttention.__call__
 _full = layers.FullAttention.__call__
@@ -35,15 +34,14 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
         return reference(layer, hidden_states, key_hidden_states, value_hidden_states,
                           cache=cache, conv_states=conv_states, conv_mask=conv_mask)
     packed, boundaries = projection(layer, modules, "_all_qkv" if same else "_common_q")
-    query_cache = "_encoded_qkv" if same else "_encoded_q"
-    parts = mx.split(project_weight(hidden_states, packed, layer, query_cache), boundaries, axis=-1)
+    parts = mx.split(hidden_states @ packed.T, boundaries, axis=-1)
     query, relative, gate = parts[:3]
     sinks = layer.sink_proj(hidden_states)
     if same:
         key, value = parts[3:]
     else:
-        key = project_weight(key_hidden_states, layer.k_proj.weight, layer.k_proj, "_encoded_k") if type(layer.k_proj) is nn.Linear and "bias" not in layer.k_proj else layer.k_proj(key_hidden_states)
-        value = project_weight(value_hidden_states, layer.v_proj.weight, layer.v_proj, "_encoded_v") if type(layer.v_proj) is nn.Linear and "bias" not in layer.v_proj else layer.v_proj(value_hidden_states)
+        key = layer.k_proj(key_hidden_states)
+        value = layer.v_proj(value_hidden_states)
     if full:
         key, conv_states[0] = layer.k_sconv(key, key_hidden_states, conv_states[0], conv_mask)
         value, conv_states[1] = layer.v_sconv(value, value_hidden_states, conv_states[1], conv_mask)
@@ -74,11 +72,7 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
     if (kv is not None and 1024 <= k.shape[2] <= 8192 and q.shape[-1] == 128
             and type(layer.rel_logits_proj) is layers.RelativeLogits and rel.dtype == q.dtype == mx.bfloat16):
         from . import grouped_attn
-        attended = grouped_attn.attend(layer,q,k,v,rel,sinks,kv,gate)
-        out = layer.o_proj
-        if type(out) is nn.Linear and "bias" not in out:
-            return project_weight(attended,out.weight,out,"_encoded_o")
-        return out(attended)
+        return layer.o_proj(grouped_attn.attend(layer,q,k,v,rel,sinks,kv,gate))
     if kv is not None and type(layer.rel_logits_proj) is layers.RelativeLogits and rel.dtype == q.dtype:
         output = rel_mask.attend(layer, q, k, v, rel, sinks, kv)
     else:
