@@ -46,24 +46,26 @@ _pack = mx.fast.metal_kernel(
 )
 
 _dot = mx.fast.metal_kernel(
-    name="inkling_vocab_twelve_bit_dot", input_names=["x","tiles","overflow","formats","offsets"],
+    name="inkling_vocab_twelve_bit_dot", input_names=["x","tiles","overflow"],
     output_names=["out"], source="""
         uint lane=thread_index_in_simdgroup, row=thread_position_in_grid.x/32;
-        uint fmt=formats[row], mask=fmt&0x3ffffu;
+        device const uint* group=tiles+(row/4)*3488;
+        uint2 descriptor=((device const uint2*)group)[row%4];
+        uint fmt=descriptor.x, mask=fmt&0x3ffffu;
         ushort base=ushort(fmt>>24);
         float dot=0;
         #pragma clang loop unroll_count(3)
         for (uint t=0;t<18;++t) {
-            uint addr=((row/4*18+t)*4+row%4)*48;
-            ushort h=((device const ushort*)(tiles+addr+32))[lane];
+            uint addr=32+(t*4+row%4)*48;
+            ushort h=((device const ushort*)(group+addr+32))[lane];
             ushort4 codes=ushort4(h,h>>4,h>>8,h>>12);
             ushort4 n=codes&7;
             if (mask&(1u<<t)) {
-                uint index=offsets[row]+popcount(mask&((1u<<t)-1));
+                uint index=descriptor.y+popcount(mask&((1u<<t)-1));
                 ushort hi=((device const ushort*)overflow)[index*32+lane];
                 n|=(ushort4(hi,hi>>4,hi>>8,hi>>12)&15)<<3;
             }
-            ushort4 bits=((codes&8)<<12)|(((n+base)&127)<<8)|ushort4(as_type<uchar4>(tiles[addr+lane]));
+            ushort4 bits=((codes&8)<<12)|(((n+base)&127)<<8)|ushort4(as_type<uchar4>(group[addr+lane]));
             float4 w=float4(as_type<bfloat4>(bits));
             float4 a=float4(((device const bfloat4*)x)[t*32+lane]);
             for (uint j=0;j<4;++j) dot=fma(a[j],w[j],dot);
@@ -83,7 +85,9 @@ def encode(w):
     offsets=ends-counts
     tiles,overflow=_pack(inputs=[w,formats,offsets], grid=(rows*18*32,1,1), threadgroup=(128,1,1),
                          output_shapes=[(rows,18,48),(n_overflow,16)], output_dtypes=[mx.uint32]*2)
-    return tiles,overflow,formats,offsets
+    descriptors=mx.stack((formats,offsets),axis=1).reshape(-1,8)
+    headers=mx.pad(descriptors,[(0,0),(0,24)])
+    return mx.concatenate((headers,tiles.reshape(-1,3456)),axis=1),overflow
 
 
 def project(x,weight,encoded):
