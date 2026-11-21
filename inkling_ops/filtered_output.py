@@ -1,6 +1,7 @@
 """Apply attention output projection, temporal filter, and residual in one pass."""
 import mlx.core as mx
 import mlx.nn as nn
+from . import single_row_tiles
 
 _kernel = mx.fast.metal_kernel(
     name="inkling_project_attention_residual",
@@ -40,61 +41,13 @@ _kernel = mx.fast.metal_kernel(
 )
 
 
-_pack_rows = mx.fast.metal_kernel(
-    name="inkling_output_row_bytes", input_names=["w"], output_names=["payload","formats"],
-    source="""
-        uint lane=thread_index_in_simdgroup, row=thread_position_in_grid.x/32;
-        ushort highest=0;
-        for (uint d=lane*4;d<3072;d+=128) {
-            ushort4 bits=*(device const ushort4*)((device const ushort*)w+row*3072+d);
-            ushort4 e=(bits>>7)&255;
-            highest=max(highest,max(max(e.x,e.y),max(e.z,e.w)));
-        }
-        highest=simd_max(highest);
-        ushort base=ushort(max(0,int(highest)-15));
-        uint raw_tiles=0;
-        for (uint tile=0;tile<24;++tile) {
-            uint d=tile*128+lane*4;
-            ushort4 bits=*(device const ushort4*)((device const ushort*)w+row*3072+d);
-            ushort4 delta=((bits>>7)&255)-base;
-            uint addr=((row/4*24+tile)*4+row%4)*64;
-            if (simd_any(any(delta>15))) {
-                raw_tiles|=1u<<tile;
-                *(device ushort4*)(payload+addr+lane*2)=bits;
-            } else {
-                payload[addr+lane]=as_type<uint>(uchar4((bits<<1)|(bits>>15)));
-                ((device ushort*)(payload+addr+32))[lane]=delta.x|(delta.y<<4)|(delta.z<<8)|(delta.w<<12);
-            }
-        }
-        if (!lane) formats[row]=(uint(base)<<24)|raw_tiles;
-    """,
-)
 _compact_rows = mx.fast.metal_kernel(
     name="inkling_stream_output_row",input_names=["x","history","conv","hidden","payload","formats"],
     output_names=["residual","window","squares"],
     source="""
         uint lane=thread_index_in_simdgroup, row=thread_position_in_grid.x/32;
         uint sg=simdgroup_index_in_threadgroup;
-        uint format=formats[row];
-        ushort base=ushort(format>>24)<<8;
-        float dot=0;
-        for (uint tile=0;tile<24;++tile) {
-            uint d=tile*128+lane*4, addr=((row/4*24+tile)*4+row%4)*64;
-            float4 a=float4(*(device const bfloat4*)(x+d));
-            ushort4 bits;
-            if (format&(1u<<tile)) {
-                bits=*(device const ushort4*)(payload+addr+lane*2);
-            } else {
-                ushort h=((device const ushort*)(payload+addr+32))[lane];
-                ushort4 n=ushort4(h,h>>4,h>>8,h>>12)&15;
-                ushort4 code=(n<<8)|ushort4(as_type<uchar4>(payload[addr+lane]));
-                ushort4 rot=code+base;
-                bits=(rot>>1)|(rot<<15);
-            }
-            float4 w=float4(as_type<bfloat4>(bits));
-            for (uint j=0;j<4;++j) dot=fma(a[j],w[j],dot);
-        }
-        for (ushort step=16;step;step>>=1) dot+=simd_shuffle_down(dot,step);
+    """ + single_row_tiles.DOT + """
         threadgroup float values[4];
         if (!lane) {
             float v=float(bfloat16_t(dot)),filtered=0;
@@ -129,8 +82,7 @@ def prepare(model):
             continue
         saved=getattr(proj,"_output_rows",None)
         if saved is None or saved[0] is not w:
-            encoded=_pack_rows(inputs=[w],grid=(2304*32,1,1),threadgroup=(128,1,1),
-                               output_shapes=[(2304,24,64),(2304,)],output_dtypes=[mx.uint32,mx.uint32])
+            encoded=single_row_tiles.encode(w)
             object.__setattr__(proj,"_output_rows",(w,encoded))
             arrays.extend(encoded)
     if arrays:
@@ -150,7 +102,7 @@ def apply(projection, x, post):
     inputs=([x,history,conv,hidden,*saved[1]] if compact else
             [x,projection.weight,history,conv,hidden])
     return tuple(kernel(inputs=inputs,
-                         template=[("W",conv.dtype),("BOUNDARY",layer.is_block_boundary)],
+                         template=[("W",conv.dtype),("BOUNDARY",layer.is_block_boundary),("COLS",3072)],
                          grid=((2304 if compact else 576)*32,1,1),threadgroup=(128,1,1),
                          output_shapes=[hidden.shape,(1,4,2304),(576,)],
                          output_dtypes=[mx.float32]*3))
