@@ -47,7 +47,9 @@ _kernel = mx.fast.metal_kernel(
             float scale = amax[expert] / 2688.f;
             ushort g = as_type<ushort>(bfloat16_t(sums[lane*2]*scale));
             ushort u = as_type<ushort>(bfloat16_t(sums[lane*2+1]*scale));
-            out[slot*1152+first/2+lane] = bfloat16_t(activation[uint(g)*2]*activation[uint(u)*2+1]);
+            uint gi=((uint(g)&32767)<<2)|((g>>15)<<1);
+            uint ui=((uint(u)&32767)<<2)|((u>>15)<<1);
+            out[slot*1152+first/2+lane]=bfloat16_t(activation[gi]*activation[ui+1]);
         }
     """,
 )
@@ -58,7 +60,7 @@ def activation_tables():
     values = mx.arange(65536, dtype=mx.uint32).astype(mx.uint16).view(mx.bfloat16).astype(mx.float32)
     gates = (mx.tanh(values / 4)*4) * mx.sigmoid(values)
     ups = mx.tanh(values / 25)*25
-    table=mx.stack((gates,ups),axis=1)
+    table=mx.contiguous(mx.stack((gates,ups),axis=1).reshape(2,32768,2).transpose(1,0,2))
     mx.eval(table)
     return table
 
