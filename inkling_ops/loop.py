@@ -6,6 +6,7 @@ from mlx.utils import tree_flatten
 from mlx_lm.models.cache import ArraysCache, CacheList, KVCache, RotatingKVCache
 from mlx_lm.models.inkling2.model import TextModel
 
+from . import bank
 from .compiled_ring import _DeviceRing
 
 _reference = TextModel._run_loop
@@ -22,7 +23,7 @@ def _compile(model):
             conv = ArraysCache(4)
             conv.cache = list(history)
             caches.append(CacheList(ring, conv))
-        result = _reference(owner(), x, caches, None)
+        result = bank.run(owner(), x, caches)
         return result, [(c[0].keys, c[0].values, tuple(c[1].cache)) for c in caches]
 
     return run
