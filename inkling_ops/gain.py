@@ -34,17 +34,21 @@ def _make_kernel(with_sums):
     outputs = ["out"]
     if with_sums:
         outputs.append("squares")
-        source = "threadgroup float values[128];\n" + source.replace(
-            "out[c] = retained + added;", "float value = retained + added; out[c] = value; values[row%128] = value;")
+        source = "threadgroup float partials[32];\n" + source.replace(
+            "if ((lane % 4) == 0)", "float value = 0; if ((lane % 4) == 0)").replace(
+            "out[c] = retained + added;", "value = retained + added; out[c] = value;")
         source += """
+            float squares4 = 0;
+            for (ushort j = 0; j < 4; ++j) {
+                float v = simd_shuffle(value, ushort((lane & 16) + j * 4));
+                squares4 += v * v;
+            }
+            if ((lane & 15) == 0)
+                partials[simdgroup_index_in_threadgroup * 2 + lane / 16] = squares4;
             threadgroup_barrier(mem_flags::mem_threadgroup);
             if (!simdgroup_index_in_threadgroup) {
-                float sum=0;
-                for (uint j=0;j<4;++j) {
-                    float v=values[lane*4+j]; sum+=v*v;
-                }
-                sum=simd_sum(sum);
-                if (!lane) squares[bank*18+threadgroup_position_in_grid.x]=sum;
+                float sum = simd_sum(partials[lane]);
+                if (!lane) squares[bank * 18 + threadgroup_position_in_grid.x] = sum;
             }
         """
     return mx.fast.metal_kernel(name="inkling_gain_router_norm" if with_sums else "inkling_gain_forget",
