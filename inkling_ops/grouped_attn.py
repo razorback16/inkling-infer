@@ -49,6 +49,56 @@ _partial = mx.fast.metal_kernel(
                 for (uint j=0; j<4; ++j) accum[j]=accum[j]*a+b*value[j];
                 peak=top;
             }
+        } else if (PAGED && !WINDOW && PRE_UPDATE && R>=256 && R<=4096 &&
+                   newest==valid-1 && newest<int(S)) {
+            // Older positions occupy the immutable prefix and have zero relative bias.
+            uint count=uint(max(0,(newest-int(tile)+128)/128));
+            uint old=uint(max(0,(newest-int(R)-int(tile)+128)/128));
+            uint i=0;
+            for (;i+4<=old;i+=4) {
+                float scores[4];
+                for (uint t=0;t<4;++t) {
+                    uint p=(kv*(S-256)+tile+(i+t)*128)*128+d;
+                    float4 key=float4(*(device const bfloat4*)(k+p));
+                    float score=0;
+                    for (uint j=0;j<4;++j) score+=query[j]*key[j];
+                    scores[t]=simd_sum(score)+0.f;
+                }
+                for (uint t=0;t<4;++t) {
+                    uint p=(kv*(S-256)+tile+(i+t)*128)*128+d;
+                    float4 value=float4(*(device const bfloat4*)(v+p));
+                    float top=max(peak,scores[t]);
+                    float a=fast::exp(peak-top),b=fast::exp(scores[t]-top);
+                    total=total*a+b;
+                    for (uint j=0;j<4;++j) accum[j]=accum[j]*a+b*value[j];
+                    peak=top;
+                }
+            }
+            float bias=0;
+            if (lane<count-old) {
+                uint dist=uint(newest)-(tile+(old+lane)*128);
+                for (uint j=0;j<WIDTH;++j)
+                    bias=fma(float(rel[head*WIDTH+j]),float(w[SWIZZLED ? ((dist%128)*WIDTH+j)*(R/128)+dist/128 : j*R+dist]),bias);
+                bias=float(T(bias));
+            }
+            for (;i<count;++i) {
+                float pb=i<old ? 0.f : simd_shuffle(bias,(i-old)&31u);
+                if (pb==-INFINITY) continue;
+                uint pos=tile+i*128;
+                bool last=pos>=S-256;
+                uint p=(kv*(last ? 256 : S-256)+(last ? pos-(S-256) : pos))*128+d;
+                auto keys=last ? tail : k;
+                auto values=last ? tail+NKV*256*128 : v;
+                float4 key=float4(*(device const bfloat4*)(keys+p));
+                float4 value=float4(*(device const bfloat4*)(values+p));
+                float score=0;
+                for (uint j=0;j<4;++j) score+=query[j]*key[j];
+                score=simd_sum(score)+pb;
+                float top=max(peak,score),a=fast::exp(peak-top),b=fast::exp(score-top);
+                total=total*a+b;
+                for (uint j=0;j<4;++j) accum[j]=accum[j]*a+b*value[j];
+                peak=top;
+            }
         } else {
             for (uint chunk=0; chunk<S; chunk+=4096) {
                 int pos = chunk + tile + lane*128;
