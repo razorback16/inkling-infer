@@ -92,6 +92,71 @@ _partial = mx.fast.metal_kernel(
         if (!lane) { stats[addr*2] = peak; stats[addr*2+1] = total; }
     """,
 )
+_three_global = mx.fast.metal_kernel(
+    name="inkling_global_shared_kv",
+    input_names=["q","k","v","tail","fresh","rel","w","slot","end","sinks","scale"],
+    output_names=["partials","stats"],source="""
+        uint lane=thread_index_in_simdgroup, tile=thread_position_in_grid.x/32;
+        uint kv=threadgroup_position_in_grid.y, d=lane*4;
+        uint newest=uint(slot[0]);
+        float4 queries[3], values[3];
+        float peaks[3], totals[3], biases[3]={};
+        for (uint h=0;h<3;++h) {
+            uint head=kv*3+h;
+            for (uint j=0;j<4;++j)
+                queries[h][j]=SCALED ? float(q[head*128+d+j]) : scale*float(q[head*128+d+j]);
+            values[h]=0;
+            peaks[h]=tile ? -FLT_MAX : float(sinks[head]);
+            totals[h]=tile ? 0.f : 1.f;
+        }
+
+        int valid=end[0]+1;
+        for (uint chunk=0;chunk<S;chunk+=4096) {
+            uint position=chunk+tile+lane*128;
+            int dist=int(newest)-int(position);
+            if (dist<0) dist+=S;
+            for (uint h=0;h<3;++h) biases[h]=0;
+            if (position>=S || dist>=valid || (WINDOW && dist>=WINDOW)) {
+                for (uint h=0;h<3;++h) biases[h]=-INFINITY;
+            } else if (dist<R) {
+                for (uint j=0;j<WIDTH;++j) {
+                    float basis=float(w[SWIZZLED ? ((dist%128)*WIDTH+j)*(R/128)+dist/128 : j*R+dist]);
+                    for (uint h=0;h<3;++h)
+                        biases[h]=fma(float(rel[(kv*3+h)*WIDTH+j]),basis,biases[h]);
+                }
+                for (uint h=0;h<3;++h) biases[h]=float(T(biases[h]));
+            }
+            for (uint i=0;i<32 && chunk+tile+i*128<S;++i) {
+                uint pos=chunk+tile+i*128;
+                bool last=pos>=S-256;
+                uint prefix=S-256;
+                uint at=last ? (kv*256+pos-prefix)*128+d : (kv*prefix+pos)*256+d;
+                auto kp=last ? tail+at : k+at;
+                auto vp=last ? tail+NKV*256*128+at : k+at+128;
+                float4 key=float4(*(device const bfloat4*)kp);
+                float4 val=float4(*(device const bfloat4*)vp);
+                for (uint h=0;h<3;++h) {
+                    float bias=simd_shuffle(biases[h],i);
+                    if (bias==-INFINITY) continue;
+                    float s=0;
+                    for (uint j=0;j<4;++j) s+=queries[h][j]*key[j];
+                    s=simd_sum(s)+bias;
+                    float top=max(peaks[h],s);
+                    float a=fast::exp(peaks[h]-top),b=fast::exp(s-top);
+                    totals[h]=totals[h]*a+b;
+                    for (uint j=0;j<4;++j) values[h][j]=values[h][j]*a+b*val[j];
+                    peaks[h]=top;
+                }
+            }
+        }
+        for (uint h=0;h<3;++h) {
+            uint row=(kv*3+h)*128+tile;
+            for (uint j=0;j<4;++j) partials[row*128+d+j]=T(values[h][j]);
+            if (!lane) {stats[row*2]=peaks[h];stats[row*2+1]=totals[h];}
+        }
+    """,
+)
+
 _gate_table = mx.fast.metal_kernel(
     name="inkling_attention_sigmoid_table", input_names=["codes"], output_names=["table"],
     source="""
@@ -177,12 +242,14 @@ def attend(layer,q,k,v,rel,sinks,cache,gate,scaled_query=None):
     fresh = getattr(cache,"fresh",None)
     adjacent=getattr(cache,"interleaved_prefix",None)
     threads = 64 if length==1024 and layer.sliding_window==1024 else 256 if paged else 128
-    parts,stats = _partial(
+    together = paged and adjacent is not None and before is not None and heads==3*k.shape[1]
+    kernel = _three_global if together else _partial
+    parts,stats = kernel(
         inputs=[q if scaled_query is None else scaled_query,k if adjacent is None else adjacent,v if adjacent is None else adjacent,tail,q if fresh is None else fresh,rel,w,slot,end,
                 sinks.astype(q.dtype),scalar(layer.scaling)],
         template=[("SCALED",scaled_query is not None),("T",q.dtype),("S",length),("PRE_UPDATE",before is not None),("PAGED",paged),("ADJACENT",adjacent is not None),("FRESH",fresh is not None),("NKV",k.shape[1]),("GQA",heads//k.shape[1]),("WIDTH",width),("SWIZZLED",swizzled),
                   ("R",extent),("WINDOW",layer.sliding_window)],
-        grid=(128*32,heads,1),threadgroup=(threads,1,1),
+        grid=(128*32,k.shape[1] if together else heads,1),threadgroup=(64 if together else threads,1,1),
         output_shapes=[(heads,128,128),(heads,128,2)],output_dtypes=[q.dtype,mx.float32])
     return _merge(inputs=[parts,stats,gate,gate_probabilities()],template=[("LOOKUP",gate.dtype==mx.bfloat16),("T",q.dtype)],
                   grid=(64*32,heads,1),threadgroup=(256,1,1),
