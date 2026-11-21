@@ -4,7 +4,7 @@ from mlx_lm.kernels.common import scalar
 
 _source = """
         #pragma clang fp contract(off)
-        const uint head = threadgroup_position_in_grid.x;
+        const uint head = thread_position_in_grid.x / 32;
         const uint lane = thread_index_in_simdgroup;
         const bool query = head < H;
         const bool key = head >= H && head < H + KV;
@@ -132,7 +132,7 @@ def normalize(layer, query, key, value, relative, return_pair=False, filters=Non
             template.append(("W", filters[2].dtype))
             kernel=_filtered
     q, pair, r, *windows = kernel(
-        inputs=inputs, template=template, grid=(32*(2*heads+2*kv),1,1), threadgroup=(32,1,1),
+        inputs=inputs, template=template, grid=(32*(2*heads+2*kv),1,1), threadgroup=(128,1,1),
         output_shapes=shapes, output_dtypes=types)
     if filters is not None:
         return q, pair, r, windows
