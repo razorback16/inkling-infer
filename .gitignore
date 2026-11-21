@@ -2,3 +2,4 @@
 .proxy-key
 __pycache__/
 *.log
+.DS_Store
