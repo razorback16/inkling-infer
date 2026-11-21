@@ -38,7 +38,10 @@ def decode(layer, hidden_states, block_states, *, cache=None, conv_mask=None, me
             normed = layers.unweighted_rms_norm(hidden_states.astype(mx.float32))
             inputs = None
         else:
-            inputs, normed = depth_norm.evaluate(layer.attention_input, block_states, hidden_states)
+            from . import input_heads
+            prepare_messages = (normalized_messages is not None and
+                                getattr(layer._self_attention,"__func__",None) is input_heads.attention)
+            inputs, normed = depth_norm.evaluate(layer.attention_input, block_states, hidden_states, prepare_messages)
         payload = (messages, normalized_messages) if normalized_messages is not None else messages
         attention = layer._self_attention(hidden_states,inputs,cache,history,None,payload)
     if layer.is_block_boundary:

@@ -117,12 +117,43 @@ _kernel = make_kernel(False)
 _filtered = make_kernel(True)
 
 
-def evaluate(module, blocks, x):
+def _message_state_kernel():
+    source = cached_source(_source.replace("FILTER", ""))
+    source = source.replace("mixed[query*2304+d] = v + norm[d]*coeff[K];",
+                            "values[j] = v + norm[d]*coeff[K]; mixed[query*2304+d] = values[j];")
+    source += """
+        float norm2=0;
+        for (uint j=0;j<4;++j) norm2+=values[j]*values[j];
+        norm2=simd_sum(norm2);
+        if (!lane) sums[sg]=norm2;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (!sg) {
+            float scale=precise::rsqrt(simd_sum(lane<18 ? sums[lane] : 0.f)/2304.f+1e-6f);
+            if (!lane) inverse[query]=scale;
+        }
+    """
+    return mx.fast.metal_kernel(name="inkling_depth_message_inverse",
+                                input_names=["x","blocks","queries","closed"],
+                                output_names=["mixed","normalized","inverse"],source=source)
+
+
+_message_state = _message_state_kernel()
+
+
+def evaluate(module, blocks, x, prepare_messages=False):
     q = module.query.size // 2304
     closed, config = block_lookahead.lookup(module, blocks)
-    return _kernel(inputs=[x,blocks,module.query,closed], template=[("K",blocks.shape[0]), *config],
-                   grid=(q*576,1,1),threadgroup=(576,1,1),
-                   output_shapes=[(1,1,q,2304),x.shape],output_dtypes=[mx.float32,mx.float32])
+    shapes = [(1,1,q,2304),x.shape]
+    kernel = _message_state if prepare_messages else _kernel
+    if prepare_messages:
+        shapes.append((q,))
+    result = kernel(inputs=[x,blocks,module.query,closed], template=[("K",blocks.shape[0]), *config],
+                    grid=(q*576,1,1),threadgroup=(576,1,1),
+                    output_shapes=shapes,output_dtypes=[mx.float32]*len(shapes))
+    if prepare_messages:
+        mixed, normalized, inverse = result
+        return (mixed,inverse), normalized
+    return result
 
 
 def normalized_source(filtered=False):
