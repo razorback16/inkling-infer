@@ -16,7 +16,7 @@ def project(x, head):
         packed = packed_rows.encode(w)
         saved = (w, packed)
         object.__setattr__(head, "_encoded_vocab", saved)
-    return packed_rows.project(x,w,saved[1],vocabulary=True)
+    return packed_rows.project(x,w,saved[1])
 
 
 def call(model, inputs, cache=None, input_embeddings=None, pixel_values=None):
