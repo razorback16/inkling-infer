@@ -62,24 +62,6 @@ _dot = mx.fast.metal_kernel(
         uchar4 base=*(device const uchar4*)(bases+group*4);
         uint raw_tiles=flags[group];
         float sums[4]={};
-        if (!raw_tiles) {
-        for (uint block=0;block<18;++block) {
-            uint tile=((group/4)*18+block)*4+group%4;
-            uint d=block*128+lane*4;
-            float4 v=float4(*(device const bfloat4*)(x+d));
-            uint4 low=*(device const uint4*)(payload+tile*256+lane*4);
-            ushort4 high=*(device const ushort4*)(payload+tile*256+128+lane*2);
-            for (uint r=0;r<4;++r) {
-                ushort h=high[r];
-                ushort4 ex=ushort4(h,h>>4,h>>8,h>>12)&15;
-                ushort4 code=(ex<<8)|ushort4(as_type<uchar4>(low[r]));
-                ushort4 rotated=code+(ushort(base[r])<<8);
-                ushort4 bits=(rotated>>1)|(rotated<<15);
-                float4 w=float4(as_type<bfloat4>(bits));
-                for (uint j=0;j<4;++j) sums[r]=fma(v[j],w[j],sums[r]);
-            }
-        }
-        } else {
         for (uint block=0;block<18;++block) {
             uint tile=((group/4)*18+block)*4+group%4;
             uint d=block*128+lane*4;
@@ -102,7 +84,6 @@ _dot = mx.fast.metal_kernel(
                 float4 w=float4(as_type<bfloat4>(bits));
                 for (uint j=0;j<4;++j) sums[r]=fma(v[j],w[j],sums[r]);
             }
-        }
         }
         for (uint r=0;r<4;++r) {
             float dot=sums[r];
