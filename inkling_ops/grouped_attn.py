@@ -24,7 +24,7 @@ _partial = mx.fast.metal_kernel(
             if (pos >= S || dist >= end[0] || (WINDOW && dist >= WINDOW)) bias = -INFINITY;
             else if (dist < R) {
                 for (uint j=0; j<WIDTH; ++j)
-                    bias = fma(float(rel[head*WIDTH+j]), float(w[j*R+dist]), bias);
+                    bias = fma(float(rel[head*WIDTH+j]), float(w[SWIZZLED ? ((dist%128)*WIDTH+j)*(R/128)+dist/128 : j*R+dist]), bias);
                 bias = float(T(bias));
             }
             for (uint i=0; i<32 && chunk+tile+i*128<S; ++i) {
@@ -80,11 +80,21 @@ def attend(layer,q,k,v,rel,sinks,cache,gate):
     length, heads = k.shape[2], q.shape[1]
     slot = cache._idx if isinstance(cache,(RotatingKVCache,BatchRotatingKVCache)) else length
     w = layer.rel_logits_proj.proj.astype(rel.dtype)
+    width, extent = w.shape
+    swizzled = extent % 128 == 0
+    if swizzled:
+        weight = layer.rel_logits_proj.proj
+        saved = getattr(layer, "_relative_tiles", None)
+        if saved is None or saved[0] is not weight or saved[1] != rel.dtype:
+            tiled = mx.contiguous(w.reshape(width, extent//128, 128).transpose(2,0,1))
+            saved = (weight, rel.dtype, tiled)
+            object.__setattr__(layer, "_relative_tiles", saved)
+        w = saved[2]
     parts,stats = _partial(
         inputs=[q,k,v,rel,w,mx.array(slot,mx.int32).reshape(1),mx.array(cache.offset,mx.int32).reshape(1),
                 sinks.astype(q.dtype),scalar(layer.scaling)],
-        template=[("T",q.dtype),("S",length),("GQA",heads//k.shape[1]),("WIDTH",w.shape[0]),
-                  ("R",w.shape[1]),("WINDOW",layer.sliding_window)],
+        template=[("T",q.dtype),("S",length),("GQA",heads//k.shape[1]),("WIDTH",width),("SWIZZLED",swizzled),
+                  ("R",extent),("WINDOW",layer.sliding_window)],
         grid=(128*32,heads,1),threadgroup=(128,1,1),
         output_shapes=[(heads,128,128),(heads,128,2)],output_dtypes=[q.dtype,mx.float32])
     return _merge(inputs=[parts,stats,gate],template=[("T",q.dtype)],
