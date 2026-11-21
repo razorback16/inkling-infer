@@ -78,8 +78,7 @@ _select = mx.fast.metal_kernel(
         uint tid=thread_position_in_threadgroup.x, lane=thread_index_in_simdgroup;
         uint warp=simdgroup_index_in_threadgroup;
         threadgroup float biased[128], scores[128], selected[8];
-        threadgroup uint special[4], candidates[32];
-        threadgroup float values[32];
+        threadgroup uint special[4];
         if (tid<128) {
             float x=logits[tid];
             float p=1.f/(1.f+precise::exp(abs(x)));
@@ -113,29 +112,16 @@ _select = mx.fast.metal_kernel(
                 }
             }
         } else {
-            float own=biased[tid];
-            for (uint k=0;k<8;++k) {
-                float peak=simd_max(own);
-                uint winner=simd_min(own==peak ? tid : 128u);
-                if (!lane) {
-                    candidates[warp*8+k]=winner;
-                    values[warp*8+k]=peak;
-                }
-                if (tid==winner) own=-INFINITY;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (!warp) {
-                uint expert=candidates[lane];
-                float value=values[lane];
-                for (uint k=0;k<8;++k) {
-                    float peak=simd_max(value);
-                    uint winner=simd_min(value==peak ? expert : 128u);
-                    if (!lane) {
-                        inds[k]=winner;
-                        selected[k]=scores[winner];
-                    }
-                    if (expert==winner) value=-INFINITY;
-                }
+            float other[4];
+            for (uint j=0;j<4;++j) other[j]=biased[lane+32*j];
+            for (uint i=0;i<4;++i) {
+                uint e=warp+32*i;
+                float query=simd_shuffle(other[i],warp);
+                uint ahead=0;
+                for (uint j=0;j<4;++j)
+                    ahead+=uint(other[j]>query || (other[j]==query && lane+32*j<e));
+                uint rank=simd_sum(ahead);
+                if (!lane && rank<8) {inds[rank]=e; selected[rank]=scores[e];}
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -165,7 +151,7 @@ def route(layer, x, dtype, normalized=False, logits=None):
     if gate.top_k == 8:
         indices, weights = _select(
             inputs=[logits,gate.e_score_correction_bias,scalar(layers._ROUTER_SCORE_EPS),
-                    scalar(gate.routed_scaling_factor)], grid=(128,1,1),threadgroup=(128,1,1),
+                    scalar(gate.routed_scaling_factor)], grid=(1024,1,1),threadgroup=(1024,1,1),
             output_shapes=[(1,1,8)]*2, output_dtypes=[mx.uint32,mx.float32])
     else:
         indices, weights = layers.expert_routing(
