@@ -18,10 +18,10 @@ def _apply(states, messages, down, up, normalized=None):
         joined = paired_norm.join(states, messages if normalized is None else normalized, down.dtype, normalized is not None)
     else:
         joined = mx.concatenate((norm(states), norm(messages)), axis=-1).astype(down.dtype)
-    reduced = (joined @ down.swapaxes(-1, -2)).astype(mx.float32)
+    reduced = joined @ down.swapaxes(-1, -2)
     if reduced.shape[-1] == 64 and states.shape[-1] == 2304 and up.dtype in (mx.bfloat16, mx.float32):
         return apply(reduced, up, states, messages)
-    gates = mx.tanh(reduced @ up.swapaxes(-1, -2))
+    gates = mx.tanh(reduced.astype(mx.float32) @ up.swapaxes(-1, -2))
     forget, gain = mx.split(gates, 2, axis=-1)
     return (1 - forget) * states + gain * messages
 
