@@ -83,9 +83,11 @@ def kernel():
                     if (xr<count) v=*(device const bfloat4*)(x+input_row*K+k+xc+j);
                     *(threadgroup bfloat4*)(Xs+xr*40+xc+j)=v;
                 }
-                uint scale=scales[weight_row*(K/16)+(k+wc)/16];
+                uint tile=((expert*(N/64)+column/64)*(K/32)+k/32);
+                auto data=w+tile*288;
+                uint scale=((device const uchar*)data)[tid];
                 auto values=table+(expert*256+scale)*16;
-                uint2 codes=*(device const uint2*)(w+weight_row*(K/8)+(k+wc)/8);
+                uint2 codes=((device const uint2*)(data+32))[tid];
                 for (ushort j=0;j<16;++j)
                     Ws[wr*40+wc+j]=values[(codes[j/8]>>((j%8)*4))&15];
                 threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -130,6 +132,22 @@ def applicable(proj):
             and proj.weight.shape[0]==128 and proj.input_dims%32==0 and proj.output_dims%64==0)
 
 
+def packed_tiles(proj):
+    weight,scales=proj.weight,proj.scales
+    saved=getattr(proj,"_prompt_tiles",None)
+    if saved is None or saved[0] is not weight or saved[1] is not scales:
+        e,n,k=proj.num_experts,proj.output_dims,proj.input_dims
+        groups=(e,n//64,k//32)
+        codes=weight.reshape(e,n//64,64,k//32,4).transpose(0,1,3,2,4).reshape(*groups,256)
+        levels=scales.reshape(e,n//64,64,k//32,2).transpose(0,1,3,2,4)
+        levels=mx.contiguous(levels).reshape(*groups,128).view(mx.uint32)
+        packed=mx.concatenate((levels,codes),axis=-1)
+        mx.eval(packed)
+        saved=(weight,scales,packed)
+        object.__setattr__(proj,"_prompt_tiles",saved)
+    return saved[2]
+
+
 def project(proj, x, tiles, activation=None, token_rows=None, original_slots=None):
     scale=proj.global_scale
     saved=getattr(proj,"_prompt_coefficients",None)
@@ -143,7 +161,7 @@ def project(proj, x, tiles, activation=None, token_rows=None, original_slots=Non
     n=proj.output_dims
     width=n//2 if activation is not None else n
     m=x.shape[0] if token_rows is None else token_rows.size
-    return kernel()(inputs=[x,proj.weight,proj.scales,saved[1],tiles,x if activation is None else activation,
+    return kernel()(inputs=[x,packed_tiles(proj),proj.scales,saved[1],tiles,x if activation is None else activation,
                             tiles if token_rows is None else token_rows,tiles if original_slots is None else original_slots],
                     template=[("K",proj.input_dims),("N",n),("GATED",activation is not None),("GATHER",token_rows is not None),("ROUTE_LAYOUT",original_slots is not None)],
                     grid=(n//64*128,tiles.shape[0],1),threadgroup=(128,1,1),
