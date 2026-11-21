@@ -2,11 +2,7 @@
 import mlx.core as mx
 from mlx_lm.kernels.common import scalar
 
-_kernel = mx.fast.metal_kernel(
-    name="inkling_head_norm",
-    input_names=["q", "k", "v", "r", "qs", "rs", "threshold", "rel_threshold", "eps"],
-    output_names=["qo", "kvo", "ro"],
-    source="""
+_source = """
         #pragma clang fp contract(off)
         const uint head = threadgroup_position_in_grid.x;
         const uint lane = thread_index_in_simdgroup;
@@ -46,20 +42,54 @@ _kernel = mx.fast.metal_kernel(
             else if (val) kvo[KV*D+base+d] = x;
             else ro[base+d] = x;
         }
-    """,
+    """
+_inputs = ["q", "k", "v", "r", "qs", "rs", "threshold", "rel_threshold", "eps"]
+_outputs = ["qo", "kvo", "ro"]
+_kernel = mx.fast.metal_kernel(name="inkling_head_norm", input_names=_inputs,
+                               output_names=_outputs, source=_source)
+_filter = """
+            if (key || val) {
+                auto history = key ? kh : vh;
+                auto conv = key ? kw : vw;
+                auto next = key ? k_window : v_window;
+                float total = 0;
+                for (uint t = 0; t < 3; ++t) {
+                    float old = history[t*KV*D+i];
+                    next[t*KV*D+i] = old;
+                    total = fma(float(W(old)), float(conv[i*4+t]), total);
+                }
+                next[3*KV*D+i] = x;
+                total = fma(float(W(x)), float(conv[i*4+3]), total);
+                x = float(T((float(W(total))+x)*0.4472135954999579f));
+            }
+"""
+_filtered = mx.fast.metal_kernel(
+    name="inkling_head_norm_filtered_pair", input_names=_inputs + ["kh","vh","kw","vw"],
+    output_names=_outputs + ["k_window","v_window"],
+    source=_source.replace("            states[d", _filter + "            states[d", 1),
 )
 
 
-def normalize(layer, query, key, value, relative, return_pair=False):
+
+def normalize(layer, query, key, value, relative, return_pair=False, filters=None):
     heads, kv, dim = layer.num_heads, layer.num_key_value_heads, layer.head_dim
     rel = relative.shape[-1] // heads
-    q, pair, r = _kernel(
-        inputs=[query, key, value, relative, layer.q_l2_clip.scale, layer.rel_l2_clip.scale,
-                scalar(layer.q_l2_clip.threshold), scalar(layer.rel_l2_clip.threshold), scalar(layer.eps)],
-        template=[("T", query.dtype), ("H", heads), ("KV", kv), ("D", dim), ("R", rel)],
-        grid=(32 * (2 * heads + 2 * kv), 1, 1), threadgroup=(32, 1, 1),
-        output_shapes=[(1, 1, heads, dim), (1, 1, 2*kv, dim), (1, 1, heads, rel)],
-        output_dtypes=[query.dtype] * 3,
-    )
+    inputs = [query, key, value, relative, layer.q_l2_clip.scale, layer.rel_l2_clip.scale,
+              scalar(layer.q_l2_clip.threshold), scalar(layer.rel_l2_clip.threshold), scalar(layer.eps)]
+    shapes = [(1, 1, heads, dim), (1, 1, 2*kv, dim), (1, 1, heads, rel)]
+    types = [query.dtype] * 3
+    template = [("T", query.dtype), ("H", heads), ("KV", kv), ("D", dim), ("R", rel)]
+    kernel = _kernel
+    if filters is not None:
+        inputs.extend(filters)
+        shapes.extend([(1,4,kv*dim)] * 2)
+        types.extend([mx.float32] * 2)
+        template.append(("W", filters[2].dtype))
+        kernel = _filtered
+    q, pair, r, *windows = kernel(
+        inputs=inputs, template=template, grid=(32*(2*heads+2*kv),1,1), threadgroup=(32,1,1),
+        output_shapes=shapes, output_dtypes=types)
+    if filters is not None:
+        return q, pair, r, windows
     k, v = mx.split(pair,2,axis=2)
     return (q, k, v, r, pair) if return_pair else (q, k, v, r)

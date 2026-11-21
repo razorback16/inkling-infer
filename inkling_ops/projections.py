@@ -46,14 +46,25 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
     else:
         key = layer.k_proj(key_hidden_states)
         value = layer.v_proj(value_hidden_states)
+    fused_norm = (same and not full and conv_mask is None and conv_states is not None and layer.head_dim == 128
+                  and relative.shape[-1] // layer.num_heads <= 128
+                  and key.dtype == value.dtype == query.dtype
+                  and all(type(c) is layers.ShortConvolution and c.kernel_size == 4
+                          for c in (layer.k_sconv, layer.v_sconv))
+                  and layer.k_sconv.conv1d.weight.dtype == layer.v_sconv.conv1d.weight.dtype
+                  and all(h is not None and h.shape == (1,3,key.shape[-1]) for h in conv_states[:2]))
     if full:
         key, conv_states[0] = layer.k_sconv(key, key_hidden_states, conv_states[0], conv_mask)
         value, conv_states[1] = layer.v_sconv(value, value_hidden_states, conv_states[1], conv_mask)
-    elif filtered is None:
+    elif filtered is None and not fused_norm:
         key, conv_states[0] = layer.k_sconv(key, conv_states[0], conv_mask)
         value, conv_states[1] = layer.v_sconv(value, conv_states[1], conv_mask)
     pair = None
-    if layer.head_dim == 128 and relative.shape[-1] // layer.num_heads <= 128:
+    if fused_norm:
+        filters = [*conv_states[:2],layer.k_sconv.conv1d.weight,layer.v_sconv.conv1d.weight]
+        query, pair, rel, conv_states[:2] = normalize(layer,query,key,value,relative,filters=filters)
+        key,value = mx.split(pair,2,axis=2)
+    elif layer.head_dim == 128 and relative.shape[-1] // layer.num_heads <= 128:
         query, key, value, rel, pair = normalize(layer, query, key, value, relative, return_pair=True)
     else:
         query = layer.q_l2_clip(query.reshape(1, 1, layer.num_heads, -1))
