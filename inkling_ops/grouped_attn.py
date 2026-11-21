@@ -6,6 +6,15 @@ from mlx_lm.models.cache import BatchRotatingKVCache, RotatingKVCache
 _partial = mx.fast.metal_kernel(
     name="inkling_interleaved_attention",
     input_names=["q","k","v","tail","fresh","rel","w","slot","end","sinks","scale"],output_names=["partials","stats"],
+    header="""
+        inline float2 online_scales(float peak, float score, float top) {
+            if (isfinite(peak) && isfinite(score)) {
+                float smaller = fast::exp(min(peak,score)-top);
+                return float2(peak==top ? 1.f : smaller, score==top ? 1.f : smaller);
+            }
+            return float2(fast::exp(peak-top), fast::exp(score-top));
+        }
+    """,
     source="""
         uint lane = thread_index_in_simdgroup, head = threadgroup_position_in_grid.y;
         int newest = slot[0] - (PRE_UPDATE ? 0 : 1);
@@ -44,7 +53,8 @@ _partial = mx.fast.metal_kernel(
                 auto value_ptr = FRESH && uint(newest)==tile+pos*128 ? fresh+(NKV+kv)*128+d : v+at;
                 float4 value=float4(*(device const bfloat4*)value_ptr);
                 float score=scores[pos], top=max(peak,score);
-                float a=fast::exp(peak-top), b=fast::exp(score-top);
+                float2 factors=online_scales(peak,score,top);
+                float a=factors.x,b=factors.y;
                 total=total*a+b;
                 for (uint j=0; j<4; ++j) accum[j]=accum[j]*a+b*value[j];
                 peak=top;
@@ -79,7 +89,8 @@ _partial = mx.fast.metal_kernel(
                     for (uint j=0; j<4; ++j) score += query[j]*float(keys[p+j]);
                     score = simd_sum(score)+pb;
                     float top = max(peak,score);
-                    float a = fast::exp(peak-top), b = fast::exp(score-top);
+                    float2 factors=online_scales(peak,score,top);
+                    float a=factors.x,b=factors.y;
                     total = total*a+b;
                     for (uint j=0; j<4; ++j) accum[j] = accum[j]*a+b*float(values[p+j]);
                     peak = top;
