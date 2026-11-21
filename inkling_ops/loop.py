@@ -19,11 +19,13 @@ def _compile(model):
     @mx.compile
     def run(x, states, offset, slots):
         caches = []
+        position_scales = {}
         for (packed, history), slot in zip(states, slots):
             pages = packed if isinstance(packed, tuple) else None
             storage = mx.concatenate(pages, axis=2) if pages is not None else packed
             keys, values = mx.split(storage, 2, axis=1)
             ring = _DeviceRing(keys, values, offset, slot, packed=storage)
+            ring.position_scales = position_scales
             if pages is not None:
                 ring.page_prefix, ring.page_tail = pages
             conv = ArraysCache(4)
