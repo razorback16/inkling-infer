@@ -96,25 +96,31 @@ _compact_rows = mx.fast.metal_kernel(
         }
         for (ushort step=16;step;step>>=1) dot+=simd_shuffle_down(dot,step);
         threadgroup float values[4];
-        if (!lane) {
-            float v=float(bfloat16_t(dot)),filtered=0;
-            for (uint t=0;t<3;++t) {
-                float old=history[t*2304+row];
-                window[t*2304+row]=old;
-                filtered=fma(float(W(old)),float(conv[row*4+t]),filtered);
-            }
-            filtered=fma(float(W(v)),float(conv[row*4+3]),filtered);
-            window[3*2304+row]=v;
-            float out=float(bfloat16_t((float(W(filtered))+v)*0.4472135954999579f));
-            if (!BOUNDARY) out+=float(hidden[row]);
-            residual[row]=out;
-            values[sg]=out;
-        }
+        if (!lane) values[sg]=dot;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (!sg && !lane) {
+        if (!sg) {
+            uint first=row&~3u;
+            float out=0;
+            if (lane<4) {
+                uint col=first+lane;
+                float v=float(bfloat16_t(values[lane])),filtered=0;
+                for (uint t=0;t<3;++t) {
+                    float old=history[t*2304+col];
+                    window[t*2304+col]=old;
+                    filtered=fma(float(W(old)),float(conv[col*4+t]),filtered);
+                }
+                filtered=fma(float(W(v)),float(conv[col*4+3]),filtered);
+                window[3*2304+col]=v;
+                out=float(bfloat16_t((float(W(filtered))+v)*0.4472135954999579f));
+                if (!BOUNDARY) out+=float(hidden[col]);
+                residual[col]=out;
+            }
             float norm2=0;
-            for (uint i=0;i<4;++i) norm2+=values[i]*values[i];
-            squares[row/4]=norm2;
+            for (ushort i=0;i<4;++i) {
+                float v=simd_shuffle(out,i);
+                norm2+=v*v;
+            }
+            if (!lane) squares[first/4]=norm2;
         }
     """,
 )
