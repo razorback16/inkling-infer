@@ -14,7 +14,7 @@ _reference = layers.MessageGate.__call__
 @mx.compile
 def _project(hidden, message, down, paired, normalized=None):
     if prepared_reduce.applicable(hidden,normalized,down,paired):
-        return apply(prepared_reduce.reduce(hidden,normalized,down),paired,hidden,message)
+        return apply(prepared_reduce.reduce(hidden,normalized,down,widen=True),paired,hidden,message)
     if hidden.shape[-1] == 2304 and hidden.dtype == message.dtype == mx.float32:
         joined = paired_norm.join(hidden, message if normalized is None else normalized, down.dtype, normalized is not None)
     else:

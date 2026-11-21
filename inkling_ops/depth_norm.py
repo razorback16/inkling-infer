@@ -314,7 +314,7 @@ def from_projection(layer, blocks, residual, squares, normalize, gate=None, mess
     if message is not None:
         return _projected_message(inputs=[*inputs,gate,message],template=[("K",blocks.shape[0]),*config],
                                   grid=(32*576,1,1),threadgroup=(576,1,1),
-                                  output_shapes=[(1,1,1,2304),(1,1,64)],output_dtypes=[mx.float32,mx.bfloat16])
+                                  output_shapes=[(1,1,1,2304),(1,1,64)],output_dtypes=[mx.float32,mx.float32])
     if gate is not None:
         return _projected_routes(inputs=[*inputs,gate,layer.mlp.gate.e_score_correction_bias],template=[("K",blocks.shape[0]),*config],
                                  grid=(64*576,1,1),threadgroup=(576,1,1),

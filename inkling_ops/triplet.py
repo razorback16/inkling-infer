@@ -14,7 +14,7 @@ _reference = layers.DecoderLayer._mix_messages
 @mx.compile
 def _apply(states, messages, down, up, normalized=None, inverse=None):
     if prepared_reduce.applicable(states,normalized,down,up):
-        return apply(prepared_reduce.reduce(states,normalized,down,inverse),up,states,messages)
+        return apply(prepared_reduce.reduce(states,normalized,down,inverse,widen=True),up,states,messages)
     norm = layers.unweighted_rms_norm
     if states.shape[-1] == 2304 and states.dtype == messages.dtype == mx.float32:
         joined = paired_norm.join(states, messages if normalized is None else normalized, down.dtype, normalized is not None)
@@ -52,7 +52,7 @@ def mix_messages(layer, states, messages, packed_states=None, inverse=None, with
     msg = messages.reshape(4, 1, -1)[:3]
     prepared = None if normalized is None else normalized.reshape(4,1,-1)[:3]
     if with_sums and prepared_reduce.applicable(x,prepared,cache[1],cache[2]):
-        reduced = prepared_reduce.reduce(x,prepared,cache[1],inverse)
+        reduced = prepared_reduce.reduce(x,prepared,cache[1],inverse,widen=True)
         outputs, sums = apply(reduced,cache[2],x,msg,with_sums=True)
         return tuple(mx.split(outputs,3,axis=0)), sums
     outputs = _apply(x, msg, cache[1], cache[2], prepared, inverse)

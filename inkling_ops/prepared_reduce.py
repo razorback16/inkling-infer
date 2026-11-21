@@ -54,10 +54,10 @@ def applicable(state, msg, down, up):
             and up.shape[-2:]==(4608,64) and up.dtype in (mx.bfloat16,mx.float32))
 
 
-def reduce(state,msg,down,inverse=None):
+def reduce(state,msg,down,inverse=None,widen=False):
     banks=msg.size//2304
     rows=2 if inverse is not None else 4
     return _kernel(inputs=[state,msg,down,state if inverse is None else inverse],
                    template=[("ROWS",rows),("SHARED",state.size!=msg.size),("PRECOMPUTED",inverse is not None)],
                    grid=(64//rows*256,banks,1),threadgroup=(256,1,1),
-                   output_shapes=[msg.shape[:-1]+(64,)],output_dtypes=[mx.bfloat16])[0]
+                   output_shapes=[msg.shape[:-1]+(64,)],output_dtypes=[mx.float32 if widen else mx.bfloat16])[0]
