@@ -12,7 +12,7 @@ _ranges = mx.fast.metal_kernel(
             peak=max(peak,max(max(e.x,e.y),max(e.z,e.w)));
         }
         peak=simd_max(peak);
-        if (!lane) bases[row]=uchar(max(int(peak>>1)-7,0));
+        if (!lane) bases[row]=uchar(max(int(peak)-15,0));
     """,
 )
 
@@ -31,12 +31,12 @@ _pack = mx.fast.metal_kernel(
             uint i=(4*group+row)*2304+block*128+lane*4;
             ushort4 bits=*(device const ushort4*)((device const ushort*)weight+i);
             ushort4 e=(bits>>7)&255;
-            ushort4 delta=(e>>1)-ushort(base[row]);
-            bool4 escapes=delta>7;
+            ushort4 delta=e-ushort(base[row]);
+            bool4 escapes=delta>15;
             raw |= any(escapes);
-            uchar4 bytes=uchar4(bits);
+            uchar4 bytes=uchar4((bits<<1)|(bits>>15));
             low[row]=as_type<uint>(bytes);
-            ushort4 n=(delta&7)|((bits>>12)&8);
+            ushort4 n=delta&15;
             high[row]=n.x|(n.y<<4)|(n.z<<8)|(n.w<<12);
         }
         bool any_raw=simd_any(raw);
@@ -78,9 +78,9 @@ _dot = mx.fast.metal_kernel(
             for (uint r=0;r<4;++r) {
                 ushort h=high[r];
                 ushort4 ex=ushort4(h,h>>4,h>>8,h>>12)&15;
-                ushort4 upper=(ex&7)+ushort(base[r]);
-                upper|=(ex&8)<<4;
-                ushort4 bits=(upper<<8)|ushort4(as_type<uchar4>(low[r]));
+                ushort4 code=(ex<<8)|ushort4(as_type<uchar4>(low[r]));
+                ushort4 rotated=code+(ushort(base[r])<<8);
+                ushort4 bits=(rotated>>1)|(rotated<<15);
                 float4 w=float4(as_type<bfloat4>(bits));
                 for (uint j=0;j<4;++j) sums[r]=fma(v[j],w[j],sums[r]);
             }
