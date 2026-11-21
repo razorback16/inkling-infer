@@ -84,10 +84,11 @@ def kernel():
                         uint addr=input_rows[i]*K+k+frag*8+fn;
                         mma.Atile.frag_at(i,0)=float2(*(device const bfloat2*)(x+addr));
                     }
-                    uint at=((tile*4+frag)*2+simdgroup_index_in_threadgroup%2)*32+thread_index_in_simdgroup;
-                    uint4 bits=((device const uint4*)w)[at];
-                    for (short j=0;j<4;++j)
-                        mma.Btile.frag_at(0,j)=float2(as_type<bfloat2>(bits[j]));
+                    for (short j=0;j<4;++j) {
+                        uint nfrag=simdgroup_index_in_threadgroup%2+2*j;
+                        uint at=((tile*32+frag*8+nfrag)*32+thread_index_in_simdgroup);
+                        mma.Btile.frag_at(0,j)=float2(((device const bfloat2*)w)[at]);
+                    }
                     mlx::steel::tile_matmad(mma.Ctile,mma.Atile,mma.Btile,mma.Ctile);
                 }
             }
@@ -147,10 +148,9 @@ _expand = mx.fast.metal_kernel(
     source="""
         uint index=thread_position_in_grid.x,tile=index/1024;
         uint expert=tile/((N/64)*(K/32)), nb=(tile/(K/32))%(N/64), kb=tile%(K/32);
-        uint kfrag=(index/256)%4, nfrag=(index/128)%2+2*(index%4);
-        uint lane=(index/4)%32;
+        uint frag=(index/32)%32,lane=index%32;
         uint fm=((lane/4)&4)+(lane/2)%4, fn=((lane/4)&2)*2+(lane%2)*2;
-        uint k=kb*32+kfrag*8+fm, row=expert*N+nb*64+nfrag*8+fn;
+        uint k=kb*32+(frag/8)*8+fm, row=expert*N+nb*64+(frag%8)*8+fn;
         for (ushort j=0;j<2;++j) {
             if (MX8) {
                 uint bits=weight[(row+j)*(K/4)+k/4];
