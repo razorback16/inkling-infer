@@ -1,4 +1,6 @@
 """Single-token weighted mixture of eight Inkling expert outputs."""
+import os
+
 import mlx.core as mx
 from mlx_lm.models.inkling2 import layers
 
@@ -138,6 +140,8 @@ def single_token_moe(self, x):
 
 
 def install():
+    if mx.device_info().get("device_name") == "Apple M3 Ultra":
+        os.environ.setdefault("MLX_BFS_MAX_WIDTH", "100")
     from inkling_ops import packed_vocab
     packed_vocab.install()
     from inkling_ops import attention_mask, compiled_ring, dynamic_conv, message_gate, projections, short_conv, triplet
