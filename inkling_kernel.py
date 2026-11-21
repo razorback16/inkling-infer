@@ -128,7 +128,7 @@ def single_token_moe(self, x):
     down = self.experts.down_proj
     if can_fuse_down(down, x):
         from inkling_ops.expert_gate import gated_activation
-        hidden = gated_activation(self.experts, x, experts, widen=True)
+        hidden = gated_activation(self.experts, x, experts)
         return _down_mix(
             inputs=[hidden, experts, weights, down.weight, down.scales, down.global_scale],
             template=[("T", x.dtype)], grid=(576 * 256, 1, 1),

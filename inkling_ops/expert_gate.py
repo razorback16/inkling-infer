@@ -108,7 +108,7 @@ def activation_tables():
     return table
 
 
-def gated_activation(layer, x, indices, widen=False):
+def gated_activation(layer, x, indices):
     proj = layer.gate_up_proj
     if (x.shape == (1,1,2304) and x.dtype == mx.bfloat16 and indices.shape == (1,1,8)
             and getattr(proj, "mode", None) == "mxfp8" and proj.group_size == 32 and proj.bits == 8
@@ -129,7 +129,7 @@ def gated_activation(layer, x, indices, widen=False):
     active = _kernel(
         inputs=[x, indices, proj.weight, proj.scales, proj.global_scale, activation_tables()],
         grid=(144 * 128, 8, 1), threadgroup=(128, 1, 1),
-        output_shapes=[(1, 1, 8, 1, 1152)], output_dtypes=[mx.float32 if widen else x.dtype],
+        output_shapes=[(1, 1, 8, 1, 1152)], output_dtypes=[x.dtype],
     )[0]
     return active
 
