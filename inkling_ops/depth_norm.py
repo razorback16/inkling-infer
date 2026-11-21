@@ -142,19 +142,6 @@ def normalized_source(filtered=False):
     """
 
 
-_final = mx.fast.metal_kernel(
-    name="inkling_final_depth_norm",
-    input_names=["x","blocks","queries","weights","eps"],output_names=["mixed"],
-    source=normalized_source().replace("if (!query) normalized[d] = norm[d];",""),
-)
-
-
-def final_hidden(layer,raw,blocks):
-    return _final(inputs=[raw,blocks,layer.final_input.query,layer.norm.weight,scalar(layer.norm.eps)],
-                  template=[("K",blocks.shape[0])],grid=(576,1,1),threadgroup=(576,1,1),
-                  output_shapes=[raw.shape],output_dtypes=[mx.bfloat16])[0]
-
-
 _normalized_inputs = mx.fast.metal_kernel(
     name="inkling_depth_attention_input_norm",
     input_names=["x","blocks","queries","weights","eps","closed"], output_names=["mixed","normalized"],
