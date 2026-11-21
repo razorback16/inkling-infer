@@ -55,9 +55,7 @@ _pack = mx.fast.metal_kernel(
 
     """,
 )
-_dot = mx.fast.metal_kernel(
-    name="inkling_four_row_gemv", input_names=["x","payload"],output_names=["out"],
-    source="""
+_dot_source = """
         uint lane=thread_index_in_simdgroup, group=thread_position_in_grid.x/32;
         uint2 meta=*(device const uint2*)(payload+(group/4)*18688+(group%4)*2);
         uchar4 base=as_type<uchar4>(meta.x);
@@ -91,8 +89,40 @@ _dot = mx.fast.metal_kernel(
             for (ushort step=16;step;step>>=1) dot+=simd_shuffle_down(dot,step);
             if (!lane) out[group*4+r]=bfloat16_t(dot);
         }
-    """,
+    """
+_dot = mx.fast.metal_kernel(
+    name="inkling_four_row_gemv", input_names=["x","payload"],output_names=["out"],
+    source=_dot_source,
 )
+
+_relative_source = _dot_source.replace("float sums[4]={};", """
+        bool relative=group*4>=BEGIN && group*4<END;
+        threadgroup float scaled[16];
+        float sums[4]={};
+    """).replace("if (!lane) out[group*4+r]=bfloat16_t(dot);", """
+        if (!lane) {
+            uint row=group*4+r;
+            bfloat16_t value=bfloat16_t(dot);
+            if (relative) scaled[row%16]=float(value)*float(rs[row-BEGIN]);
+            else out[row]=value;
+        }
+    """) + """
+        if (relative) {
+            #pragma clang fp contract(off)
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (thread_position_in_threadgroup.x<16) {
+                float total=0;
+                for (uint j=0;j<16;++j) total+=scaled[j]*scaled[j];
+                float scale=min(1.f,threshold/(precise::sqrt(total)+1e-6f));
+                out[threadgroup_position_in_grid.x*16+lane]=bfloat16_t(scaled[lane]*scale);
+            }
+        }
+    """
+_dot_relative = mx.fast.metal_kernel(
+    name="inkling_relative_four_row_gemv", input_names=["x","payload","rs","threshold"],
+    output_names=["out"],source=_relative_source,
+)
+
 
 
 def encode(weight):
@@ -108,7 +138,12 @@ def encode(weight):
     return (mx.concatenate((headers,payload.reshape(-1,18432)),axis=1),)
 
 
-def project(x,weight,encoded):
+def project(x,weight,encoded,relative=None):
     rows=weight.shape[0]
+    if relative is not None:
+        start,rs,threshold=relative
+        return _dot_relative(inputs=[x,*encoded,rs,threshold],template=[("BEGIN",start),("END",start+rs.size)],
+                             grid=(rows*8,1,1),threadgroup=(128,1,1),
+                             output_shapes=[(1,1,rows)],output_dtypes=[x.dtype])[0]
     return _dot(inputs=[x,*encoded],grid=(rows*8,1,1),threadgroup=(128,1,1),
                 output_shapes=[(1,1,rows)],output_dtypes=[x.dtype])[0]

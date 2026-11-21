@@ -91,9 +91,14 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
     name = "_all_qkv" if same else "_common_q"
     packed, boundaries = projection(layer,modules,name)
     tiles = getattr(layer,name+"_tiles",None)
-    projected = (packed_rows.project(hidden_states,packed,tiles[1])
-                 if tiles is not None and tiles[0] is packed and hidden_states.dtype==mx.bfloat16
-                 else hidden_states @ packed.T)
+    clip=None
+    tiled=tiles is not None and tiles[0] is packed and hidden_states.dtype==mx.bfloat16
+    if (tiled and not full and layer.head_dim==128 and boundaries[0]%16==0
+            and boundaries[1]-boundaries[0]==layer.num_heads*16
+            and type(layer.rel_l2_clip) is layers.ScaledL2Clip and layer.rel_l2_clip.scale.size==layer.num_heads*16):
+        from mlx_lm.kernels.common import scalar
+        clip=(boundaries[0],layer.rel_l2_clip.scale,scalar(layer.rel_l2_clip.threshold))
+    projected = packed_rows.project(hidden_states,packed,tiles[1],clip) if tiled else hidden_states @ packed.T
     parts = mx.split(projected,boundaries,axis=-1)
     query, relative, gate = parts[:3]
     sinks = layer.sink_proj(hidden_states)
@@ -139,10 +144,10 @@ def attend(layer, hidden_states, key_hidden_states, value_hidden_states, *, cach
                      layer.k_sconv.weight_proj(key_hidden_states),layer.v_sconv.weight_proj(value_hidden_states)]
         else:
             filters=[*conv_states[:2],layer.k_sconv.conv1d.weight,layer.v_sconv.conv1d.weight]
-        query, pair, rel, conv_states[:2] = normalize(layer,query,key,value,relative,filters=filters,position=position)
+        query, pair, rel, conv_states[:2] = normalize(layer,query,key,value,relative,filters=filters,position=position,relative_ready=clip is not None)
         key,value = mx.split(pair,2,axis=2)
     elif layer.head_dim == 128 and relative.shape[-1] // layer.num_heads <= 128:
-        query, key, value, rel, pair = normalize(layer, query, key, value, relative, return_pair=True)
+        query, key, value, rel, pair = normalize(layer, query, key, value, relative, return_pair=True,relative_ready=clip is not None)
     else:
         query = layer.q_l2_clip(query.reshape(1, 1, layer.num_heads, -1))
         key = layer.k_l2_clip(key.reshape(1, 1, layer.num_key_value_heads, -1))
