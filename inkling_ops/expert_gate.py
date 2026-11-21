@@ -34,8 +34,11 @@ _kernel = mx.fast.metal_kernel(
                 uint bits = packed[row * 288 + word];
                 float partial = 0.f;
                 for (uint i = 0; i < 8; i += 4) {
-                    partial += v[i] * levels[bits & 15] + v[i+1] * levels[(bits >> 4) & 15]
-                             + v[i+2] * levels[(bits >> 8) & 15] + v[i+3] * levels[(bits >> 12) & 15];
+                    float group = v[i] * levels[bits & 15];
+                    group = fma(v[i+1], levels[(bits >> 4) & 15], group);
+                    group = fma(v[i+2], levels[(bits >> 8) & 15], group);
+                    group = fma(v[i+3], levels[(bits >> 12) & 15], group);
+                    partial += group;
                     bits >>= 16;
                 }
                 float term = partial * fp8_scale(scales[row * 144 + word / 2]);
