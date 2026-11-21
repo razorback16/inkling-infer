@@ -5,7 +5,7 @@ from mlx_lm.models.inkling2.model import Model
 
 _reference = Model.__call__
 
-from . import single_row_tiles
+from . import vocab_tiles
 
 
 def project(x, head):
@@ -13,10 +13,10 @@ def project(x, head):
     n, k = w.shape
     saved = getattr(head, "_encoded_vocab", None)
     if saved is None or saved[0] is not w:
-        packed = single_row_tiles.encode(w)
+        packed = vocab_tiles.encode(w)
         saved = (w, packed)
         object.__setattr__(head, "_encoded_vocab", saved)
-    return single_row_tiles.project(x,w,saved[1])
+    return vocab_tiles.project(x,w,saved[1])
 
 
 def call(model, inputs, cache=None, input_embeddings=None, pixel_values=None):
