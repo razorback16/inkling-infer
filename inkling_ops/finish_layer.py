@@ -44,13 +44,10 @@ def decode(layer, hidden_states, block_states, *, cache=None, conv_mask=None, me
     active = expert_gate.gated_activation(moe.experts,x,selected)
     w = post.conv1d.weight
     if fused_down:
-        out, next_history = _finish_mix(
-            inputs=[active, selected, routing, down.weight, down.scales, down.global_scale,
-                    history[3], w, residual],
-            template=[("T", x.dtype), ("W",w.dtype)], grid=(576*256,1,1), threadgroup=(256,1,1),
-            output_shapes=[x.shape, (1,3,2304)], output_dtypes=[x.dtype,mx.float32])
+        from . import ordered_down
+        states = ordered_down.project(active, selected, down)
     else:
         states = down(active, selected).squeeze(-2)
-        out, next_history = postmix.finish(states, routing, history[3], w, residual)
+    out, next_history = postmix.finish(states, routing, history[3], w, residual)
     cache[1].cache = [layers._conv_state(h,None,3) for h in history[:3]] + [next_history]
     return out, block_states
