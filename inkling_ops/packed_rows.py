@@ -59,23 +59,24 @@ _dot = mx.fast.metal_kernel(
     name="inkling_four_row_gemv", input_names=["x","payload"],output_names=["out"],
     source="""
         uint lane=thread_index_in_simdgroup, group=thread_position_in_grid.x/32;
-        uint2 meta=*(device const uint2*)(payload+(group/4)*18688+(group%4)*2);
+        auto stripe=payload+(group/4)*18464;
+        uint2 meta=*(device const uint2*)(stripe+(group%4)*2);
         uchar4 base=as_type<uchar4>(meta.x);
         uint raw_tiles=meta.y;
         float sums[4]={};
         for (uint block=0;block<18;++block) {
-            uint tile=(group/4)*73+1+block*4+group%4;
+            uint tile=block*4+group%4;
             uint d=block*128+lane*4;
             float4 v=float4(*(device const bfloat4*)(x+d));
             if (raw_tiles & (1u<<block)) {
                 for (uint r=0;r<4;++r) {
-                    float4 w=float4(*(device const bfloat4*)(payload+tile*256+r*64+lane*2));
+                    float4 w=float4(*(device const bfloat4*)(stripe+32+tile*256+r*64+lane*2));
                     for (uint j=0;j<4;++j) sums[r]=fma(v[j],w[j],sums[r]);
                 }
                 continue;
             }
-            uint4 low=*(device const uint4*)(payload+tile*256+lane*4);
-            ushort4 high=*(device const ushort4*)(payload+tile*256+128+lane*2);
+            uint4 low=*(device const uint4*)(stripe+32+tile*256+lane*4);
+            ushort4 high=*(device const ushort4*)(stripe+32+tile*256+128+lane*2);
             for (uint r=0;r<4;++r) {
                 ushort h=high[r];
                 ushort4 ex=ushort4(h,h>>4,h>>8,h>>12)&15;
@@ -104,7 +105,7 @@ def encode(weight):
                  output_shapes=[(count//512,256),(rows//4,18)],output_dtypes=[mx.uint32,mx.uint32])
     formats=mx.stack((bases.view(mx.uint32),mx.sum(flags,axis=1)),axis=1)
     # One aligned header per set of sixteen rows, followed by its 72 coefficient tiles.
-    headers=mx.pad(formats.reshape(-1,8),[(0,0),(0,248)])
+    headers=mx.pad(formats.reshape(-1,8),[(0,0),(0,24)])
     return (mx.concatenate((headers,payload.reshape(-1,18432)),axis=1),)
 
 
