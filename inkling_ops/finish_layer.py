@@ -1,0 +1,45 @@
+"""Finish NVFP4 expert mixing, temporal convolution and residual in one launch."""
+import mlx.core as mx
+from mlx_lm.models.inkling2 import layers
+
+from . import expert_gate
+
+_reference = layers.DecoderLayer.__call__
+
+
+def decode(layer, hidden_states, block_states, *, cache=None, conv_mask=None, messages=None):
+    from inkling_kernel import _finish_mix, can_fuse_down
+    from .compiled_ring import _DeviceRing
+    moe = layer.mlp
+    post = layer.post_mlp_convolution
+    if (hidden_states.shape != (1,1,2304) or hidden_states.dtype != mx.bfloat16 or conv_mask is not None
+            or cache is None or type(cache[0]) is not _DeviceRing or type(post) is not layers.ShortConvolution
+            or post.kernel_size != 4 or moe.sharding_group is not None or moe.gate.top_k != 8
+            or not can_fuse_down(moe.experts.down_proj, hidden_states)):
+        return _reference(layer, hidden_states, block_states, cache=cache, conv_mask=conv_mask, messages=messages)
+    history = list(cache[1].cache)
+    normed = layers.unweighted_rms_norm(hidden_states.astype(mx.float32))
+    inputs = layer.attention_input(block_states,normed) if layer.attention_input is not None else None
+    attention = layer._self_attention(hidden_states,inputs,cache,history,None,messages)
+    filtered, history[2] = layer.post_attention_convolution(attention,history[2],None)
+    residual = filtered.astype(mx.float32)
+    if layer.is_block_boundary:
+        block = normed[None]
+        block_states = block if block_states is None else mx.concatenate((block_states, block))
+    else:
+        residual = hidden_states.astype(mx.float32) + residual
+    x = layer.mlp_input(block_states,layers.unweighted_rms_norm(residual))[...,0,:]
+    if messages is not None:
+        x = layer.mlp_message_gate(x,messages[...,3,:])
+    x = layer.post_attention_layernorm(x).astype(hidden_states.dtype)
+    selected, routing = moe.gate(x)
+    active = expert_gate.gated_activation(moe.experts,x,selected)
+    down = moe.experts.down_proj
+    w = post.conv1d.weight
+    out, next_history = _finish_mix(
+        inputs=[active, selected, routing, down.weight, down.scales, down.global_scale,
+                history[3], w, residual],
+        template=[("T", x.dtype), ("W",w.dtype)], grid=(576*256,1,1), threadgroup=(256,1,1),
+        output_shapes=[x.shape, (1,3,2304)], output_dtypes=[x.dtype,mx.float32])
+    cache[1].cache = [layers._conv_state(h,None,3) for h in history[:3]] + [next_history]
+    return out, block_states

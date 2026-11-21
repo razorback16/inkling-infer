@@ -6,7 +6,7 @@ from mlx.utils import tree_flatten
 from mlx_lm.models.cache import ArraysCache, CacheList, KVCache, RotatingKVCache
 from mlx_lm.models.inkling2 import layers
 
-_reference = layers.DecoderLayer.__call__
+from .finish_layer import decode as _reference
 
 
 class _DeviceRing(RotatingKVCache):

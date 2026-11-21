@@ -25,10 +25,30 @@ def mix(states, weights, dtype):
                 output_shapes=[(1, 1, 2304)], output_dtypes=[dtype])[0]
 
 
-_down_mix = mx.fast.metal_kernel(
-    name="inkling_nvfp4_down_mix",
-    input_names=["hidden", "indices", "routing", "packed", "scales", "amax"],
-    output_names=["out"],
+def _make_down(finish):
+    inputs = ["hidden", "indices", "routing", "packed", "scales", "amax"]
+    outputs = ["out"]
+    store = "out[channel + lane] = T(value);"
+    if finish:
+        inputs += ["history", "conv_w", "residual"]
+        outputs += ["next_history"]
+        store = """
+            uint c = channel + lane;
+            float current = float(T(value));
+            float total = 0;
+            for (uint j = 0; j < 3; ++j) {
+                float old = history[j*2304+c];
+                total = fma(float(W(old)), float(conv_w[c*4+j]), total);
+                if (j > 0) next_history[(j-1)*2304+c] = old;
+            }
+            total = fma(float(W(current)), float(conv_w[c*4+3]), total);
+            next_history[2*2304+c] = current;
+            float filtered = float(T((float(W(total)) + current) * 0.4472135954999579f));
+            out[c] = T(residual[c] + filtered);
+        """
+    return mx.fast.metal_kernel(
+        name="inkling_finish_nvfp4_layer" if finish else "inkling_nvfp4_down_mix",
+        input_names=inputs, output_names=outputs,
     header="""
         constant float fp4_values[16] = {
             0, .5, 1, 1.5, 2, 3, 4, 6, -0., -.5, -1, -1.5, -2, -3, -4, -6
@@ -80,10 +100,22 @@ _down_mix = mx.fast.metal_kernel(
                 volatile float term = projected[e][lane] * float(routing[e]);
                 value = value + term;
             }
-            out[channel + lane] = T(value);
+            STORE
         }
-    """,
-)
+    """.replace("STORE", store),
+    )
+
+
+_down_mix = _make_down(False)
+_finish_mix = _make_down(True)
+
+
+def can_fuse_down(down, x):
+    return (getattr(down, "mode", None) == "nvfp4" and down.group_size == 16
+            and down.bits == 4 and down.weight.shape[1:] == (2304, 144)
+            and down.global_scale is not None
+            and down.global_scale.shape == (down.weight.shape[0],) and "bias" not in down
+            and x.dtype == mx.bfloat16)
 
 
 def single_token_moe(self, x):
@@ -91,11 +123,7 @@ def single_token_moe(self, x):
         return _reference(self, x)
     experts, weights = self.gate(x)
     down = self.experts.down_proj
-    if (getattr(down, "mode", None) == "nvfp4" and down.group_size == 16
-            and down.bits == 4 and down.weight.shape[1:] == (2304, 144)
-            and down.global_scale is not None
-            and down.global_scale.shape == (down.weight.shape[0],) and "bias" not in down
-            and x.dtype == mx.bfloat16):
+    if can_fuse_down(down, x):
         from inkling_ops.expert_gate import gated_activation
         hidden = gated_activation(self.experts, x, experts)
         return _down_mix(
