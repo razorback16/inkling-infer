@@ -41,7 +41,7 @@ _pack = mx.fast.metal_kernel(
         }
         bool any_raw=simd_any(raw);
         if (!lane) flags[tile]=uint(any_raw)<<block;
-        uint physical=((group/STRIPE)*18+block)*STRIPE+group%STRIPE;
+        uint physical=((group/4)*18+block)*4+group%4;
         if (any_raw) {
             for (uint r=0;r<4;++r) {
                 uint i=(4*group+r)*2304+block*128+lane*4;
@@ -57,12 +57,12 @@ _pack = mx.fast.metal_kernel(
 )
 _dot_source = """
         uint lane=thread_index_in_simdgroup, group=thread_position_in_grid.x/32;
-        uint2 meta=*(device const uint2*)(payload+(group/STRIPE)*(18*STRIPE+1)*256+(group%STRIPE)*2);
+        uint2 meta=*(device const uint2*)(payload+(group/4)*18688+(group%4)*2);
         uchar4 base=as_type<uchar4>(meta.x);
         uint raw_tiles=meta.y;
         float sums[4]={};
         for (uint block=0;block<18;++block) {
-            uint tile=(group/STRIPE)*(18*STRIPE+1)+1+block*STRIPE+group%STRIPE;
+            uint tile=(group/4)*73+1+block*4+group%4;
             uint d=block*128+lane*4;
             float4 v=float4(*(device const bfloat4*)(x+d));
             if (raw_tiles & (1u<<block)) {
@@ -109,31 +109,26 @@ def project_kv(layer,k,v):
             or "bias" in layer.k_proj or "bias" in layer.v_proj
             or k.shape!=(1,1,2304) or v.shape!=k.shape or k.dtype!=mx.bfloat16 or v.dtype!=k.dtype):
         return None
-    pair,=_pair(inputs=[k,v,*saved[2]],template=[("STRIPE",4)],grid=(2048*32,1,1),threadgroup=(128,1,1),
+    pair,=_pair(inputs=[k,v,*saved[2]],grid=(2048*32,1,1),threadgroup=(128,1,1),
                 output_shapes=[(1,1,2048)],output_dtypes=[k.dtype])
     return mx.split(pair,2,axis=-1)
 
 
 
-def rows_per_stripe(rows):
-    return 128 if rows % 128 == 0 else 16
-
-
-def encode(weight, stripe_rows=None):
+def encode(weight):
     count=weight.size
     rows=weight.shape[0]
-    stripe = (stripe_rows or rows_per_stripe(rows)) // 4
     bases=_ranges(inputs=[weight],grid=(rows*32,1,1),threadgroup=(128,1,1),
                   output_shapes=[(rows,)],output_dtypes=[mx.uint8])[0]
-    payload,flags=_pack(inputs=[weight,bases],template=[("STRIPE",stripe)],grid=(count//16,1,1),threadgroup=(128,1,1),
+    payload,flags=_pack(inputs=[weight,bases],grid=(count//16,1,1),threadgroup=(128,1,1),
                  output_shapes=[(count//512,256),(rows//4,18)],output_dtypes=[mx.uint32,mx.uint32])
     formats=mx.stack((bases.view(mx.uint32),mx.sum(flags,axis=1)),axis=1)
-    # Each stripe starts with an aligned header of bases and exception masks.
-    headers=mx.pad(formats.reshape(-1,2*stripe),[(0,0),(0,256-2*stripe)])
-    return (mx.concatenate((headers,payload.reshape(-1,18*stripe*256)),axis=1),)
+    # One aligned header per set of sixteen rows, followed by its 72 coefficient tiles.
+    headers=mx.pad(formats.reshape(-1,8),[(0,0),(0,248)])
+    return (mx.concatenate((headers,payload.reshape(-1,18432)),axis=1),)
 
 
 def project(x,weight,encoded):
     rows=weight.shape[0]
-    return _dot(inputs=[x,*encoded],template=[("STRIPE",rows_per_stripe(rows)//4)],grid=(rows*8,1,1),threadgroup=(128,1,1),
+    return _dot(inputs=[x,*encoded],grid=(rows*8,1,1),threadgroup=(128,1,1),
                 output_shapes=[(1,1,rows)],output_dtypes=[x.dtype])[0]

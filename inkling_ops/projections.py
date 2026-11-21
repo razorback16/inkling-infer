@@ -49,7 +49,7 @@ def prepare_query_weights(model):
             k,v=layer.k_proj.weight,layer.v_proj.weight
             saved=getattr(layer,"_four_row_kv",None)
             if saved is None or saved[0] is not k or saved[1] is not v:
-                encoded=packed_rows.encode(mx.concatenate((k,v)), stripe_rows=16)
+                encoded=packed_rows.encode(mx.concatenate((k,v)))
                 object.__setattr__(layer,"_four_row_kv",(k,v,encoded))
                 arrays.extend(encoded)
         common = (layer.q_proj,layer.r_proj,layer.gate_proj)
@@ -66,15 +66,13 @@ def prepare_query_weights(model):
                 joint=getattr(layer,"_all_qkv",None)
                 tiles=getattr(layer,"_all_qkv_tiles",None)
                 rows=sum(p.weight.shape[0] for p in modules)
-                if (joint is not None and tiles is not None
-                        and rows % packed_rows.rows_per_stripe(joint[1].shape[0]) == 0
-                        and packed_rows.rows_per_stripe(rows) == packed_rows.rows_per_stripe(joint[1].shape[0])
+                if (rows%16==0 and joint is not None and tiles is not None
                         and tiles[0] is joint[1] and all(p.weight is w for p,w in zip(modules,joint[0]))):
                     weights=tuple(p.weight for p in modules)
                     w=joint[1][:rows]
                     boundaries=joint[2][:len(modules)-1]
                     data,=tiles[1]
-                    subset=(data[:rows//packed_rows.rows_per_stripe(rows)],)
+                    subset=(data[:rows//16],)
                     object.__setattr__(layer,name,(weights,w,boundaries))
                     object.__setattr__(layer,name+"_tiles",(w,subset))
                     arrays.extend(subset)
