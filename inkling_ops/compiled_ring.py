@@ -35,8 +35,6 @@ class _DeviceRing(RotatingKVCache):
             self.offset = self.offset + 1
             return self.keys, self.values
         if hasattr(self, "page_tail"):
-            self.previous_tail = self.page_tail
-            self.fresh = new
             slot = self._idx - self.page_prefix.shape[2]
             self.page_tail = mx.slice_update(self.page_tail, new, slot, axes=(2,))
             self.packed = mx.concatenate((self.page_prefix, self.page_tail), axis=2)

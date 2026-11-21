@@ -71,9 +71,7 @@ _partial = mx.fast.metal_kernel(
                     uint p = (kv*length+pos)*128+d;
                     auto keys = in_tail ? tail : k;
                     auto values = in_tail ? tail+NKV*256*128 : v;
-                    if (FRESH && PAGED && int(position)==newest) {
-                        keys=fresh; values=fresh+NKV*128; p=kv*128+d;
-                    } else if (ADJACENT && !in_tail) {
+                    if (ADJACENT && !in_tail) {
                         p=(kv*length+pos)*256+d;
                         keys=k; values=k+128;
                     }
@@ -140,7 +138,7 @@ def attend(layer,q,k,v,rel,sinks,cache,gate):
             object.__setattr__(layer, "_relative_tiles", saved)
         w = saved[2]
     paged = hasattr(cache, "page_tail")
-    tail = getattr(cache,"previous_tail",cache.page_tail) if paged else q
+    tail = cache.page_tail if paged else q
     if paged:
         k, v = mx.split(cache.page_prefix, 2, axis=1)
     # A compiled ring already carries one-element int32 graph inputs.
