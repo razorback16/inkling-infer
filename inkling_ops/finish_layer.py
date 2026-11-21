@@ -37,8 +37,11 @@ def decode(layer, hidden_states, block_states, *, cache=None, conv_mask=None, me
         payload = (messages, normalized_messages) if normalized_messages is not None else messages
         attention = layer._self_attention(hidden_states,inputs,cache,history,None,payload)
     if layer.is_block_boundary:
+        from . import closed_scores
+        old_blocks = block_states
         block = normed[None]
         block_states = block if block_states is None else mx.concatenate((block_states, block))
+        closed_scores.append(old_blocks, block_states, normed)
     if type(layer.post_attention_convolution) is layers.ShortConvolution and layer.post_attention_convolution.kernel_size == 4:
         mixed, residual, history[2] = depth_norm.post_attention(layer, block_states, attention, history[2], hidden_states)
     else:
