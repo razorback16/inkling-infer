@@ -73,7 +73,7 @@ _mx_gate = mx.fast.metal_kernel(
                 float sum = 0;
                 for (uint j = 0; j < 4; ++j) sum += a[j] * codes[lo[j]];
                 for (uint j = 0; j < 4; ++j) sum += b[j] * codes[hi[j]];
-                dots[r] += sum * codes[256 + uint(scales[(row+r)*72 + block/4])];
+                dots[r] += sum * as_type<float>(uint(scales[(row+r)*72 + block/4]) << 23);
             }
         }
         for (uint r = 0; r < 4; ++r) dots[r] = simd_sum(dots[r]);
@@ -91,9 +91,7 @@ _mx_gate = mx.fast.metal_kernel(
 @lru_cache(maxsize=1)
 def mx_codes():
     bits = mx.arange(256, dtype=mx.int32).astype(mx.uint8)
-    unit = mx.full((256,8), 0x38383838, mx.uint32)
-    scale = mx.dequantize(unit, bits[:,None], group_size=32, bits=8, mode="mxfp8", dtype=mx.float32)
-    codes = mx.concatenate((mx.from_fp8(bits,mx.float32),scale[:,0]))
+    codes = mx.from_fp8(bits,mx.float32)
     mx.eval(codes)
     return codes
 

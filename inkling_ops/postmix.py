@@ -51,7 +51,7 @@ _mx_down = mx.fast.metal_kernel(
                 uchar4 bytes=as_type<uchar4>(packed[row*288+word]);
                 float sum=0;
                 for (uint k=0;k<4;++k) sum+=activation[k]*codes[bytes[k]];
-                float scale=codes[256+uint(scales[row*36+word/8])];
+                float scale=as_type<float>(uint(scales[row*36+word/8]) << 23);
                 dots[r]+=sum*scale;
             }
         }
