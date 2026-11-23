@@ -6,9 +6,8 @@ export INKLING_CONTEXT_WINDOW
 
 usage() {
   echo 'Usage: ./serve [--kv-cache-dtype bf16|fp8]'
-  echo 'Defaults: FP8 E4M3 attention cache and the Inkling custom kernel.'
+  echo 'Defaults: native Metal backend and BF16 attention cache.'
   echo "Context window: $INKLING_CONTEXT_WINDOW tokens including the prompt and output."
-  echo 'Set INKLING_CUSTOM_KERNEL=0 to use the upstream kernel.'
 }
 case "$#:${1-}" in
   0:) ;;
@@ -30,11 +29,17 @@ if [[ -z "$LITELLM_MASTER_KEY" ]]; then
   exit 1
 fi
 export LITELLM_MASTER_KEY
-.venv/bin/python backend.py --chat-template-args '{"reasoning_effort":"low"}' --model thinkingmachines/Inkling-2-Mini --prefill-step-size 2048 --host 127.0.0.1 --port 8089 &
+make -s -C native
+python_bin="${INKLING_PYTHON:-.venv/bin/python}"
+backend_port="${INKLING_BACKEND_PORT:-8089}"
+export INKLING_API_BASE="http://127.0.0.1:$backend_port/v1"
+ready=$(mktemp -t inkling-ready)
+"$python_bin" backend.py --port "$backend_port" --ready-file "$ready" &
 backend=$!
-trap 'kill "$backend" 2>/dev/null || true' EXIT
-while ! curl -fsS http://127.0.0.1:8089/v1/models >/dev/null 2>&1; do
+trap 'kill "$backend" 2>/dev/null || true; rm -f "$ready"' EXIT
+while [[ ! -s "$ready" ]]; do
   kill -0 "$backend" || exit 1
   sleep 1
 done
-.venv/bin/litellm --config proxy.yaml --host 127.0.0.1 --port 4010
+kill -0 "$backend" 2>/dev/null || exit 1
+"$(dirname "$python_bin")/litellm" --config proxy.yaml --host 127.0.0.1 --port "${INKLING_PROXY_PORT:-4010}"

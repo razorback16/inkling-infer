@@ -1,0 +1,498 @@
+{
+  "device": "Apple M3 Ultra",
+  "checkpoint": "thinkingmachines/Inkling-2-Mini",
+  "revision": "ed40e7da625f594fc9c4990f5f66be24873c22d7",
+  "date": "2026-11-22",
+  "native_bf16": {
+    "command": "python native_benchmark.py",
+    "batch_size": 1,
+    "prompt": "moby-prefix.txt",
+    "prompt_tokens": 4096,
+    "prefill_chunk": 2048,
+    "cached_greedy_steps": 128,
+    "repetitions": 3,
+    "samples_tokens_per_second": [
+      [
+        1982.8116391025485,
+        90.85338565156636
+      ],
+      [
+        1958.1992659280165,
+        88.50150789316972
+      ],
+      [
+        1962.3886681101708,
+        90.42563807152072
+      ]
+    ],
+    "median_prefill_tokens_per_second": 1962.3886681101708,
+    "median_decode_tokens_per_second": 90.42563807152072,
+    "prefill_roofline_tokens_per_second": 2447.0441454899415,
+    "decode_roofline_tokens_per_second": 112.09278255626771,
+    "integrated_workspace_rerun": {
+      "tuning_trial": 373,
+      "median_prefill_tokens_per_second": 1961.3739577675983,
+      "median_decode_tokens_per_second": 90.1977983107698,
+      "samples_tokens_per_second": [
+        [
+          1992.5204683005327,
+          90.1977983107698
+        ],
+        [
+          1961.3739577675983,
+          90.48050806958275
+        ],
+        [
+          1944.7426335691648,
+          88.89102375448789
+        ]
+      ],
+      "passed_pytorch_positions": 21,
+      "worst_relative_l2": 0.015075486490368278
+    },
+    "tuning_trial": 373,
+    "output_projection": "Affine six-bit weights with one scale and zero point per 32 weights, BF16 normalized hidden states, and FP32 accumulation.",
+    "final_verification": {
+      "tuning_trial": 373,
+      "target_prefill": 1957.6353163919532,
+      "target_decode": 89.67422604501417,
+      "score": 1.0024281088915878,
+      "official": {
+        "prefill": 1962.3886681101708,
+        "decode": 90.42563807152072,
+        "samples": [
+          [
+            1982.8116391025485,
+            90.85338565156636
+          ],
+          [
+            1958.1992659280165,
+            88.50150789316972
+          ],
+          [
+            1962.3886681101708,
+            90.42563807152072
+          ]
+        ],
+        "worst": 0.015075486490368278,
+        "top1": 21,
+        "passed": 21,
+        "score": 1.0024281088915878
+      },
+      "integrated_first": {
+        "prefill": 1961.3739577675983,
+        "decode": 90.1977983107698,
+        "samples": [
+          [
+            1992.5204683005327,
+            90.1977983107698
+          ],
+          [
+            1961.3739577675983,
+            90.48050806958275
+          ],
+          [
+            1944.7426335691648,
+            88.89102375448789
+          ]
+        ],
+        "worst": 0.015075486490368278,
+        "top1": 21,
+        "passed": 21,
+        "score": 1.0019097741772127
+      },
+      "integrated_repeat": {
+        "prefill": 1961.1680199788711,
+        "decode": 89.10237880658411,
+        "samples": [
+          [
+            1991.9879550318656,
+            89.10237880658411
+          ],
+          [
+            1961.1680199788711,
+            90.87367670306085
+          ],
+          [
+            1935.0932358851476,
+            89.07951032020466
+          ]
+        ],
+        "worst": 0.015075486490368278,
+        "top1": 21,
+        "passed": 21,
+        "score": 0.9936230591146334
+      },
+      "integrated_nine_repetitions": {
+        "prefill": 1958.1516788149181,
+        "decode": 89.77551562313494,
+        "samples": [
+          [
+            1958.1516788149181,
+            88.61712459972725
+          ],
+          [
+            1961.2360995219676,
+            89.77551562313494
+          ],
+          [
+            1976.9909338993139,
+            90.58779536387574
+          ],
+          [
+            1968.391640098283,
+            88.43011669902191
+          ],
+          [
+            1959.5355825604192,
+            90.38421411438696
+          ],
+          [
+            1946.820030943715,
+            90.61186192755181
+          ],
+          [
+            1933.8461495793638,
+            88.69509165298417
+          ],
+          [
+            1936.5766421812118,
+            90.58296329047334
+          ],
+          [
+            1938.0164372978495,
+            89.66001426305189
+          ]
+        ]
+      },
+      "integrated_nine_fraction_of_roof": {
+        "prefill": 0.8002110147558705,
+        "decode": 0.8009036226580416
+      },
+      "pytorch_positions": 183,
+      "worst_relative_l2": 0.018265652638239854,
+      "top1_matches": 183,
+      "mlx_installed_in_serving_venv": false
+    }
+  },
+  "native_http_streaming": {
+    "tuning_trial": 373,
+    "endpoint": "./serve native /v1/completions",
+    "method": "Three warm BF16 requests on the same 4096 token IDs. Replace the saved prefix before each sample and verify zero cached prompt tokens and exactly 128 generated tokens. Prefill is prompt tokens divided by time until response headers. Decode is the 127 subsequent model steps divided by time from headers to the final SSE event, including HTTP transport and sampling.",
+    "columns": [
+      "prefill_tps",
+      "decode_tps",
+      "seconds_to_headers",
+      "seconds_headers_to_done"
+    ],
+    "samples": [
+      [
+        1937.80391348068,
+        90.38274244836103,
+        2.1137329589982983,
+        1.4051354999828618
+      ],
+      [
+        1938.1896069149414,
+        91.55271785266675,
+        2.113312333007343,
+        1.3871789170079865
+      ],
+      [
+        1947.1317987526422,
+        89.94127788545427,
+        2.103606958000455,
+        1.412032416992588
+      ]
+    ],
+    "median_prefill": 1938.1896069149414,
+    "median_decode": 90.38274244836103
+  },
+  "pytorch_cpu_comparison": {
+    "command": "python native_logit_guard.py check .build/torch-logits.npz",
+    "cache": "bf16",
+    "eager_prefill_chunk": 512,
+    "prompt_lengths": [
+      10,
+      1030,
+      4096
+    ],
+    "positions_per_prompt": 7,
+    "vocabulary_size": 200058,
+    "metric": "L2 norm of the logit difference divided by the L2 norm of the PyTorch logits, independently at each position",
+    "tolerance": 0.02,
+    "passed": 21,
+    "top1_matches": 21,
+    "worst_relative_l2": 0.015075486490368278
+  },
+  "extended_pytorch_cpu_comparison": {
+    "tuning_trial": 373,
+    "reference": "Pinned PyTorch CPU eager BF16 checkpoint. All 200058 logits are compared independently at each position. The additional eight cases use 16 greedy PyTorch positions each, teacher-forced through native Metal.",
+    "reproduce": "python native_logit_guard.py reference .build/torch-logits-greedy-holdouts.npz --holdouts --greedy-holdouts, then python native_logit_guard.py check .build/torch-logits-greedy-holdouts.npz",
+    "positions": 173,
+    "passed": 173,
+    "top1_matches": 173,
+    "worst_relative_l2": 0.018265652638239854,
+    "cases": {
+      "context": {
+        "positions": 21,
+        "passed": 21,
+        "top1_matches": 21,
+        "worst_relative_l2": 0.015075486490368278
+      },
+      "density": {
+        "positions": 6,
+        "passed": 6,
+        "top1_matches": 6,
+        "worst_relative_l2": 0.014375694272772679
+      },
+      "journal": {
+        "positions": 6,
+        "passed": 6,
+        "top1_matches": 6,
+        "worst_relative_l2": 0.01351986444580274
+      },
+      "notebook": {
+        "positions": 12,
+        "passed": 12,
+        "top1_matches": 12,
+        "worst_relative_l2": 0.014051084053335761
+      },
+      "search": {
+        "positions": 16,
+        "passed": 16,
+        "top1_matches": 16,
+        "worst_relative_l2": 0.018265652638239854
+      },
+      "french": {
+        "positions": 16,
+        "passed": 16,
+        "top1_matches": 16,
+        "worst_relative_l2": 0.01727667734243339
+      },
+      "digits": {
+        "positions": 16,
+        "passed": 16,
+        "top1_matches": 16,
+        "worst_relative_l2": 0.0133328127858708
+      },
+      "json": {
+        "positions": 16,
+        "passed": 16,
+        "top1_matches": 16,
+        "worst_relative_l2": 0.016898046111432335
+      },
+      "poem": {
+        "positions": 16,
+        "passed": 16,
+        "top1_matches": 16,
+        "worst_relative_l2": 0.011151804795557375
+      },
+      "sql": {
+        "positions": 16,
+        "passed": 16,
+        "top1_matches": 16,
+        "worst_relative_l2": 0.016791954274729428
+      },
+      "zh": {
+        "positions": 16,
+        "passed": 16,
+        "top1_matches": 16,
+        "worst_relative_l2": 0.012891315390912391
+      },
+      "math": {
+        "positions": 16,
+        "passed": 16,
+        "top1_matches": 16,
+        "worst_relative_l2": 0.018076962062810474
+      }
+    }
+  },
+  "long_context_pytorch_cpu_comparison": {
+    "tuning_trial": 373,
+    "reference": "Upstream PyTorch CPU eager BF16 with 512-token chunks, a single-token step at 6145, and four greedy decode steps after 8192. Both implementations receive the actual archived IDs and identical chunks.",
+    "reproduce": "python native_logit_guard.py reference-long .build/torch-long-pages.npz, then python native_logit_guard.py check .build/torch-long-pages.npz",
+    "checkpoint_revision": "ed40e7da625f594fc9c4990f5f66be24873c22d7",
+    "token_ids_sha256_le_i64": "fa04605ea8be5e8e2dc790c1e9eca549bdb793e715cb5dbd36f61a866a08e28b",
+    "passed": 10,
+    "top1_matches": 10,
+    "worst_relative_l2": 0.013775695154798002,
+    "results": [
+      {
+        "position": 6144,
+        "relative_l2": 0.013775695154798002,
+        "top1": true
+      },
+      {
+        "position": 6145,
+        "relative_l2": 0.010860715185138,
+        "top1": true
+      },
+      {
+        "position": 6656,
+        "relative_l2": 0.01210862598231211,
+        "top1": true
+      },
+      {
+        "position": 7168,
+        "relative_l2": 0.011180055584143672,
+        "top1": true
+      },
+      {
+        "position": 7680,
+        "relative_l2": 0.009259858760520639,
+        "top1": true
+      },
+      {
+        "position": 8192,
+        "relative_l2": 0.008483577341776993,
+        "top1": true
+      },
+      {
+        "position": 8193,
+        "relative_l2": 0.0073881779221502296,
+        "top1": true
+      },
+      {
+        "position": 8194,
+        "relative_l2": 0.008013072266820586,
+        "top1": true
+      },
+      {
+        "position": 8195,
+        "relative_l2": 0.013401311498046681,
+        "top1": true
+      },
+      {
+        "position": 8196,
+        "relative_l2": 0.008469593495875238,
+        "top1": true
+      }
+    ],
+    "prompt_fixture": "benchmarks/long-context-prompt.npy"
+  },
+  "paired_greedy_token_streams": {
+    "native_tuning_trial": 373,
+    "method": "Warmed, four alternating pairs of greedy 128-token generation on the identical 4096 prompt IDs, cold KV cache, 2048 chunks, BF16 KV, same checkpoint. Timed in-process token delivery and detokenization using mlx_lm.stream_generate with the custom kernels and the native server Generator and Sampler. Each engine follows its own greedy tokens. Prefill is prompt length divided by time to first token. Decode counts the remaining 127 inter-token intervals.",
+    "checkpoint": "ed40e7da625f594fc9c4990f5f66be24873c22d7",
+    "samples": {
+      "native": [
+        {
+          "ttft": 2.2885285840020515,
+          "prefill": 1789.7963034558838,
+          "decode": 91.89750441811302
+        },
+        {
+          "ttft": 2.178267124982085,
+          "prefill": 1880.3938015791737,
+          "decode": 90.62217746217526
+        },
+        {
+          "ttft": 2.2230049580102786,
+          "prefill": 1842.5509962272702,
+          "decode": 90.13429029219859
+        },
+        {
+          "ttft": 2.1010903750138823,
+          "prefill": 1949.463977708687,
+          "decode": 91.79361742687719
+        }
+      ],
+      "mlx_custom": [
+        {
+          "ttft": 2.159763167001074,
+          "prefill": 1896.5042383269622,
+          "decode": 84.4953687553864
+        },
+        {
+          "ttft": 2.4047186670068186,
+          "prefill": 1703.317754462454,
+          "decode": 83.92292309121105
+        },
+        {
+          "ttft": 2.1611566670180764,
+          "prefill": 1895.2813845058186,
+          "decode": 84.55254423785522
+        },
+        {
+          "ttft": 2.3430328329850454,
+          "prefill": 1748.1615888334175,
+          "decode": 84.15370774085993
+        }
+      ]
+    },
+    "median": {
+      "native": {
+        "ttft": 2.200636041496182,
+        "prefill": 1861.4723989032218,
+        "decode": 91.20789744452622
+      },
+      "mlx_custom": {
+        "ttft": 2.252094750001561,
+        "prefill": 1821.7214866696181,
+        "decode": 84.32453824812316
+      }
+    },
+    "first_differing_token": 6
+  },
+  "mlx_bf16_custom_kernels": {
+    "workload": "Same checkpoint, batch, token IDs, prefill chunk, BF16 KV, and host-visible logits per step as native_bf16.",
+    "samples_tokens_per_second": [
+      [
+        1967.0662473669356,
+        67.265744920027
+      ],
+      [
+        1966.873239968302,
+        68.92733365280328
+      ],
+      [
+        1968.146908825483,
+        68.17307412566342
+      ]
+    ],
+    "median_prefill_tokens_per_second": 1967.0662473669356,
+    "median_decode_tokens_per_second": 68.17307412566342,
+    "per_position_full_logit_comparison": {
+      "reference": "Same PyTorch CPU archive and evaluation positions as pytorch_cpu_comparison.",
+      "passed": 3,
+      "positions": 21,
+      "top1_matches": 21,
+      "worst_relative_l2": 0.11985033057666375
+    }
+  },
+  "decode_lookahead": {
+    "tuning_trial": 373,
+    "retained_commit": "dbaea65a6801edd0f65cfd9433e42c27e396afe5",
+    "method": "Prepare the next token through all 48 visits with two alternating position buffers. Commit the suffix only when the actual token, committed history and every KV visit match. HTTP requests using sampling, penalties or logit bias disable lookahead. The bounded endpoint also skips lookahead for its final output.",
+    "differential": {
+      "bf16": {
+        "positions": 112,
+        "logits": 22406496,
+        "pending": 94,
+        "predicted_dispatches": 507
+      },
+      "fp8": {
+        "positions": 112,
+        "logits": 22406496,
+        "pending": 94,
+        "predicted_dispatches": 507
+      }
+    },
+    "request_mode_logit_checks": {
+      "sampled": 2400696,
+      "biased": 2400696,
+      "penalty": 2400696,
+      "greedy": 2400696
+    },
+    "metal31_fallback": {
+      "metal_language": "3.1",
+      "gate_publication": false,
+      "forced_fallback_matrices": 25,
+      "positions": 21,
+      "passed": 21,
+      "worst_relative_l2": 0.015075486490368278,
+      "top1_matches": 21
+    }
+  }
+}
